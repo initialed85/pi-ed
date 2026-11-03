@@ -10,7 +10,7 @@ and `/reload` follows them.
 
 ```
 extensions/   the six extensions
-test/         vitest suite, 102 tests, no Pi runtime and no network needed
+test/         vitest suite, 113 tests, no Pi runtime and no network needed
 hack/         check-package-shape.mjs, the CI gate on the package manifest
 .woodpecker/  CI: workflow lint + typecheck + tests
 ```
@@ -55,7 +55,7 @@ itself), and stops when context usage passes 85%.
 | Commands | `/autopilot [goal]` arm · `/autopilot stop` · `/autopilot status` · `/autopilot max <n>` · `/autopilot goal <text>` |
 | Flags | `--autopilot`, `--autopilot-max <n>`, `--autopilot-goal <text>` |
 | Env | `AUTOPILOT_DEBUG=<logfile>` to trace the loop |
-| Knobs | `DEFAULT_MAX_HOPS` (128; `/autopilot max` accepts up to 1024, the positional form of `arm()` clamps to 50), `SIDE_CALL_MAX_TOKENS` (600), `CONTEXT_STOP_PERCENT` (85), `SHAPE_STOP` (0.7) |
+| Knobs | `DEFAULT_MAX_HOPS` (128), `MAX_HOPS_CEILING` (1024, the one ceiling for `/autopilot max <n>` and `--autopilot-max`), `SIDE_CALL_MAX_TOKENS` (600), `CONTEXT_STOP_PERCENT` (85), `SHAPE_STOP` (0.7) |
 
 ### `loop-guard.ts` — catches a failing agent doing the same failing thing again
 
@@ -130,7 +130,8 @@ The suite drives each extension against a fake `ExtensionAPI` (`test/harness.ts`
 registration, tool call, notification and session-manager operation, and fails loudly on anything an
 extension has not been written against — a half-built code path shows up as a test failure instead of a
 mystery in a live session. There is no Pi runtime, no provider and no network: `searxng.ts` is tested
-against a stubbed `fetch`, and `test/packaging.test.ts` asserts each extension's whole registration
+against a stubbed `fetch`, `test/autopilot.test.ts` holds the hop-limit surface still, and
+`test/packaging.test.ts` asserts each extension's whole registration
 surface, so a file that quietly registers nothing cannot pass.
 
 `npm install` pulls `@earendil-works/*` at 1.5.0 for the typecheck. When Pi updates, bump those versions

@@ -16,7 +16,7 @@
  *   /autopilot [goal]       arm; the optional text is the goal note
  *   /autopilot stop         disarm
  *   /autopilot status       counters
- *   /autopilot max <n>      hop limit (default 6, max 50)
+ *   /autopilot max <n>      hop limit (default 128, max 1024)
  *   /autopilot goal <text>  set/clear the goal note
  *
  * Anti-drift: the brief always shows "THE REQUEST YOU MADE", and the human-voice has to
@@ -54,6 +54,13 @@ import { Box, Text } from "@earendil-works/pi-tui";
 
 const CUSTOM_TYPE = "autopilot";
 const DEFAULT_MAX_HOPS = 128;
+/**
+ * The one ceiling for every hop-limit input: the `/autopilot max <n>` subcommand, the positional form
+ * of `/autopilot <goal>`, and `--autopilot-max`. They used to disagree - the subcommand allowed 1024 and
+ * the other two silently clamped to 50 - so the same number meant different things depending on how you
+ * typed it, and `pi --autopilot --autopilot-max 100` quietly ran with 50.
+ */
+const MAX_HOPS_CEILING = 1024;
 const MAX_PROMPT_CHARS = 1200;
 const SIDE_CALL_MAX_TOKENS = 600;
 const BRIEF_CHAR_BUDGET = 6000;
@@ -250,11 +257,15 @@ function wordCount(value: string): number {
 	return (value.match(/\S+/g) ?? []).length;
 }
 
+function clampMaxHops(value: number): number {
+	return Math.max(1, Math.min(MAX_HOPS_CEILING, Math.trunc(value)));
+}
+
 function arm(nextMax?: number, goal?: string): void {
 	state.armed = true;
 	state.hops = 0;
 	state.prompts = [];
-	if (nextMax !== undefined) state.maxHops = Math.max(1, Math.min(50, nextMax));
+	if (nextMax !== undefined) state.maxHops = clampMaxHops(nextMax);
 	if (goal !== undefined) state.goal = goal;
 }
 
@@ -367,7 +378,7 @@ export default function (pi: ExtensionAPI) {
 					report("usage: /autopilot max <n>", ctx, "warning");
 					return;
 				}
-				state.maxHops = Math.min(1024, parsed);
+				state.maxHops = clampMaxHops(parsed);
 				showStatus(ctx);
 				report(`hop limit is ${state.maxHops}.`, ctx);
 				return;
