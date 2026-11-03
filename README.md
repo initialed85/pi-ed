@@ -4,11 +4,13 @@ Six [Pi](https://github.com/earendil-works/pi) extensions I wrote to stop my age
 that were wasting my time, plus the tests that keep them honest.
 
 They live in `~/.pi/agent/extensions/` on my machines. This repository is the source of truth: the
-copies here are what I edit, and the installed ones are the same bytes.
+installed files are symlinks into a clone of it, so there is exactly one copy of each to edit. Pi's
+discovery accepts symlinked extension files (`loader.js`: `entry.isFile() || entry.isSymbolicLink()`),
+and `/reload` follows them.
 
 ```
 extensions/   the six extensions
-test/         vitest suite, 101 tests, no Pi runtime and no network needed
+test/         vitest suite, 102 tests, no Pi runtime and no network needed
 hack/         check-package-shape.mjs, the CI gate on the package manifest
 .woodpecker/  CI: workflow lint + typecheck + tests
 ```
