@@ -10,7 +10,7 @@ and `/reload` follows them.
 
 ```
 extensions/   the seven extensions
-test/         vitest suite, 135 tests, no Pi runtime and no network needed
+test/         vitest suite, 136 tests, no Pi runtime and no network needed
 hack/         check-package-shape.mjs, the CI gate on the package manifest
 .woodpecker/  CI: workflow lint + typecheck + tests
 ```

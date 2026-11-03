@@ -64,6 +64,17 @@ describe("session markers", () => {
     expect(pi.entryRenderers.has(ENTRY_TYPE)).toBe(true);
   });
 
+  it("writes the record even when there is no UI to tell", async () => {
+    // Print and JSON mode set hasUI: false. The mark is the point of the command, so a headless
+    // run still has to persist it, and the notification has to be skipped rather than thrown.
+    const { ui, context } = createContext({ branch: BRANCH, hasUI: false, mode: "print" });
+    await pi.commands.get("score")!.handler!("2 good work", context);
+    await pi.commands.get("comment")!.handler!("noted", context);
+    expect(pi.appendedEntries).toHaveLength(2);
+    expect(lastEntry(pi).data).toMatchObject({ kind: "comment", text: "noted" });
+    expect(ui.notifications).toEqual([]);
+  });
+
   it("writes a comment as a marker, and says so", async () => {
     const { context, ui } = createContext({ branch: BRANCH });
     await pi.commands.get("comment")!.handler!("the rollback took nine minutes", context);

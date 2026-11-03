@@ -81,16 +81,6 @@ interface ScoreMarker extends Stamp {
 
 type Marker = CommentMarker | ScoreMarker;
 
-function textOf(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => (part && typeof part === "object" && (part as { type?: string }).type === "text" ? (part as { text?: string }).text ?? "" : ""))
-      .join(" ");
-  }
-  return "";
-}
-
 /**
  * The message this mark is about. Walk back from the leaf to the nearest message rather than
  * taking the leaf itself: mark twice in a row and the second mark's leaf would be the first
@@ -108,6 +98,14 @@ function findTarget(ctx: ExtensionCommandContext): Target | undefined {
 }
 
 export default function (pi: ExtensionAPI) {
+  /**
+   * Say something, if there is a terminal to say it to. Print and JSON mode have no UI, and the
+   * record is the point of these commands, so the write is never gated on this.
+   */
+  const report = (ctx: ExtensionCommandContext, message: string, level?: "info" | "warning" | "error") => {
+    if (ctx.hasUI) ctx.ui.notify(message, level);
+  };
+
   const stamp = (ctx: ExtensionCommandContext): Stamp => {
     const model = ctx.model;
     const thinkingLevel = pi.getThinkingLevel();
@@ -146,11 +144,11 @@ export default function (pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const text = args.trim();
       if (!text) {
-        ctx.ui.notify("usage: /comment <text>", "warning");
+        report(ctx, "usage: /comment <text>", "warning");
         return;
       }
       pi.appendEntry<Marker>(ENTRY_TYPE, { v: MARKER_VERSION, kind: "comment", text, ...stamp(ctx) });
-      ctx.ui.notify("commented", "info");
+      report(ctx, "commented", "info");
     },
   });
 
@@ -164,13 +162,13 @@ export default function (pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const trimmed = args.trim();
       if (!trimmed) {
-        ctx.ui.notify("usage: /score <0 bad | 1 neutral | 2 good> [note]", "warning");
+        report(ctx, "usage: /score <0 bad | 1 neutral | 2 good> [note]", "warning");
         return;
       }
       const [head, ...rest] = trimmed.split(/\s+/);
       const key = head === "0" || head === "1" || head === "2" ? head : SCORE_WORDS[head!.toLowerCase()];
       if (!key) {
-        ctx.ui.notify(`score must be 0 (bad), 1 (neutral) or 2 (good), not "${head}"`, "warning");
+        report(ctx, `score must be 0 (bad), 1 (neutral) or 2 (good), not "${head}"`, "warning");
         return;
       }
       const score = Number(key);
@@ -183,7 +181,7 @@ export default function (pi: ExtensionAPI) {
         ...(note ? { note } : {}),
         ...stamp(ctx),
       });
-      ctx.ui.notify(`scored ${score} (${SCORES[key].label})`, "info");
+      report(ctx, `scored ${score} (${SCORES[key].label})`, "info");
     },
   });
 }
