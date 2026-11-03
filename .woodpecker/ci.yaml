@@ -1,0 +1,41 @@
+# The test lane for pi-ed: six hand-written Pi extensions and the vitest suite that pins what they do.
+#
+# Everything here runs without infrastructure. That is the point of the suite: the extensions are driven
+# against a fake ExtensionAPI (test/harness.ts) that records registrations, tool calls, notifications and
+# session-manager operations, so no Pi runtime, no provider, no cluster and no network are needed. The
+# SearXNG tool is tested against a stubbed fetch; the real endpoint is a homelab service behind a
+# LAN/Tailscale allowlist and would answer 403 from a runner anyway.
+#
+# Deliberately not here:
+#   - `npm publish` / a Pi package release. This repo is installed as a git package (`pi install
+#     git:github.com/initialed85/pi-ed`), and the package.json is marked private.
+#   - A lane that runs the extensions inside a real Pi session. That is the only way to catch a change in
+#     Pi's own behaviour, but it needs a model, a provider key and a TTY; it is done by hand on a machine
+#     with a live session, not per push.
+#   - Anything that touches ~/.pi/agent/extensions. CI has no such directory, and the repo copy is the
+#     source of truth, so the sync check is a human one.
+steps:
+  - name: test
+    image: docker.io/library/node:22
+    commands:
+      - node --version
+      - npm --version
+      # The lockfile is committed, so ci is the honest install: a manifest/lockfile drift fails here
+      # instead of producing a tree nobody tested.
+      - npm ci
+      # Typecheck is a separate assertion because it earns its keep: it is what caught an extension
+      # importing AgentMessage from the wrong Pi package, and a State field declared required but never
+      # initialised. Pi loads extensions through a transpiler that does not check either.
+      - npm run typecheck
+      # vitest run (not watch), forks pool, no coverage threshold. Reports are per-test, so a failure
+      # names the extension and the behaviour rather than an exit code.
+      - npm run test
+
+  - name: package-shape
+    image: docker.io/library/node:22
+    depends_on: [test]
+    commands:
+      # The two things that decide whether this repository loads in Pi at all, and that fail silently
+      # rather than loudly: the pi.extensions discovery field, and not bundling the packages Pi hands
+      # to extensions itself. See hack/check-package-shape.mjs for why each one matters.
+      - node ./hack/check-package-shape.mjs
