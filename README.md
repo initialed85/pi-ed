@@ -10,7 +10,7 @@ and `/reload` follows them.
 
 ```
 extensions/   the six extensions
-test/         vitest suite, 113 tests, no Pi runtime and no network needed
+test/         vitest suite, 118 tests, no Pi runtime and no network needed
 hack/         check-package-shape.mjs, the CI gate on the package manifest
 .woodpecker/  CI: workflow lint + typecheck + tests
 ```
@@ -88,9 +88,16 @@ budget in the prompt, validation of the actual output, and up to two compressed 
 still comes back oversized. Worth ~1–2 minutes per compaction on a local model, purely because the budget
 goes into the summary instead of into thinking.
 
+What it does when it still cannot get under budget: **uses the summary anyway.** A summary 30% over is
+accepted on the spot rather than costing two more model calls; if all three attempts come back big, the
+smallest one is kept (trimmed to budget at a line boundary if it is more than 2× over). Falling back to
+Pi's default compaction is now the last resort, reached only when there is no usable summary at all —
+because the default path is the thing that was failing, so it was never a safer option than a real
+summary that happened to be a bit long.
+
 | | |
 | --- | --- |
-| Knobs | `SUMMARY_OUTPUT_TOKENS` (8192), `SUMMARY_TARGET_TOKENS` (4000), `RETRY_POLICY` (`maxRetries: 2`, `baseDelayMs: 2000`, `maxAgentDelayMs: 15000`) |
+| Knobs | `SUMMARY_OUTPUT_TOKENS` (8192), `SUMMARY_TARGET_TOKENS` (4000, so 16000 characters), `SOFT_OVERLIMIT_RATIO` (1.3, accept without retrying), `TRIM_OVERLIMIT_RATIO` (2, trim rather than pass through), `RETRY_POLICY` (`maxRetries: 2`, `baseDelayMs: 2000`, `maxAgentDelayMs: 15000`) |
 
 ### `searxng.ts` — web search through my own SearXNG
 

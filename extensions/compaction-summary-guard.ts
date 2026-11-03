@@ -23,8 +23,12 @@
  *    summary instead of thinking — worth ~1-2 min per compaction on local models);
  * 3. a length budget in the prompt plus validation of actual output tokens/text;
  * 4. up to two compressed retries for token-cap failures or oversized summaries;
- * 5. file lists are carried forward by hand, because Pi only merges them between
- *    its own (non-extension) compactions — see extractFileOperations().
+ * 5. and, when it still cannot get under budget, the over-budget summary it did manage to write
+ *    (trimmed if it is silly) rather than Pi's default compaction, because default compaction is
+ *    the thing that was failing. See SOFT_OVERLIMIT_RATIO and TRIM_OVERLIMIT_RATIO.
+ *
+ * Separately, file lists are carried forward by hand, because Pi only merges them between its own
+ * (non-extension) compactions — see the loop over branchEntries in the handler below.
  *
  * Side effects: compaction summaries are shorter and generated without thinking.
  * Tune SUMMARY_TARGET_TOKENS / SUMMARY_OUTPUT_TOKENS below, or delete this file to
@@ -46,16 +50,42 @@ const LENGTH_BUDGET = `Length budget (hard requirement): keep the whole summary 
 const COMPRESS_HARDER = `The previous summary exceeded the enforced ${SUMMARY_TARGET_TOKENS}-token budget. Rewrite it from scratch, targeting under 2000 tokens. Keep only the current goal/task, constraints that still apply, important decisions, current state/blockers, next action, and essential paths/commands. Remove completed work from prior tasks, stale or contradictory status, repeated bullets, and narrative.`;
 const COMPRESS_HARDEST = `The last summary was still over budget. Rewrite it from scratch in at most 1000 tokens. Preserve only the active task, critical constraints, current state/blocker, immediate next step, and essential file paths/commands. Drop all old completed work and repeated history.`;
 
-function summaryOverBudget(result: CompactionResult): string | undefined {
+/**
+ * A summary this far over the budget is accepted instead of being retried. The budget exists to stop
+ * a summary growing without bound across compactions, not to win an exact number, and each retry is
+ * another full summarisation call on a local model. The case that kept happening in practice was
+ * ~5000 against 4000, which cost two extra calls and then fell back to default compaction anyway.
+ */
+const SOFT_OVERLIMIT_RATIO = 1.3;
+/** Past this multiple of the budget the summary is trimmed to it rather than passed through whole. */
+const TRIM_OVERLIMIT_RATIO = 2;
+
+function overBudget(result: CompactionResult): { reason: string; tokens: number } | undefined {
 	const outputTokens = result.usage?.output;
-	if (typeof outputTokens === "number" && outputTokens > SUMMARY_TARGET_TOKENS) {
-		return `summary used ${outputTokens} output tokens (limit ${SUMMARY_TARGET_TOKENS})`;
-	}
 	const estimatedTokens = Math.ceil(result.summary.length / 4);
+	const tokens = Math.max(typeof outputTokens === "number" ? outputTokens : 0, estimatedTokens);
+	if (typeof outputTokens === "number" && outputTokens > SUMMARY_TARGET_TOKENS) {
+		return { reason: `summary used ${outputTokens} output tokens (limit ${SUMMARY_TARGET_TOKENS})`, tokens };
+	}
 	if (result.summary.length > SUMMARY_MAX_CHARS) {
-		return `summary is about ${estimatedTokens} tokens by length (limit ${SUMMARY_TARGET_TOKENS})`;
+		return { reason: `summary is about ${estimatedTokens} tokens by length (limit ${SUMMARY_TARGET_TOKENS})`, tokens };
 	}
 	return undefined;
+}
+
+/**
+ * Cut at a line boundary and say so. A truncated summary continues the task; a failed compaction
+ * does not, and the whole point of this file is that the default path is the one that fails.
+ */
+function trimToBudget(result: CompactionResult): CompactionResult {
+	const note = `\n\n(truncated by compaction-summary-guard to fit the ${SUMMARY_TARGET_TOKENS}-token budget)`;
+	let kept = "";
+	for (const line of result.summary.split("\n")) {
+		if (kept.length + line.length + 1 > SUMMARY_MAX_CHARS - note.length) break;
+		kept += `${kept ? "\n" : ""}${line}`;
+	}
+	// One line longer than the budget still beats the fallback, so this is a guard, not a policy.
+	return { ...result, summary: kept ? kept + note : result.summary.slice(0, SUMMARY_MAX_CHARS) + note };
 }
 
 export default function (pi: ExtensionAPI) {
@@ -108,6 +138,10 @@ export default function (pi: ExtensionAPI) {
 
 		const compressionInstructions = [undefined, COMPRESS_HARDER, COMPRESS_HARDEST];
 		let lastFailure = "summary was empty";
+		// The smallest summary any attempt produced, kept so the last resort is a real summary rather
+		// than the default path. Each attempt summarises the same input, so any of them is valid.
+		let best: CompactionResult | undefined;
+		let bestTokens = Number.POSITIVE_INFINITY;
 		for (let attempt = 0; attempt < compressionInstructions.length; attempt++) {
 			try {
 				const result = await summarize(compressionInstructions[attempt]);
@@ -116,16 +150,26 @@ export default function (pi: ExtensionAPI) {
 					break;
 				}
 
-				const overBudget = summaryOverBudget(result);
-				if (!overBudget) {
+				const over = overBudget(result);
+				if (!over) {
 					if (attempt > 0) {
 						ctx.ui.notify(`Compaction summary compressed to budget after ${attempt} retries in ${reason} compaction`, "info");
 					}
 					return { compaction: result };
 				}
-				lastFailure = overBudget;
+				if (over.tokens <= SUMMARY_TARGET_TOKENS * SOFT_OVERLIMIT_RATIO) {
+					ctx.ui.notify(`Compaction summary guard: ${over.reason}; accepted rather than spending two more summarisation calls`, "info");
+					return { compaction: result };
+				}
+				lastFailure = over.reason;
+				if (over.tokens < bestTokens) {
+					best = result;
+					bestTokens = over.tokens;
+				}
 			} catch (error) {
 				lastFailure = error instanceof Error ? error.message : String(error);
+				// A token-cap failure means the summary is cut off mid-sentence, so it is worth another
+				// attempt; anything else is the provider being down and will not improve by retrying.
 				if (signal.aborted || !lastFailure.includes("token cap")) break;
 			}
 
@@ -133,8 +177,20 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (!signal.aborted) {
+			if (best) {
+				// The trim decision is made on the text, not on the token count: the budget is about how
+				// much context the summary occupies, and a provider that spent 9999 output tokens on 44
+				// characters of summary has nothing to trim.
+				const oversized = best.summary.length > SUMMARY_MAX_CHARS * TRIM_OVERLIMIT_RATIO;
+				const compaction = oversized ? trimToBudget(best) : best;
+				ctx.ui.notify(
+					`Compaction summary guard: ${lastFailure}; using the ${Math.ceil(best.summary.length / 4)}-token summary${oversized ? " trimmed to budget" : ""} rather than default compaction`,
+					"warning",
+				);
+				return { compaction };
+			}
 			ctx.ui.notify(
-				`Compaction summary guard: ${lastFailure} after compression retries; falling back to default compaction`,
+				`Compaction summary guard: ${lastFailure}; falling back to default compaction`,
 				"warning",
 			);
 		}

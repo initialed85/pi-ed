@@ -21,6 +21,9 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
 
 const SUMMARY_TARGET_TOKENS = 4000;
 const SUMMARY_OUTPUT_TOKENS = 8192;
+// Mirrors the extension's own derivation, so a test that measures the trim boundary in characters is
+// using the same number the guard is.
+const SUMMARY_MAX_CHARS = SUMMARY_TARGET_TOKENS * 4;
 
 function makeCompaction(summary: string, usage: Record<string, number> = { output: 900 }) {
   return {
@@ -163,7 +166,7 @@ describe("compaction summary guard", () => {
 
   it("compresses an oversized summary instead of failing compaction", async () => {
     mockCompact
-      .mockResolvedValueOnce(makeCompaction(GOOD, { output: SUMMARY_TARGET_TOKENS + 1000 }))
+      .mockResolvedValueOnce(makeCompaction(GOOD, { output: 9000 }))
       .mockResolvedValueOnce(makeCompaction("shorter", { output: 1800 }));
 
     const { result, ui } = await run(makeEvent());
@@ -174,6 +177,28 @@ describe("compaction summary guard", () => {
     expect(ui.notifications.map((n) => n.message)).toEqual([
       "Compaction summary compressed to budget after 1 retries in threshold compaction",
     ]);
+  });
+
+  // The case that kept firing in practice: ~5000 against a 4000 budget. The old code retried twice and
+  // then fell back to the default path, which is the thing this extension exists to avoid.
+  it("accepts a slightly over-budget summary instead of spending two more calls", async () => {
+    mockCompact.mockResolvedValue(makeCompaction(GOOD, { output: Math.round(SUMMARY_TARGET_TOKENS * 1.25) }));
+    const { result, ui } = await run(makeEvent());
+
+    expect(result).toEqual({ compaction: expect.objectContaining({ summary: GOOD }) });
+    expect(mockCompact).toHaveBeenCalledTimes(1);
+    expect(ui.notifications.map((n) => n.message)).toEqual([
+      "Compaction summary guard: summary used 5000 output tokens (limit 4000); accepted rather than spending two more summarisation calls",
+    ]);
+    expect(ui.notifications.at(-1)!.level).toBe("info");
+  });
+
+  it("applies the same tolerance to the length estimate when there is no usage", async () => {
+    const slightlyOver = "y".repeat(Math.round(SUMMARY_TARGET_TOKENS * 1.25) * 4);
+    mockCompact.mockResolvedValue(makeCompaction(slightlyOver, {}));
+    const { result } = await run(makeEvent());
+    expect(result).toEqual({ compaction: expect.objectContaining({ summary: slightlyOver }) });
+    expect(mockCompact).toHaveBeenCalledTimes(1);
   });
 
   it("takes the second, harder compression when the first is still too long", async () => {
@@ -189,7 +214,7 @@ describe("compaction summary guard", () => {
   });
 
   it("judges oversize by length when the provider reports no usage", async () => {
-    const oversized = "y".repeat(SUMMARY_TARGET_TOKENS * 4 + 10);
+    const oversized = "y".repeat(SUMMARY_TARGET_TOKENS * 4 * 3);
     mockCompact
       .mockResolvedValueOnce(makeCompaction(oversized, {}))
       .mockResolvedValueOnce(makeCompaction(GOOD, {}));
@@ -198,16 +223,53 @@ describe("compaction summary guard", () => {
     expect(mockCompact).toHaveBeenCalledTimes(2);
   });
 
-  it("gives up quietly rather than writing an over-budget summary", async () => {
+  // The behaviour change. An over-budget summary is still a summary, and the alternative is Pi's
+  // default compaction, which is the path that was failing on the token cap.
+  it("keeps the over-budget summary rather than falling back to default compaction", async () => {
     mockCompact.mockResolvedValue(makeCompaction(GOOD, { output: 9999 }));
     const { result, ui } = await run(makeEvent());
 
-    expect(result).toBeUndefined();
+    expect(result).toEqual({ compaction: expect.objectContaining({ summary: GOOD }) });
     expect(mockCompact).toHaveBeenCalledTimes(3);
-    expect(ui.notifications.at(-1)?.message).toContain(
-      "summary used 9999 output tokens (limit 4000) after compression retries; falling back to default compaction",
+    expect(ui.notifications.at(-1)?.message).toBe(
+      `Compaction summary guard: summary used 9999 output tokens (limit 4000); using the ${Math.ceil(GOOD.length / 4)}-token summary rather than default compaction`,
     );
     expect(ui.notifications.at(-1)!.level).toBe("warning");
+  });
+
+  it("keeps the smallest summary it managed, not the last one", async () => {
+    mockCompact
+      .mockResolvedValueOnce(makeCompaction("x".repeat(9000), { output: 9000 }))
+      .mockResolvedValueOnce(makeCompaction("y".repeat(6000), { output: 6000 }))
+      .mockResolvedValueOnce(makeCompaction("z".repeat(30000), { output: 30000 }));
+    const { result } = await run(makeEvent());
+
+    expect(result).toEqual({
+      compaction: expect.objectContaining({ summary: expect.stringContaining("y".repeat(500)) }),
+    });
+    expect((result as any).compaction.summary).not.toContain("z".repeat(500));
+  });
+
+  it("trims a summary that is silly rather than passing it through whole", async () => {
+    const huge = Array.from({ length: 500 }, (_, i) => `line ${i}: ${"x".repeat(80)}`).join("\n");
+    expect(huge.length).toBeGreaterThan(SUMMARY_MAX_CHARS * 2);
+    mockCompact.mockResolvedValue(makeCompaction(huge, { output: 60000 }));
+    const { result, ui } = await run(makeEvent());
+
+    const summary = (result as any).compaction.summary as string;
+    expect(summary.length).toBeLessThanOrEqual(SUMMARY_MAX_CHARS);
+    expect(summary).toContain("truncated by compaction-summary-guard to fit the 4000-token budget");
+    // A line boundary, not a character count: the tail of the last kept line is intact.
+    expect(summary.split("\n").every((line) => /^line \d+: x{80}$/.test(line) || line === "" || line.startsWith("(truncated")))
+      .toBe(true);
+    expect(ui.notifications.at(-1)?.message).toContain("trimmed to budget");
+  });
+
+  it("still falls back when there is no summary to keep", async () => {
+    mockCompact.mockRejectedValue(new Error("429 rate limited"));
+    const { result, ui } = await run(makeEvent());
+    expect(result).toBeUndefined();
+    expect(ui.notifications.at(-1)?.message).toContain("falling back to default compaction");
   });
 
   it("does not retry an empty summary", async () => {
@@ -215,7 +277,7 @@ describe("compaction summary guard", () => {
     const { result, ui } = await run(makeEvent());
     expect(result).toBeUndefined();
     expect(mockCompact).toHaveBeenCalledTimes(1);
-    expect(ui.notifications.at(-1)?.message).toContain("summary was empty after compression retries");
+    expect(ui.notifications.at(-1)?.message).toContain("summary was empty; falling back to default compaction");
   });
 
   it("retries the token-cap failure that started all of this", async () => {
@@ -238,7 +300,7 @@ describe("compaction summary guard", () => {
     const { result, ui } = await run(makeEvent());
     expect(result).toBeUndefined();
     expect(mockCompact).toHaveBeenCalledTimes(1);
-    expect(ui.notifications.at(-1)?.message).toContain("429 rate limited after compression retries");
+    expect(ui.notifications.at(-1)?.message).toContain("429 rate limited; falling back to default compaction");
   });
 
   it("stops retrying when the run is aborted mid-flight", async () => {
