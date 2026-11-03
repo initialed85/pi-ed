@@ -13,7 +13,7 @@
  * half-built code path.
  */
 
-export type AnyHandler = (event: any, ctx: any) => any;
+export type AnyHandler = (...args: any[]) => any;
 
 export interface ToolDefinitionLike {
   name: string;
@@ -55,6 +55,7 @@ export interface PiRecord {
   commands: Map<string, CommandDefinitionLike>;
   flags: Map<string, { options: any; value: boolean | string | undefined }>;
   messageRenderers: Map<string, AnyHandler>;
+  entryRenderers: Map<string, AnyHandler>;
   busChannels: Map<string, AnyHandler[]>;
   sentUserMessages: Array<{ content: unknown; options?: { deliverAs?: string } }>;
   appendedEntries: Array<{ type: string; data: unknown }>;
@@ -68,6 +69,10 @@ export interface FakePi extends PiRecord {
   registerCommand(name: string, options: CommandDefinitionLike): void;
   registerFlag(name: string, options: any): void;
   registerMessageRenderer(customType: string, renderer: AnyHandler): void;
+  registerEntryRenderer(customType: string, renderer: AnyHandler): void;
+  getThinkingLevel(): string;
+  /** Test helper: the real pi also has setThinkingLevel, with the same effect. */
+  setThinkingLevel(level: string): void;
   getFlag(name: string): boolean | string | undefined;
   /** Test helper: Pi fills flags in from the CLI after extensions load. */
   setFlag(name: string, value: boolean | string | undefined): void;
@@ -94,6 +99,7 @@ export function createFakePi(): FakePi {
     commands: new Map(),
     flags: new Map(),
     messageRenderers: new Map(),
+    entryRenderers: new Map(),
     busChannels: new Map(),
     sentUserMessages: [],
     appendedEntries: [],
@@ -102,6 +108,7 @@ export function createFakePi(): FakePi {
   };
   const handlers = new Map<string, AnyHandler[]>();
   let sessionName: string | undefined;
+  let thinkingLevel = "high";
 
   const track = (name: string) => (args: unknown[]) => record.calls.push({ name, args });
 
@@ -138,6 +145,16 @@ export function createFakePi(): FakePi {
     registerMessageRenderer(customType: string, renderer: AnyHandler) {
       track("registerMessageRenderer")([customType]);
       record.messageRenderers.set(customType, renderer);
+    },
+    registerEntryRenderer(customType: string, renderer: AnyHandler) {
+      track("registerEntryRenderer")([customType]);
+      record.entryRenderers.set(customType, renderer);
+    },
+    getThinkingLevel() {
+      return thinkingLevel;
+    },
+    setThinkingLevel(level: string) {
+      thinkingLevel = level;
     },
     getFlag(name: string) {
       const flag = record.flags.get(name);
@@ -243,6 +260,8 @@ export interface ContextOptions {
   sessionFile?: string | undefined;
   sessionId?: string | undefined;
   sessionName?: string | undefined;
+  /** Session entries the extension sees on its branch, oldest first. */
+  branch?: any[];
   apiKeyResult?: { ok: true; apiKey?: string; headers?: Record<string, unknown>; env?: Record<string, string> } | { ok: false; error?: string };
   completeResult?: any;
   completeError?: Error;
@@ -342,6 +361,10 @@ export function createContext(options: ContextOptions = {}): ContextRecord {
       },
       appendSessionInfo: (value: string) => {
         track("sessionManager.appendSessionInfo")([value]);
+      },
+      getBranch: (fromId?: string) => {
+        track("sessionManager.getBranch")([fromId]);
+        return options.branch ?? [];
       },
     },
     modelRegistry: {

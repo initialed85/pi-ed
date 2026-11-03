@@ -1,6 +1,6 @@
 # pi-ed
 
-Six [Pi](https://github.com/earendil-works/pi) extensions I wrote to stop my agents doing the things
+Seven [Pi](https://github.com/earendil-works/pi) extensions I wrote to stop my agents doing the things
 that were wasting my time, plus the tests that keep them honest.
 
 They live in `~/.pi/agent/extensions/` on my machines. This repository is the source of truth: the
@@ -9,8 +9,8 @@ discovery accepts symlinked extension files (`loader.js`: `entry.isFile() || ent
 and `/reload` follows them.
 
 ```
-extensions/   the six extensions
-test/         vitest suite, 118 tests, no Pi runtime and no network needed
+extensions/   the seven extensions
+test/         vitest suite, 135 tests, no Pi runtime and no network needed
 hack/         check-package-shape.mjs, the CI gate on the package manifest
 .woodpecker/  CI: workflow lint + typecheck + tests
 ```
@@ -127,6 +127,44 @@ Queues a reload for when the agent is next idle, instead of dropping the runtime
 - `/clear` starts a fresh session and carries the current session name over, so `--session-name` keeps
   working after you clear.
 
+### `session-markers.ts` — `/comment` and `/score`
+
+Marks on the session for reviewing model performance later. They go in the session history and the
+model cannot see them.
+
+- `/comment <text>` — a note.
+- `/score <0|1|2> [note]` — a rating: 0 bad, 1 neutral, 2 good. `bad` / `neutral` / `ok` / `good` work
+  too, so the intent never has to be remembered.
+
+Each writes a `CustomEntry` with `pi.appendEntry()`. Custom entries are ignored by Pi's
+`buildSessionContext()`, and an extension command is executed rather than sent as a prompt, so neither
+the mark nor the text you typed reaches the model. `test/session-markers.test.ts` asserts that against
+Pi's real context builder rather than against this sentence.
+
+Pi stamps the entry with `id`, `parentId` and an ISO `timestamp`, so it is durable and sits in the tree
+at the point you made it. The record also carries what cannot be recovered later: which model and
+thinking level were in use (they change mid-session) and the entry id of the message being marked. That
+target is the nearest *message* walking back from the leaf rather than the leaf itself, so two marks in
+a row still rate the same turn instead of the second one rating the first.
+
+A score of 1 is written, not skipped. If neutral meant "no entry", a reader could not tell a turn rated
+neutral from a turn nobody rated, which is the difference between a rating scale and a count of
+complaints.
+
+Marks render in the transcript via `registerEntryRenderer`, so you can see what you marked without the
+model seeing it.
+
+```bash
+jq -r 'select(.customType=="model-marker")
+       | [.timestamp, .data.kind, .data.score, .data.text // .data.note] | @tsv' \
+  ~/.pi/agent/sessions/*/*.jsonl
+```
+
+| | |
+| --- | --- |
+| Record | `customType: "model-marker"`, `data.v: 1` — the one string a reader should grep for |
+| Score | `0` bad, `1` neutral, `2` good, stored as a number so it can be averaged |
+
 ## Tests
 
 ```bash
@@ -137,7 +175,8 @@ The suite drives each extension against a fake `ExtensionAPI` (`test/harness.ts`
 registration, tool call, notification and session-manager operation, and fails loudly on anything an
 extension has not been written against — a half-built code path shows up as a test failure instead of a
 mystery in a live session. There is no Pi runtime, no provider and no network: `searxng.ts` is tested
-against a stubbed `fetch`, `test/autopilot.test.ts` holds the hop-limit surface still, and
+against a stubbed `fetch`, `test/autopilot.test.ts` holds the hop-limit surface still,
+`test/session-markers.test.ts` proves the marks do not reach the model using Pi's own context builder, and
 `test/packaging.test.ts` asserts each extension's whole registration
 surface, so a file that quietly registers nothing cannot pass.
 

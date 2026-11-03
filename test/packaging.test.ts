@@ -23,6 +23,8 @@ interface Surface {
   commands: readonly string[];
   flags: readonly string[];
   messageRenderers: readonly string[];
+  /** TUI-only renderers for custom entries, which are the ones the model never sees. */
+  entryRenderers: readonly string[];
 }
 
 const EXPECTED: Record<string, Surface> = {
@@ -32,6 +34,7 @@ const EXPECTED: Record<string, Surface> = {
     commands: ["autopilot"],
     flags: ["autopilot", "autopilot-max", "autopilot-goal"],
     messageRenderers: ["autopilot"],
+    entryRenderers: [],
   },
   "compaction-summary-guard.ts": {
     events: ["session_before_compact"],
@@ -39,6 +42,7 @@ const EXPECTED: Record<string, Surface> = {
     commands: [],
     flags: [],
     messageRenderers: [],
+    entryRenderers: [],
   },
   "loop-guard.ts": {
     events: ["input", "session_start", "session_tree", "tool_call", "turn_end"],
@@ -46,6 +50,7 @@ const EXPECTED: Record<string, Surface> = {
     commands: [],
     flags: [],
     messageRenderers: [],
+    entryRenderers: [],
   },
   "queue-reload.ts": {
     events: [],
@@ -53,6 +58,7 @@ const EXPECTED: Record<string, Surface> = {
     commands: ["queue-reload"],
     flags: [],
     messageRenderers: [],
+    entryRenderers: [],
   },
   "searxng.ts": {
     events: [],
@@ -61,6 +67,7 @@ const EXPECTED: Record<string, Surface> = {
     commands: [],
     flags: [],
     messageRenderers: [],
+    entryRenderers: [],
   },
   "session-commands.ts": {
     events: [],
@@ -68,6 +75,16 @@ const EXPECTED: Record<string, Surface> = {
     commands: ["continue", "clear"],
     flags: [],
     messageRenderers: [],
+    entryRenderers: [],
+  },
+  "session-markers.ts": {
+    events: [],
+    tools: [],
+    commands: ["comment", "score"],
+    flags: [],
+    messageRenderers: [],
+    // The one string the analysis pass greps for in the session JSONL.
+    entryRenderers: ["model-marker"],
   },
 } as const;
 
@@ -128,6 +145,7 @@ describe("extensions directory", () => {
         expect([...pi.commands.keys()].sort()).toEqual([...EXPECTED[name].commands].sort());
         expect([...pi.flags.keys()].sort()).toEqual([...EXPECTED[name].flags].sort());
         expect([...pi.messageRenderers.keys()].sort()).toEqual([...EXPECTED[name].messageRenderers].sort());
+        expect([...pi.entryRenderers.keys()].sort()).toEqual([...EXPECTED[name].entryRenderers].sort());
         expect([...new Set(pi.lifecycleEvents)].sort()).toEqual([...EXPECTED[name].events].sort());
       });
 
