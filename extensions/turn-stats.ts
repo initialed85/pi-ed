@@ -92,7 +92,6 @@ interface TurnStatsData {
   /** Set when the answer never arrived, so the line says so instead of showing nothing. */
   aborted?: boolean;
 }
-
 interface CallStats {
   /** Set by `before_provider_request`; a call that never started has no row at all. */
   startedAt: number;
@@ -126,6 +125,8 @@ interface CallStats {
   cacheHitRate?: number;
   /** True when the response arrived as a stream, which is what decides who measures TTFT. */
   streamed: boolean;
+  /** Why the provider stopped, read from the assistant message. */
+  stopReason?: string;
 }
 
 export default function turnStats(pi: ExtensionAPI): void {
@@ -366,9 +367,17 @@ export default function turnStats(pi: ExtensionAPI): void {
     if (call.completionTokens === undefined && typeof message.usage?.output === "number") {
       call.completionTokens = message.usage.output;
     }
-    // One row per answer, which is the granularity Ed reads at: the number sits under the thing it
-    // describes, so scrollback keeps the pairing.
-    emit(calls, message.stopReason === "aborted");
+    call.stopReason = message.stopReason;
+  });
+
+  pi.on("turn_end", (event, ctx) => {
+    lastCtx = ctx;
+    // turn_end, not message_end. message_end is a handler that can still replace the message, so it
+    // runs before the message reaches the session log; a row appended from it lands *above* the answer
+    // it describes. turn_end runs after the assistant and tool-result messages are persisted, and it
+    // fires once per turn, which is once per answer - so the row lands under the thing it measures.
+    const stopReason = (event as { message?: { stopReason?: string } }).message?.stopReason;
+    emit(calls, stopReason === "aborted");
   });
 
   pi.on("agent_end", (_event, ctx) => {

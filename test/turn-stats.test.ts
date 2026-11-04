@@ -105,18 +105,18 @@ async function drive(pi: FakePi, options: DriveOptions = {}): Promise<any[]> {
       );
     }
     step(options.headersToMessageEndMs ?? 0);
+    const assistantMessage = {
+      role: "assistant",
+      model: options.assistant?.model ?? "auto",
+      responseModel: options.assistant?.responseModel,
+      stopReason: options.assistant?.stopReason,
+      usage: { output: options.assistant?.output ?? 8, input: 54, totalTokens: 62 },
+    };
+    await pi.emit("message_end", { type: "message_end", message: assistantMessage }, session.context);
+    // Pi persists the assistant message, then fires turn_end. The row has to come after that.
     await pi.emit(
-      "message_end",
-      {
-        type: "message_end",
-        message: {
-          role: "assistant",
-          model: options.assistant?.model ?? "auto",
-          responseModel: options.assistant?.responseModel,
-          stopReason: options.assistant?.stopReason,
-          usage: { output: options.assistant?.output ?? 8, input: 54, totalTokens: 62 },
-        },
-      },
+      "turn_end",
+      { type: "turn_end", turnIndex: 0, message: assistantMessage, toolResults: [], messageEntryId: "m1", toolResultEntryIds: [] },
       session.context,
     );
     await pi.emit("agent_end", { type: "agent_end", messages: [] }, session.context);
@@ -325,9 +325,11 @@ describe("turn-stats", () => {
         { type: "after_provider_response", status: 200, headers: rooterHeaders({ "x-rooter-completion-tokens": String(tokens) }) },
         session.context,
       );
+      const message = { role: "assistant", model: "auto", usage: { output: tokens } };
+      await pi.emit("message_end", { type: "message_end", message }, session.context);
       await pi.emit(
-        "message_end",
-        { type: "message_end", message: { role: "assistant", model: "auto", usage: { output: tokens } } },
+        "turn_end",
+        { type: "turn_end", turnIndex: tokens, message, toolResults: [], messageEntryId: `m${tokens}`, toolResultEntryIds: [] },
         session.context,
       );
     }
@@ -349,6 +351,30 @@ describe("turn-stats", () => {
     const entries = pi.appendedEntries.filter((entry) => entry.type === ENTRY_TYPE);
     expect(entries).toHaveLength(1);
     expect((entries[0].data as { aborted?: boolean }).aborted).toBe(true);
+  });
+
+  it("waits for the message to be persisted before writing its row", async () => {
+    // The whole point of the row is that it sits under the answer. message_end is a handler that can
+    // still replace the message, so it runs before the message reaches the session log, and a row
+    // appended from it lands above the thing it describes. This is the regression.
+    const session = createContext();
+    await pi.emit("session_start", { type: "session_start" }, session.context);
+    await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, session.context);
+    await pi.emit("before_provider_request", { type: "before_provider_request", payload: {} }, session.context);
+    await pi.emit(
+      "after_provider_response",
+      { type: "after_provider_response", status: 200, headers: rooterHeaders() },
+      session.context,
+    );
+    const message = { role: "assistant", model: "auto", usage: { output: 8 } };
+    await pi.emit("message_end", { type: "message_end", message }, session.context);
+    expect(pi.appendedEntries).toHaveLength(0);
+    await pi.emit(
+      "turn_end",
+      { type: "turn_end", turnIndex: 0, message, toolResults: [], messageEntryId: "m1", toolResultEntryIds: [] },
+      session.context,
+    );
+    expect(pi.appendedEntries).toHaveLength(1);
   });
 
   it("does not invent a row for a turn that made no provider call", async () => {

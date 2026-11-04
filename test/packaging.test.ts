@@ -98,6 +98,7 @@ const EXPECTED: Record<string, Surface> = {
       "after_provider_response",
       "provider_stream_event",
       "message_end",
+      "turn_end",
       "agent_end",
     ],
     tools: [],
