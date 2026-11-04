@@ -19,7 +19,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const EXPECTED_EXTENSIONS = 8;
+const EXPECTED_EXTENSIONS = 9;
 const HOST_PACKAGES = [
   "@earendil-works/pi-ai",
   "@earendil-works/pi-agent-core",
