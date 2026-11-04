@@ -33,8 +33,11 @@
  *     measures it locally — first parsed stream event minus request start — which is the arrival the
  *     client actually experienced. It is marked `~` so a server measurement and a local one are not
  *     read as the same kind of number.
- *   - `tok/s` prefers `X-Rooter-Decode-Tok-S`, the runner's own decode rate, and only falls back to
- *     tokens over measured seconds. The two disagree on a warm cache and the runner is the authority.
+ *   - `tok/s` prefers `X-Rooter-Decode-Tok-S`, the runner's own decode rate. The fallback divides
+ *     tokens by the window they arrived in - last parsed stream event minus first - because that is
+ *     the only window that is actually decoding. A held body exposes no arrival window at all, so a
+ *     call with no runner rate and no stream shows no rate rather than tokens over however long the
+ *     proxy spent queueing, which is a different quantity wearing the same unit.
  *   - A turn that made several provider calls shows the sum of their waits and total tokens over
  *     total time. Averaging the per-call rates would read as a speed no single call achieved.
  *   - `model` is the model that answered, which is not always the one requested: `auto` and a backend
@@ -78,6 +81,12 @@ interface CallStats {
   endedAt?: number;
   /** Parsed stream events are the only honest signal a streaming client has of first token. */
   firstStreamEventAt?: number;
+  /**
+   * The last parsed stream event. A measured rate is divided by the window the tokens actually
+   * arrived in, and that window starts at the first token rather than at the request - otherwise the
+   * queue and the prefill get folded into a number whose whole point is how fast it decoded.
+   */
+  lastStreamEventAt?: number;
   backend?: string;
   /** What rooter's header said, which for `auto` is `auto` rather than a lie. */
   routedModel?: string;
@@ -157,10 +166,14 @@ export default function turnStats(pi: ExtensionAPI): void {
   function decodeRateOfCall(call: CallStats): { rate: number; measured: boolean } | undefined {
     if (call.decodeTokensPerSecond !== undefined) return { rate: call.decodeTokensPerSecond, measured: false };
     const tokens = call.completionTokens;
-    if (tokens === undefined || !call.endedAt) return undefined;
-    // Tokens over the whole call, prefill included, which is why this is a fallback and is marked.
-    const seconds = (call.endedAt - call.startedAt) / 1000;
-    if (seconds <= 0) return undefined;
+    if (tokens === undefined) return undefined;
+    // A held body has no arrival window to measure, and dividing its tokens by the time the proxy
+    // spent waiting would read as a decode rate when it is really a queueing rate. Nothing is the
+    // honest answer for a call that never exposed when its tokens arrived.
+    if (call.firstStreamEventAt === undefined || call.lastStreamEventAt === undefined) return undefined;
+    const seconds = (call.lastStreamEventAt - call.firstStreamEventAt) / 1000;
+    // One token, or a burst Pi parsed in the same millisecond, has no measurable window.
+    if (seconds <= 0 || tokens < 2) return undefined;
     return { rate: tokens / seconds, measured: true };
   }
 
@@ -228,7 +241,7 @@ export default function turnStats(pi: ExtensionAPI): void {
     // Summing rates is wrong the moment a turn has more than one call, so a multi-call turn shows
     // the aggregate that is actually defensible: total tokens over total decode time.
     if (calls.length > 1 && hasTokens && durationMs > 0) {
-      decodeRate = (tokens / (durationMs / 1000)) as number;
+      decodeRate = tokens / (durationMs / 1000);
       decodeMeasured = true;
     }
 
@@ -436,6 +449,7 @@ export default function turnStats(pi: ExtensionAPI): void {
     const call = currentCall();
     call.streamed = true;
     if (call.firstStreamEventAt === undefined) call.firstStreamEventAt = Date.now();
+    call.lastStreamEventAt = Date.now();
     const data = event.data as { model?: unknown; usage?: { completion_tokens?: unknown } } | null;
     if (data && typeof data.model === "string" && data.model && !isRoutingPlaceholder(data.model)) {
       call.answeredModel = data.model;

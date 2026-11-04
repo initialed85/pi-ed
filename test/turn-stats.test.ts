@@ -49,13 +49,16 @@ async function drive(
   pi: FakePi,
   options: {
     headers?: Record<string, string>;
-    streamEvents?: Array<Record<string, unknown>>;
+    streamEvents?: Array<{ data: Record<string, unknown>; advanceMs?: number }>;
+    requestStartToHeadersMs?: number;
+    headersToMessageEndMs?: number;
+    messageEndToTurnEndMs?: number;
     assistant?: { model?: string; responseModel?: string; output?: number };
     hasUI?: boolean;
     cwd?: string;
     statuses?: Array<[string, string]>;
     branch?: string | null;
-    advanceMs?: number;
+
   } = {},
 ): Promise<Installed | undefined> {
   const session = createContext({ hasUI: options.hasUI ?? true, cwd: options.cwd ?? "/home/edward/Projects/Home/rooter" });
@@ -67,42 +70,33 @@ async function drive(
   const component = factory({} as any, fakeTheme, footerData);
 
   await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, session.context);
-  await pi.emit("before_provider_request", { type: "before_provider_request", payload: {} }, session.context);
 
-  // The extension times a call with Date.now(). Advancing the clock is the only way to give a test a
-  // duration that is not zero, and doing it here keeps that out of the extension.
-  if (options.advanceMs) {
-    const real = Date.now;
-    const offset = options.advanceMs;
-    // Everything read after the request started is shifted by the same amount, so a test gets a
-    // duration it chose rather than whatever the two readings happened to differ by.
-    Date.now = () => real() + offset;
-    try {
-      await pi.emit("after_provider_response", { type: "after_provider_response", status: 200, headers: options.headers ?? rooterHeaders() }, session.context);
-      for (const data of options.streamEvents ?? []) {
-        await pi.emit("provider_stream_event", { type: "provider_stream_event", provider: "openai", api: "openai-completions", model: "auto", data }, session.context);
-      }
+  // The extension times a call with Date.now(), so the test owns the clock: a virtual one that
+  // starts at a fixed instant and steps by whatever the test says. Without this every measured
+  // duration in every test would be "however long vitest took to run four lines".
+  const real = Date.now;
+  let virtual = 1_730_000_000_000;
+  const step = (ms: number) => {
+    virtual += ms;
+  };
+  Date.now = () => virtual;
+  try {
+    await pi.emit("before_provider_request", { type: "before_provider_request", payload: {} }, session.context);
+    step(options.requestStartToHeadersMs ?? 0);
+    await pi.emit(
+      "after_provider_response",
+      { type: "after_provider_response", status: 200, headers: options.headers ?? rooterHeaders() },
+      session.context,
+    );
+    for (const event of options.streamEvents ?? []) {
+      step(event.advanceMs ?? 0);
       await pi.emit(
-        "message_end",
-        {
-          type: "message_end",
-          message: {
-            role: "assistant",
-            model: options.assistant?.model ?? "auto",
-            responseModel: options.assistant?.responseModel,
-            usage: { output: options.assistant?.output ?? 8, input: 54, totalTokens: 62 },
-          },
-        },
+        "provider_stream_event",
+        { type: "provider_stream_event", provider: "openai", api: "openai-completions", model: "auto", data: event.data },
         session.context,
       );
-    } finally {
-      Date.now = real;
     }
-  } else {
-    await pi.emit("after_provider_response", { type: "after_provider_response", status: 200, headers: options.headers ?? rooterHeaders() }, session.context);
-    for (const data of options.streamEvents ?? []) {
-      await pi.emit("provider_stream_event", { type: "provider_stream_event", provider: "openai", api: "openai-completions", model: "auto", data }, session.context);
-    }
+    step(options.headersToMessageEndMs ?? 0);
     await pi.emit(
       "message_end",
       {
@@ -116,9 +110,12 @@ async function drive(
       },
       session.context,
     );
+    step(options.messageEndToTurnEndMs ?? 0);
+    await pi.emit("turn_end", { type: "turn_end", turnIndex: 0 }, session.context);
+  } finally {
+    Date.now = real;
   }
 
-  await pi.emit("turn_end", { type: "turn_end", turnIndex: 0 }, session.context);
   return { component, footerData };
 }
 
@@ -198,7 +195,7 @@ describe("turn-stats", () => {
     // `auto` back. The runner's own chunk is the answer.
     const installed = await drive(pi, {
       headers: rooterHeaders({ "x-rooter-model": "auto", "x-rooter-streamed": "1" }),
-      streamEvents: [{ model: "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw" }],
+      streamEvents: [{ data: { model: "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw" } }],
       assistant: { model: "auto", output: 8 },
     });
     expect(installed).toBeDefined();
@@ -210,13 +207,46 @@ describe("turn-stats", () => {
   it("marks a locally measured number so it is not read as the server's", async () => {
     // A stream has no server-measured time to first byte, so this extension times its own arrival.
     // That is a different kind of number and has to look different.
+    // Rooter cannot publish a measurement it did not make, so on a stream it publishes the routing
+    // headers only and every number here is this extension's own. Deleting the measurement headers is
+    // what the wire actually looks like, not a shortcut.
     const headers = rooterHeaders({ "x-rooter-streamed": "1" });
-    delete headers["x-rooter-ttft-ms"];
-    delete headers["x-rooter-decode-tok-s"];
-    const installed = await drive(pi, { headers, streamEvents: [{ model: "qwen-model" }], advanceMs: 900 });
+    for (const key of ["x-rooter-ttft-ms", "x-rooter-decode-tok-s", "x-rooter-prefill-tok-s", "x-rooter-completion-tokens", "x-rooter-cache-hit-rate"]) {
+      delete headers[key];
+    }
+    // Twelve tokens arriving two hundred milliseconds apart is a decoding window the extension can
+    // actually measure; twelve tokens and no timestamps would be a number out of nothing.
+    const installed = await drive(pi, {
+      headers,
+      assistant: { model: "auto", output: 12 },
+      requestStartToHeadersMs: 400,
+      streamEvents: [
+        { data: { model: "qwen-model" }, advanceMs: 100 },
+        ...Array.from({ length: 11 }, () => ({ data: { choices: [{ delta: { content: "x" } }] }, advanceMs: 200 })),
+      ],
+    });
     expect(installed).toBeDefined();
     const text = line(installed!.component);
-    expect(text).toMatch(/ttft ~\d+m?s\b/);
+    expect(text).toMatch(/ttft ~500ms/);
+    // 12 tokens over the 2.2s they arrived in, not over the 2.7s the call existed for.
+    expect(text).toMatch(/~5\.5 tok\/s/);
+  });
+
+  it("publishes no measured rate for a held body it cannot time", async () => {
+    // No runner rate and no arrival window is not license to divide tokens by wall clock. That
+    // number has queueing and prefill in it and would be a decode rate in name only.
+    const headers = rooterHeaders();
+    delete headers["x-rooter-decode-tok-s"];
+    const installed = await drive(pi, {
+      headers,
+      assistant: { model: "auto", output: 8 },
+      requestStartToHeadersMs: 300,
+      headersToMessageEndMs: 9_000,
+    });
+    expect(installed).toBeDefined();
+    const text = line(installed!.component);
+    expect(text).not.toContain("tok/s");
+    expect(text).toContain("182ms");
   });
 
   it("trusts the runner's rate over its own arithmetic", async () => {
