@@ -87,6 +87,13 @@ interface CallStats {
    * queue and the prefill get folded into a number whose whole point is how fast it decoded.
    */
   lastStreamEventAt?: number;
+  /**
+   * The first event that carried a character the user could see. This is the one that matters and it
+   * is not the first event: llama.cpp opens every stream with an empty delta, so "first chunk" means
+   * "the runner accepted the request" and can be six seconds earlier than the first word. Measuring
+   * to it produces a time-to-first-token of 99ms for a response nobody has read yet.
+   */
+  firstContentEventAt?: number;
   backend?: string;
   /** What rooter's header said, which for `auto` is `auto` rather than a lie. */
   routedModel?: string;
@@ -153,8 +160,9 @@ export default function turnStats(pi: ExtensionAPI): void {
   function ttftOfCall(call: CallStats): { ms: number; measured: boolean } | undefined {
     if (call.serverTtftMs !== undefined) return { ms: call.serverTtftMs, measured: false };
     // Only a stream needs a local measurement, and only a stream can supply one.
-    if (call.firstStreamEventAt !== undefined) {
-      return { ms: call.firstStreamEventAt - call.startedAt, measured: true };
+    const anchor = call.firstContentEventAt ?? call.firstStreamEventAt;
+    if (anchor !== undefined) {
+      return { ms: anchor - call.startedAt, measured: true };
     }
     return undefined;
   }
@@ -171,7 +179,8 @@ export default function turnStats(pi: ExtensionAPI): void {
     // spent waiting would read as a decode rate when it is really a queueing rate. Nothing is the
     // honest answer for a call that never exposed when its tokens arrived.
     if (call.firstStreamEventAt === undefined || call.lastStreamEventAt === undefined) return undefined;
-    const seconds = (call.lastStreamEventAt - call.firstStreamEventAt) / 1000;
+    const anchor = call.firstContentEventAt ?? call.firstStreamEventAt;
+    const seconds = (call.lastStreamEventAt - anchor) / 1000;
     // One token, or a burst Pi parsed in the same millisecond, has no measurable window.
     if (seconds <= 0 || tokens < 2) return undefined;
     return { rate: tokens / seconds, measured: true };
@@ -448,9 +457,10 @@ export default function turnStats(pi: ExtensionAPI): void {
   pi.on("provider_stream_event", (event) => {
     const call = currentCall();
     call.streamed = true;
+    const data = event.data as StreamChunk | null;
     if (call.firstStreamEventAt === undefined) call.firstStreamEventAt = Date.now();
+    if (call.firstContentEventAt === undefined && carriesContent(data)) call.firstContentEventAt = Date.now();
     call.lastStreamEventAt = Date.now();
-    const data = event.data as { model?: unknown; usage?: { completion_tokens?: unknown } } | null;
     if (data && typeof data.model === "string" && data.model && !isRoutingPlaceholder(data.model)) {
       call.answeredModel = data.model;
     }
@@ -491,6 +501,36 @@ export default function turnStats(pi: ExtensionAPI): void {
     // line becomes worth redrawing, so say so instead of hoping a layout pass notices.
     installed?.footer.invalidate();
   });
+}
+
+/**
+ * Whether a parsed provider chunk carries text a user would see.
+ *
+ * Written against the openai-completions chunk shape rooter terminates, and against Pi's own delta
+ * names as well, because an extension reading a stream is reading whatever the API in front of it
+ * happened to emit and a wrong answer here silently moves the time-to-first-token back to the empty
+ * opening chunk.
+ */
+function carriesContent(data: StreamChunk | null): boolean {
+  if (!data) return false;
+  if (typeof data.content === "string" && data.content.length > 0) return true;
+  if (typeof data.text === "string" && data.text.length > 0) return true;
+  if (typeof data.textDelta === "string" && data.textDelta.length > 0) return true;
+  for (const choice of data.choices ?? []) {
+    const delta = choice?.delta;
+    if (typeof delta?.content === "string" && delta.content.length > 0) return true;
+    if (typeof choice?.text === "string" && choice.text.length > 0) return true;
+  }
+  return false;
+}
+
+interface StreamChunk {
+  model?: unknown;
+  content?: unknown;
+  text?: unknown;
+  textDelta?: unknown;
+  choices?: Array<{ delta?: { content?: unknown }; text?: unknown } | null>;
+  usage?: { completion_tokens?: unknown };
 }
 
 function isRoutingPlaceholder(model: string): boolean {

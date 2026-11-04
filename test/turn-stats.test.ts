@@ -227,9 +227,35 @@ describe("turn-stats", () => {
     });
     expect(installed).toBeDefined();
     const text = line(installed!.component);
-    expect(text).toMatch(/ttft ~500ms/);
-    // 12 tokens over the 2.2s they arrived in, not over the 2.7s the call existed for.
-    expect(text).toMatch(/~5\.5 tok\/s/);
+    expect(text).toMatch(/ttft ~700ms/);
+    // 12 tokens over the 2.0s they actually arrived in: not the 2.7s the call existed for, and not
+    // the 2.2s from the empty opening chunk either.
+    expect(text).toMatch(/~6\.0 tok\/s/);
+  });
+
+  it("does not call an empty opening chunk a first token", async () => {
+    // llama.cpp opens every stream with content:"". Timing to it reports 99ms for a response nobody
+    // has read yet, when the first word was six seconds away.
+    const headers = rooterHeaders({ "x-rooter-streamed": "1" });
+    for (const key of ["x-rooter-ttft-ms", "x-rooter-decode-tok-s", "x-rooter-completion-tokens"]) delete headers[key];
+    const installed = await drive(pi, {
+      headers,
+      assistant: { model: "auto", output: 4 },
+      streamEvents: [
+        { data: { choices: [{ delta: { role: "assistant", content: "" } }] }, advanceMs: 60 },
+        { data: { choices: [{ delta: { content: "" } }] }, advanceMs: 40 },
+        { data: { choices: [{ delta: { content: "one" } }] }, advanceMs: 6_000 },
+        { data: { choices: [{ delta: { content: "two" } }] }, advanceMs: 300 },
+        { data: { choices: [{ delta: { content: "three" } }] }, advanceMs: 300 },
+        { data: { choices: [{ delta: { content: "four" } }] }, advanceMs: 300 },
+      ],
+    });
+    expect(installed).toBeDefined();
+    const text = line(installed!.component);
+    expect(text).toMatch(/ttft ~6\.10s/);
+    expect(text).not.toMatch(/ttft ~\d\dms/);
+    // 4 tokens over the 0.9s between the first word and the last.
+    expect(text).toMatch(/~4\.4 tok\/s/);
   });
 
   it("publishes no measured rate for a held body it cannot time", async () => {
