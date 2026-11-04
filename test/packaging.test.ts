@@ -86,6 +86,17 @@ const EXPECTED: Record<string, Surface> = {
     // The one string the analysis pass greps for in the session JSONL.
     entryRenderers: ["model-marker"],
   },
+  "tags.ts": {
+    // Not bookkeeping for its own sake: the footer has to be rebuilt when the branch changes, because
+    // tags are branch-relative and /tree and /resume move the branch out from under it.
+    events: ["session_start", "session_tree"],
+    tools: [],
+    commands: ["tag"],
+    flags: [],
+    messageRenderers: [],
+    // The one string the analysis pass greps for in the session JSONL.
+    entryRenderers: ["tag"],
+  },
 } as const;
 
 const FILES = Object.keys(EXPECTED);

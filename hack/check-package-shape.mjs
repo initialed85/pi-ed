@@ -2,7 +2,7 @@
  * Checks the two things that decide whether this repository is loadable by Pi at all, and which fail
  * silently rather than loudly:
  *
- * 1. `package.json` must carry a `pi.extensions` field pointing at one directory holding the six
+ * 1. `package.json` must carry a `pi.extensions` field pointing at one directory holding the eight
  *    extensions. Pi discovers a subdirectory package through exactly that field
  *    (docs/extensions.md, "Extension discovery"); without it the install succeeds and loads nothing, and
  *    the only symptom is that the extensions appear to be broken.
@@ -19,7 +19,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const EXPECTED_EXTENSIONS = 7;
+const EXPECTED_EXTENSIONS = 8;
 const HOST_PACKAGES = [
   "@earendil-works/pi-ai",
   "@earendil-works/pi-agent-core",

@@ -1,6 +1,6 @@
 # pi-ed
 
-Seven [Pi](https://github.com/earendil-works/pi) extensions I wrote to stop my agents doing the things
+Eight [Pi](https://github.com/earendil-works/pi) extensions I wrote to stop my agents doing the things
 that were wasting my time, plus the tests that keep them honest.
 
 They live in `~/.pi/agent/extensions/` on my machines. This repository is the source of truth: the
@@ -9,8 +9,8 @@ discovery accepts symlinked extension files (`loader.js`: `entry.isFile() || ent
 and `/reload` follows them.
 
 ```
-extensions/   the seven extensions
-test/         vitest suite, 136 tests, no Pi runtime and no network needed
+extensions/   the eight extensions
+test/         vitest suite, 166 tests, no Pi runtime and no network needed
 hack/         check-package-shape.mjs, the CI gate on the package manifest
 .woodpecker/  CI: workflow lint + typecheck + tests
 ```
@@ -165,6 +165,68 @@ jq -r 'select(.customType=="model-marker")
 | Record | `customType: "model-marker"`, `data.v: 1` — the one string a reader should grep for |
 | Score | `0` bad, `1` neutral, `2` good, stored as a number so it can be averaged |
 
+### `tags.ts` — `/tag` hashtags on a turn, or on the session
+
+Labels for later. A hashtag goes on the exchange you are looking at, or on the session as a whole, and
+none of it reaches the model.
+
+```bash
+/tag                             what is tagged, anywhere
+/tag message add #rooter #slow   this exchange: the prompt, its tool calls, its answer
+/tag session add #wip #home-ops  this session, which also puts them in the footer
+/tag message remove #slow
+/tag session clear
+/tag message list
+```
+
+Two scopes, because there are two different things worth labelling. A message tag is about one exchange;
+the footer would be the wrong place for it, because a status line is a slot the next turn overwrites — a
+turn tag shown there reads as though it belongs to whatever you are doing now. Session tags go in the
+footer because they describe the session, and nothing about the next turn can make them stale.
+
+**A message tag is keyed on the turn, not on the leaf.** The record carries both ends of the span:
+`turnId` is the nearest user prompt walking back from the leaf, `messageId` is the last message at the
+time. Tag mid-turn (after the third tool result) and tag again after the answer, and both join up on the
+same exchange; key on the leaf instead and the second tag would describe the first. System entries are
+skipped — a `message` entry with role `system` is the prompt and tool loadout being patched, not something
+anybody said, and it is often the newest entry in the tree.
+
+**The log is append-only, because that is all the session tree allows.** One record is one operation on
+one scope, and what is tagged is what the operations leave behind when replayed along the current branch.
+That has three consequences worth knowing: tags are **branch-relative** (navigate to an earlier point with
+`/tree` and the tags made after it are not there); tags **survive compaction** (the replay reads the raw
+branch, not the compacted context); and an operation that would change nothing **writes nothing**, because
+a record that does nothing makes the log read as though something had been applied.
+
+**Names are normalized so one idea cannot become two tags.** The leading `#` is optional and stripped,
+`#Prod`, `PROD` and `prod` are the same tag, and the stored list is sorted. Letters and numbers from any
+script, then `_ . : / -`, which covers `#home-ops`, `#2026-11-04`, `#v3.0` and `#pi/agent` without allowing
+anything that could be mistaken for another part of the grammar. Tags are separated by spaces or commas.
+
+**Completions cover the grammar only** — the scope, then the verb. `getArgumentCompletions` is handed the
+text typed so far and nothing else: no session, no branch. Offering tag names would mean caching the tags
+this extension last wrote, and that cache goes stale across `/resume`, `/tree` and `/fork`, so it would
+start proposing tags that are no longer there. Typing a hashtag yourself cannot be stale.
+
+Like `/comment` and `/score`, these are `CustomEntry` values written with `pi.appendEntry()`, so Pi's
+`buildSessionContext()` ignores them and `test/tags.test.ts` asserts that with Pi's own context builder.
+A record that names no tags on a `clear` is still rendered, because the log then says the scope was emptied
+rather than showing an empty tag list.
+
+```bash
+jq -r 'select(.customType=="tag")
+       | [.timestamp, .data.scope, .data.op, (.data.tags | join(",")),
+          .data.target.turnId // "session"] | @tsv' \
+  ~/.pi/agent/sessions/*/*.jsonl
+```
+
+| | |
+| --- | --- |
+| Record | `customType: "tag"`, `data.v: 1` — the one string a reader should grep for |
+| Scopes | `message` (one exchange, keyed on its prompt) · `session` (the whole session, shown in the footer) |
+| Ops | `add` · `remove` · `clear`, each one record, replayed along the branch |
+| Knobs | `TAG_VERSION` (1), `MAX_TAG_LENGTH` (64), `MAX_TAGS_PER_SCOPE` (64), `STATUS_KEY` (`tags`) |
+
 ## Tests
 
 ```bash
@@ -176,7 +238,8 @@ registration, tool call, notification and session-manager operation, and fails l
 extension has not been written against — a half-built code path shows up as a test failure instead of a
 mystery in a live session. There is no Pi runtime, no provider and no network: `searxng.ts` is tested
 against a stubbed `fetch`, `test/autopilot.test.ts` holds the hop-limit surface still,
-`test/session-markers.test.ts` proves the marks do not reach the model using Pi's own context builder, and
+`test/session-markers.test.ts` proves the marks do not reach the model using Pi's own context builder,
+`test/tags.test.ts` holds the tag grammar and the branch-relative replay of the append-only log, and
 `test/packaging.test.ts` asserts each extension's whole registration
 surface, so a file that quietly registers nothing cannot pass.
 
