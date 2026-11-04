@@ -244,7 +244,9 @@ describe("turn-stats", () => {
       streamEvents: [
         { data: { choices: [{ delta: { role: "assistant", content: "" } }] }, advanceMs: 60 },
         { data: { choices: [{ delta: { content: "" } }] }, advanceMs: 40 },
-        { data: { choices: [{ delta: { content: "one" } }] }, advanceMs: 6_000 },
+        // What a thinking model actually says first, from a live sushi response.
+        { data: { choices: [{ delta: { reasoning_content: "The" } }] }, advanceMs: 6_000 },
+        { data: { choices: [{ delta: { content: "one" } }] }, advanceMs: 3_000 },
         { data: { choices: [{ delta: { content: "two" } }] }, advanceMs: 300 },
         { data: { choices: [{ delta: { content: "three" } }] }, advanceMs: 300 },
         { data: { choices: [{ delta: { content: "four" } }] }, advanceMs: 300 },
@@ -254,8 +256,11 @@ describe("turn-stats", () => {
     const text = line(installed!.component);
     expect(text).toMatch(/ttft ~6\.10s/);
     expect(text).not.toMatch(/ttft ~\d\dms/);
-    // 4 tokens over the 0.9s between the first word and the last.
-    expect(text).toMatch(/~4\.4 tok\/s/);
+    // Not the first content delta either: the thinking arrived nine seconds before it,
+    // and thinking is something the reader watches.
+    expect(text).not.toMatch(/ttft ~9/);
+    // 4 tokens over the 3.9s between the first word and the last.
+    expect(text).toMatch(/~1\.0 tok\/s/);
   });
 
   it("publishes no measured rate for a held body it cannot time", async () => {

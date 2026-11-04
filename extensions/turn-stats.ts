@@ -519,6 +519,11 @@ function carriesContent(data: StreamChunk | null): boolean {
   for (const choice of data.choices ?? []) {
     const delta = choice?.delta;
     if (typeof delta?.content === "string" && delta.content.length > 0) return true;
+    // A thinking model says this first. Live proof that it belongs here: a sushi
+    // response streamed twenty deltas as reasoning_content and its only content
+    // field was the empty opening one, so a check limited to content measures the
+    // end of the thinking as the first word.
+    if (typeof delta?.reasoning_content === "string" && delta.reasoning_content.length > 0) return true;
     if (typeof choice?.text === "string" && choice.text.length > 0) return true;
   }
   return false;
@@ -529,7 +534,7 @@ interface StreamChunk {
   content?: unknown;
   text?: unknown;
   textDelta?: unknown;
-  choices?: Array<{ delta?: { content?: unknown }; text?: unknown } | null>;
+  choices?: Array<{ delta?: { content?: unknown; reasoning_content?: unknown }; text?: unknown } | null>;
   usage?: { completion_tokens?: unknown };
 }
 
