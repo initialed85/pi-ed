@@ -86,6 +86,25 @@ const EXPECTED: Record<string, Surface> = {
     // The one string the analysis pass greps for in the session JSONL.
     entryRenderers: ["model-marker"],
   },
+  "turn-stats.ts": {
+    // The footer is installed from a lifecycle context, so these are what it has to listen to in
+    // order to time a provider call and name the model that answered it.
+    events: [
+      "session_start",
+      "session_tree",
+      "turn_start",
+      "before_provider_request",
+      "after_provider_response",
+      "provider_stream_event",
+      "message_end",
+      "turn_end",
+    ],
+    tools: [],
+    commands: [],
+    flags: [],
+    messageRenderers: [],
+    entryRenderers: [],
+  },
   "tags.ts": {
     // Not bookkeeping for its own sake: the footer has to be rebuilt when the branch changes, because
     // tags are branch-relative and /tree and /resume move the branch out from under it.
@@ -209,6 +228,11 @@ describe("extensions directory", () => {
           "context",
           "user_bash",
           "model_select",
+          // The provider-facing events. They are the only place a client can see response headers, and
+          // the only honest way to time a call and hear which model a stream actually used.
+          "before_provider_request",
+          "after_provider_response",
+          "provider_stream_event",
         ]);
         for (const event of new Set(pi.lifecycleEvents)) {
           expect(known.has(event), `${name}: unknown event "${event}"`).toBe(true);
