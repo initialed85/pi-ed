@@ -4,9 +4,10 @@ import { fileURLToPath } from "node:url";
 
 import { visibleWidth } from "@earendil-works/pi-tui";
 
-import { createFakeFooterData, createFakePi, createContext, fakeTheme, type FakePi } from "./harness.ts";
+import { createContext, createFakePi, fakeTheme, type FakePi } from "./harness.ts";
 
 const MODULE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../extensions/turn-stats.ts");
+const ENTRY_TYPE = "turn-stats";
 
 /** Load the extension against a fresh module registry, so its module-level state starts empty. */
 async function load(): Promise<FakePi> {
@@ -18,7 +19,6 @@ async function load(): Promise<FakePi> {
   mod.default(pi as any);
   return pi;
 }
-
 
 const WIDTH = 100;
 
@@ -39,41 +39,49 @@ function rooterHeaders(over: Record<string, string> = {}): Record<string, string
   };
 }
 
-interface Installed {
-  component: any;
-  footerData: ReturnType<typeof createFakeFooterData>;
+/**
+ * Drop the measurement headers the way rooter does on a stream.
+ *
+ * Rooter cannot publish a time-to-first-byte it did not observe, and a stream's headers and its first
+ * byte are the same instant, so the wire genuinely carries only the routing headers. Deleting them
+ * here is what the proxy sends, not a test shortcut.
+ */
+function streamHeaders(over: Record<string, string> = {}): Record<string, string> {
+  const headers = rooterHeaders({ "x-rooter-streamed": "1", ...over });
+  for (const key of ["x-rooter-ttft-ms", "x-rooter-decode-tok-s", "x-rooter-prefill-tok-s", "x-rooter-completion-tokens", "x-rooter-cache-hit-rate"]) {
+    delete headers[key];
+  }
+  return headers;
 }
 
-/** Drive the extension the way Pi does: session start, then a provider call, then turn end. */
-async function drive(
-  pi: FakePi,
-  options: {
-    headers?: Record<string, string>;
-    streamEvents?: Array<{ data: Record<string, unknown>; advanceMs?: number }>;
-    requestStartToHeadersMs?: number;
-    headersToMessageEndMs?: number;
-    messageEndToTurnEndMs?: number;
-    assistant?: { model?: string; responseModel?: string; output?: number };
-    hasUI?: boolean;
-    cwd?: string;
-    statuses?: Array<[string, string]>;
-    branch?: string | null;
+interface DriveOptions {
+  headers?: Record<string, string>;
+  streamEvents?: Array<{ data: Record<string, unknown>; advanceMs?: number }>;
+  /** Wall clock from the request to the response headers arriving. */
+  requestStartToHeadersMs?: number;
+  headersToMessageEndMs?: number;
+  assistant?: { model?: string; responseModel?: string; output?: number; stopReason?: string };
+  hasUI?: boolean;
+  mode?: "tui" | "rpc" | "print" | "json";
+}
 
-  } = {},
-): Promise<Installed | undefined> {
-  const session = createContext({ hasUI: options.hasUI ?? true, cwd: options.cwd ?? "/home/edward/Projects/Home/rooter" });
+/**
+ * Drive the extension the way Pi does, and return the rows it wrote to the transcript.
+ *
+ * The extension times a call with `Date.now()`, so this owns the clock: a virtual one that starts at
+ * a fixed instant and steps by whatever the test says. Without it, every measured duration in every
+ * test would be "however long vitest took to run four lines".
+ */
+async function drive(pi: FakePi, options: DriveOptions = {}): Promise<any[]> {
+  const session = createContext({
+    hasUI: options.hasUI ?? true,
+    mode: options.mode,
+    cwd: "/home/edward/Projects/Home/rooter",
+  });
   await pi.emit("session_start", { type: "session_start" }, session.context);
-  const factory = session.ui.footerFactory;
-  if (!factory) return undefined;
-
-  const footerData = createFakeFooterData({ branch: options.branch ?? "master", statuses: options.statuses ?? [] });
-  const component = factory({} as any, fakeTheme, footerData);
 
   await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, session.context);
 
-  // The extension times a call with Date.now(), so the test owns the clock: a virtual one that
-  // starts at a fixed instant and steps by whatever the test says. Without this every measured
-  // duration in every test would be "however long vitest took to run four lines".
   const real = Date.now;
   let virtual = 1_730_000_000_000;
   const step = (ms: number) => {
@@ -105,29 +113,41 @@ async function drive(
           role: "assistant",
           model: options.assistant?.model ?? "auto",
           responseModel: options.assistant?.responseModel,
+          stopReason: options.assistant?.stopReason,
           usage: { output: options.assistant?.output ?? 8, input: 54, totalTokens: 62 },
         },
       },
       session.context,
     );
-    step(options.messageEndToTurnEndMs ?? 0);
-    await pi.emit("turn_end", { type: "turn_end", turnIndex: 0 }, session.context);
+    await pi.emit("agent_end", { type: "agent_end", messages: [] }, session.context);
   } finally {
     Date.now = real;
   }
 
-  return { component, footerData };
+  return pi.appendedEntries.filter((entry) => entry.type === ENTRY_TYPE);
 }
 
-/** The footer renders exactly one line; tests read it without the colour tags the fake theme adds. */
-function line(component: any, width = WIDTH): string {
+/** Draw one appended row the way Pi would, and return the plain text it painted. */
+function paint(pi: FakePi, entry: any, width = WIDTH, expanded = false): string {
+  const renderer = pi.entryRenderers.get(ENTRY_TYPE);
+  if (!renderer) throw new Error("test: extension registered no entry renderer");
+  const component = renderer({ type: "custom", customType: ENTRY_TYPE, data: entry.data }, { expanded }, fakeTheme);
+  expect(component).toBeDefined();
   const lines = component.render(width);
-  expect(lines).toHaveLength(1);
-  // pi-tui's own truncateToWidth can emit an SGR reset, and the fake theme tags every fragment with
-  // a bracketed colour name. Neither is content a reader sees, so neither belongs in an assertion.
-  return lines[0]
+  expect(lines.length).toBeGreaterThanOrEqual(1);
+  // The fake theme tags every fragment with a bracketed colour name and pi-tui's own
+  // truncateToWidth can emit an SGR reset. Neither is content a reader sees.
+  return lines
+    .join("\n")
     .replace(/\u001b\[[0-9;]*m/g, "")
-    .replace(/\[[a-zA-Z]+\]|\[\/[a-zA-Z]+\]/g, "");
+    .replace(/\[[a-zA-Z]+\]|\[\/[a-zA-Z]+\]/g, "")
+    .trimEnd();
+}
+
+/** The single row a drive produced, painted. Fails loudly if the turn produced more than one. */
+function one(pi: FakePi, entries: any[], width = WIDTH, expanded = false): string {
+  expect(entries).toHaveLength(1);
+  return paint(pi, entries[0], width, expanded);
 }
 
 describe("turn-stats", () => {
@@ -141,83 +161,76 @@ describe("turn-stats", () => {
     expect(pi.commands.size).toBe(0);
     expect(pi.tools.size).toBe(0);
     expect(pi.flags.size).toBe(0);
+    expect(pi.entryRenderers.has(ENTRY_TYPE)).toBe(true);
   });
 
-  it("draws nothing where there is no footer to draw", async () => {
-    const session = createContext({ hasUI: false, mode: "print" });
-    await pi.emit("session_start", { type: "session_start" }, session.context);
-    expect(session.ui.footerFactory).toBeUndefined();
+  it("writes the row as a session entry, so the model never sees it", async () => {
+    const entries = await drive(pi);
+    expect(entries).toHaveLength(1);
+    // The alternative API renders identically and then hands the whole thing to the model as a user
+    // turn. A stats line that costs context tokens is a stats line that gets you fired.
+    expect(pi.sentUserMessages).toHaveLength(0);
+    expect(pi.messageRenderers.size).toBe(0);
   });
 
-  it("renders one dim line with the time, the wait, the rate, the model and the box", async () => {
-    const installed = await drive(pi, { branch: "master" });
-    expect(installed).toBeDefined();
-    // Wide enough for both halves. At 100 columns the stats win the space and the path is dropped,
-    // which is the priority the footer states; asserting the path here is asserting the layout, not
-    // the numbers.
-    const text = line(installed!.component, 120);
+  it("draws nothing where there is no transcript to draw into", async () => {
+    const entries = await drive(pi, { hasUI: false, mode: "print" });
+    expect(entries).toHaveLength(0);
+  });
 
-    expect(text).toContain("master");
-    expect(text).toContain("Projects/Home/rooter");
+  it("shows the time, the wait, the rate, the model and the box", async () => {
+    const text = one(pi, await drive(pi));
     // Rooter said 48.2 tok/s and 8 tokens out; both are the runner's numbers, not this extension's.
     expect(text).toContain("48.2 tok/s");
     expect(text).toContain("qwen3.8-flash-next-iq3_xxs");
     expect(text).toContain("→ strata");
     // A clock to the second is the whole of "when", and it costs one token of width.
     expect(text).toMatch(/\b\d{2}:\d{2}:\d{2}\b/);
-    // The three extras that live on /rooter/metrics and in Grafana are deliberately not here: the
-    // line is five fields wide so the model name does not have to share it with a cache ratio.
+    // The extras that live on /rooter/metrics and in Grafana are deliberately not here: the line is
+    // five fields wide so the model name does not have to share it with a cache ratio.
     expect(text).not.toContain("cache");
     expect(text).not.toContain("prefill");
-    expect(text).not.toContain(" out ");
+    expect(text).not.toContain("8 tok");
   });
 
-  it("right-aligns the stats and drops the path before it drops a number", async () => {
-    const installed = await drive(pi);
-    expect(installed).toBeDefined();
+  it("pushes the row to the right edge of the transcript", async () => {
+    const text = one(pi, await drive(pi), 120);
+    expect(visibleWidth(text)).toBe(120);
+    expect(text.endsWith("→ strata")).toBe(true);
+    // Narrower than the row: the padding goes, the numbers stay, and the tail is what gets cut.
+    // A fresh extension, because a second drive on the same one would add a second row.
+    const second = await load();
+    const cut = one(second, await drive(second), 40);
+    expect(cut).toContain("48.2 tok/s");
+    expect(visibleWidth(cut)).toBeLessThanOrEqual(40);
+  });
 
-    // Wide enough for both halves: the line is padded out to the viewport and the stats sit at the
-    // right edge, which is the only way a single line can be right-aligned.
-    const wide = line(installed!.component, 120);
-    expect(visibleWidth(wide)).toBe(120);
-    expect(wide.endsWith("→ strata")).toBe(true);
-    expect(wide).toContain("Projects/Home/rooter");
-
-    // Not wide enough for both: the path goes, the numbers stay.
-    const narrow = line(installed!.component, 70);
-    expect(narrow).toContain("48.2 tok/s");
-    expect(narrow).not.toContain("Projects/Home/rooter");
-    expect(narrow.endsWith("→ strata")).toBe(true);
+  it("is dim, because it is a margin note and not an answer", async () => {
+    const entries = await drive(pi);
+    const renderer = pi.entryRenderers.get(ENTRY_TYPE)!;
+    const component = renderer({ type: "custom", customType: ENTRY_TYPE, data: entries[0].data }, { expanded: false }, fakeTheme);
+    const raw = component.render(100)[0];
+    expect(raw).toContain("[dim]");
   });
 
   it("names the model that answered rather than the alias that was requested", async () => {
     // Rooter cannot know at header time which model `auto` will land on, and says so by sending
     // `auto` back. The runner's own chunk is the answer.
-    const installed = await drive(pi, {
+    const entries = await drive(pi, {
       headers: rooterHeaders({ "x-rooter-model": "auto", "x-rooter-streamed": "1" }),
       streamEvents: [{ data: { model: "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw" } }],
       assistant: { model: "auto", output: 8 },
     });
-    expect(installed).toBeDefined();
-    const text = line(installed!.component);
+    const text = one(pi, entries);
     expect(text).toContain("beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw");
     expect(text).not.toContain(" auto ");
   });
 
   it("marks a locally measured number so it is not read as the server's", async () => {
-    // A stream has no server-measured time to first byte, so this extension times its own arrival.
-    // That is a different kind of number and has to look different.
-    // Rooter cannot publish a measurement it did not make, so on a stream it publishes the routing
-    // headers only and every number here is this extension's own. Deleting the measurement headers is
-    // what the wire actually looks like, not a shortcut.
-    const headers = rooterHeaders({ "x-rooter-streamed": "1" });
-    for (const key of ["x-rooter-ttft-ms", "x-rooter-decode-tok-s", "x-rooter-prefill-tok-s", "x-rooter-completion-tokens", "x-rooter-cache-hit-rate"]) {
-      delete headers[key];
-    }
     // Twelve tokens arriving two hundred milliseconds apart is a decoding window the extension can
     // actually measure; twelve tokens and no timestamps would be a number out of nothing.
-    const installed = await drive(pi, {
-      headers,
+    const entries = await drive(pi, {
+      headers: streamHeaders(),
       assistant: { model: "auto", output: 12 },
       requestStartToHeadersMs: 400,
       streamEvents: [
@@ -225,8 +238,7 @@ describe("turn-stats", () => {
         ...Array.from({ length: 11 }, () => ({ data: { choices: [{ delta: { content: "x" } }] }, advanceMs: 200 })),
       ],
     });
-    expect(installed).toBeDefined();
-    const text = line(installed!.component);
+    const text = one(pi, entries);
     expect(text).toMatch(/ttft ~700ms/);
     // 12 tokens over the 2.0s they actually arrived in: not the 2.7s the call existed for, and not
     // the 2.2s from the empty opening chunk either.
@@ -236,10 +248,8 @@ describe("turn-stats", () => {
   it("does not call an empty opening chunk a first token", async () => {
     // llama.cpp opens every stream with content:"". Timing to it reports 99ms for a response nobody
     // has read yet, when the first word was six seconds away.
-    const headers = rooterHeaders({ "x-rooter-streamed": "1" });
-    for (const key of ["x-rooter-ttft-ms", "x-rooter-decode-tok-s", "x-rooter-completion-tokens"]) delete headers[key];
-    const installed = await drive(pi, {
-      headers,
+    const entries = await drive(pi, {
+      headers: streamHeaders(),
       assistant: { model: "auto", output: 4 },
       streamEvents: [
         { data: { choices: [{ delta: { role: "assistant", content: "" } }] }, advanceMs: 60 },
@@ -252,8 +262,7 @@ describe("turn-stats", () => {
         { data: { choices: [{ delta: { content: "four" } }] }, advanceMs: 300 },
       ],
     });
-    expect(installed).toBeDefined();
-    const text = line(installed!.component);
+    const text = one(pi, entries);
     expect(text).toMatch(/ttft ~6\.10s/);
     expect(text).not.toMatch(/ttft ~\d\dms/);
     // Not the first content delta either: the thinking arrived nine seconds before it,
@@ -268,50 +277,46 @@ describe("turn-stats", () => {
     // number has queueing and prefill in it and would be a decode rate in name only.
     const headers = rooterHeaders();
     delete headers["x-rooter-decode-tok-s"];
-    const installed = await drive(pi, {
+    const entries = await drive(pi, {
       headers,
       assistant: { model: "auto", output: 8 },
       requestStartToHeadersMs: 300,
       headersToMessageEndMs: 9_000,
     });
-    expect(installed).toBeDefined();
-    const text = line(installed!.component);
+    const text = one(pi, entries);
     expect(text).not.toContain("tok/s");
     expect(text).toContain("182ms");
   });
 
   it("trusts the runner's rate over its own arithmetic", async () => {
-    const installed = await drive(pi, { headers: rooterHeaders({ "x-rooter-decode-tok-s": "12.5" }) });
-    expect(installed).toBeDefined();
-    const text = line(installed!.component);
+    const text = one(pi, await drive(pi, { headers: rooterHeaders({ "x-rooter-decode-tok-s": "12.5" }) }));
     expect(text).toContain("12.5 tok/s");
     expect(text).not.toContain("~12.5");
   });
 
   it("keeps working against a backend that publishes nothing", async () => {
-    // Not every model is behind rooter, and a footer that only works when a proxy cooperates is a
-    // footer that breaks when one is removed.
-    const installed = await drive(pi, { headers: {}, assistant: { model: "some-model", responseModel: "some-model", output: 12 } });
-    expect(installed).toBeDefined();
-    const text = line(installed!.component);
+    // Not every model is behind rooter, and a line that only works when a proxy cooperates is a
+    // line that breaks when one is removed.
+    const text = one(pi, await drive(pi, { headers: {}, assistant: { model: "some-model", responseModel: "some-model", output: 12 } }));
     expect(text).toContain("some-model");
     expect(text).not.toContain("→");
-    expect(text).toContain("some-model");
   });
 
-  it("shows other extensions' statuses, because owning the footer does not mean evicting them", async () => {
-    const installed = await drive(pi, { statuses: [["tags", "tags #rooter #wip"]] });
-    expect(installed).toBeDefined();
-    const text = line(installed!.component);
-    expect(text).toContain("tags #rooter #wip");
+  it("adds the numbers worth having occasionally to the expanded view", async () => {
+    const entries = await drive(pi);
+    const compact = one(pi, entries, 200, false);
+    const expanded = one(pi, entries, 200, true);
+    expect(compact).not.toContain("cache");
+    expect(expanded).toContain("8 tok");
+    expect(expanded).toContain("cache 91%");
+    expect(expanded).toContain("pre 27.0 tok/s");
+    // rooter said 0.004ms, which is four microseconds and is not the same claim as "no wait".
+    expect(expanded).toContain("queued <1ms");
   });
 
-  it("sums the provider calls in a turn rather than showing only the last one", async () => {
+  it("writes one row per answer, so scrollback keeps the pairing", async () => {
     const session = createContext();
     await pi.emit("session_start", { type: "session_start" }, session.context);
-    const footerData = createFakeFooterData({ branch: "master" });
-    const component = session.ui.footerFactory!({} as any, fakeTheme, footerData);
-
     await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, session.context);
     for (const tokens of [8, 12]) {
       await pi.emit("before_provider_request", { type: "before_provider_request", payload: {} }, session.context);
@@ -326,50 +331,44 @@ describe("turn-stats", () => {
         session.context,
       );
     }
-    await pi.emit("turn_end", { type: "turn_end", turnIndex: 0 }, session.context);
+    const entries = pi.appendedEntries.filter((entry) => entry.type === ENTRY_TYPE);
+    expect(entries).toHaveLength(2);
+    // Each row describes the call that produced it, so neither is an average of the other.
+    expect(paint(pi, entries[0], 200, true)).toContain("8 tok");
+    expect(paint(pi, entries[1], 200, true)).toContain("12 tok");
+    expect(paint(pi, entries[0], 200, true)).not.toContain("12 tok");
+  });
 
-    const text = line(component, 140);
-    // Two calls answered and both rates are the runner's own, so the aggregate the footer is allowed
-    // to show is total tokens over total time, which is measurably not "48.2".
-    expect(text).toContain("tok/s");
-    expect(text).not.toContain("48.2 tok/s");
+  it("reports a turn that ended without an answer, rather than nothing", async () => {
+    const session = createContext();
+    await pi.emit("session_start", { type: "session_start" }, session.context);
+    await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, session.context);
+    await pi.emit("before_provider_request", { type: "before_provider_request", payload: {} }, session.context);
+    // Aborted before a message ever landed. The wait was real and it is the interesting one.
+    await pi.emit("agent_end", { type: "agent_end", messages: [] }, session.context);
+    const entries = pi.appendedEntries.filter((entry) => entry.type === ENTRY_TYPE);
+    expect(entries).toHaveLength(1);
+    expect((entries[0].data as { aborted?: boolean }).aborted).toBe(true);
+  });
+
+  it("does not invent a row for a turn that made no provider call", async () => {
+    const session = createContext();
+    await pi.emit("session_start", { type: "session_start" }, session.context);
+    await pi.emit("turn_start", { type: "turn_start", turnIndex: 0, timestamp: Date.now() }, session.context);
+    await pi.emit("agent_end", { type: "agent_end", messages: [] }, session.context);
+    expect(pi.appendedEntries.filter((entry) => entry.type === ENTRY_TYPE)).toHaveLength(0);
   });
 
   it("starts a fresh turn instead of carrying the previous one's numbers", async () => {
     const first = await drive(pi, { headers: rooterHeaders({ "x-rooter-completion-tokens": "8" }) });
-    expect(first).toBeDefined();
-    expect(line(first!.component)).toContain("48.2 tok/s");
+    expect(one(pi, first)).toContain("48.2 tok/s");
 
     const session = createContext();
     await pi.emit("session_start", { type: "session_start" }, session.context);
-    const footerData = createFakeFooterData({ branch: "master" });
-    const component = session.ui.footerFactory!({} as any, fakeTheme, footerData);
     await pi.emit("turn_start", { type: "turn_start", turnIndex: 1, timestamp: Date.now() }, session.context);
-    await pi.emit("turn_end", { type: "turn_end", turnIndex: 1 }, session.context);
-    // A turn with no provider call has nothing to report, and inventing the last turn's numbers
-    // would be the worst thing a stats line could do.
-    const fresh = line(component);
-    expect(fresh).not.toContain("tok/s");
-    expect(fresh).not.toContain("ttft");
-    expect(fresh).not.toContain("strata");
-  });
-
-  it("notices a branch change instead of rendering the branch it happened to start on", async () => {
-    const installed = await drive(pi, { branch: "master" });
-    expect(installed).toBeDefined();
-    expect(line(installed!.component, 120)).toContain("master");
-    installed!.footerData.setBranch("feature/rooter-catalog");
-    installed!.component.invalidate();
-    const text = line(installed!.component, 120);
-    expect(text).toContain("feature/rooter-catalog");
-    expect(text).not.toContain(" master");
-  });
-
-  it("unsubscribes from branch changes when Pi disposes the footer", async () => {
-    const installed = await drive(pi);
-    expect(installed).toBeDefined();
-    expect(installed!.footerData.subscribers).toHaveLength(1);
-    installed!.component.dispose?.();
-    expect(installed!.footerData.subscribers).toHaveLength(0);
+    await pi.emit("agent_end", { type: "agent_end", messages: [] }, session.context);
+    // A second turn with no provider call has nothing to report, and repeating the last turn's
+    // numbers would be the worst thing a stats line could do.
+    expect(pi.appendedEntries.filter((entry) => entry.type === ENTRY_TYPE)).toHaveLength(1);
   });
 });

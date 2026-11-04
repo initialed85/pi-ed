@@ -222,12 +222,9 @@ export interface FakeUi {
   notifications: RecordedNotification[];
   widgets: Map<string, unknown>;
   statuses: Map<string, string | undefined>;
-  /** The factory `ui.setFooter` received, or undefined when the built-in footer is still in place. */
-  footerFactory: ((tui: any, theme: any, footerData: any) => any) | undefined;
   notify: (message: string | undefined, level?: string) => void;
   setWidget: (key: string, value: unknown) => void;
   setStatus: (key: string, value: string | undefined) => void;
-  setFooter: (factory: ((tui: any, theme: any, footerData: any) => any) | undefined) => void;
   [key: string]: unknown;
 }
 
@@ -236,7 +233,6 @@ export function createFakeUi(): FakeUi {
     notifications: [],
     widgets: new Map(),
     statuses: new Map(),
-    footerFactory: undefined,
     notify: (message, level) => {
       ui.notifications.push({ message, level });
     },
@@ -246,11 +242,11 @@ export function createFakeUi(): FakeUi {
     setStatus: (key, value) => {
       ui.statuses.set(key, value);
     },
-    setFooter: (factory) => {
-      ui.footerFactory = factory ?? undefined;
-    },
   };
-  for (const method of ["select", "confirm", "input", "custom", "setEditorText", "addAutocompleteProvider"]) {
+  // setFooter is here rather than modelled because an extension that wants right-aligned per-message
+  // stats now writes them as a session entry instead of owning the footer. A future footer call should
+  // fail the test rather than draw into a double that is not watching.
+  for (const method of ["select", "confirm", "input", "custom", "setEditorText", "addAutocompleteProvider", "setFooter"]) {
     ui[method] = UNIMPLEMENTED(`ui.${method}`);
   }
   return ui;
@@ -437,40 +433,6 @@ export function createContext(options: ContextOptions = {}): ContextRecord {
     completed,
     newSessionArgs,
     state,
-  };
-}
-
-/**
- * A `ReadonlyFooterDataProvider` double, for extensions that replace the footer.
- *
- * Pi hands a footer factory four things it cannot get elsewhere: the git branch, the statuses other
- * extensions set, how many providers are available, and a way to hear about branch changes. The last
- * one matters more than it looks - a footer built once at session start keeps a stale branch after
- * /tree or a checkout, so an extension that owns the footer has to subscribe. This double lets a test
- * flip the branch and assert the footer noticed.
- */
-export function createFakeFooterData(options: { branch?: string | null; statuses?: Iterable<[string, string]>; providerCount?: number } = {}) {
-  const statuses = new Map<string, string>(options.statuses ?? []);
-  const subscribers: Array<() => void> = [];
-  let branch: string | null | undefined = "branch" in options ? options.branch : "main";
-  return {
-    statuses,
-    subscribers,
-    getGitBranch: () => branch ?? null,
-    getExtensionStatuses: () => statuses,
-    getAvailableProviderCount: () => options.providerCount ?? 1,
-    onBranchChange: (cb: () => void) => {
-      subscribers.push(cb);
-      return () => {
-        const at = subscribers.indexOf(cb);
-        if (at >= 0) subscribers.splice(at, 1);
-      };
-    },
-    /** Test helper: Pi's own watcher fires this when .git/HEAD moves. */
-    setBranch(value: string | null) {
-      branch = value;
-      for (const cb of [...subscribers]) cb();
-    },
   };
 }
 

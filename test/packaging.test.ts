@@ -87,8 +87,9 @@ const EXPECTED: Record<string, Surface> = {
     entryRenderers: ["model-marker"],
   },
   "turn-stats.ts": {
-    // The footer is installed from a lifecycle context, so these are what it has to listen to in
-    // order to time a provider call and name the model that answered it.
+    // The row is written from a lifecycle context, so these are what it has to listen to in order to
+    // time a provider call and name the model that answered it. agent_end rather than turn_end
+    // because it is the sweep for a turn that ended without ever producing an answer.
     events: [
       "session_start",
       "session_tree",
@@ -97,13 +98,14 @@ const EXPECTED: Record<string, Surface> = {
       "after_provider_response",
       "provider_stream_event",
       "message_end",
-      "turn_end",
+      "agent_end",
     ],
     tools: [],
     commands: [],
     flags: [],
     messageRenderers: [],
-    entryRenderers: [],
+    // A session entry, not a custom message: entries stay out of the model's context.
+    entryRenderers: ["turn-stats"],
   },
   "tags.ts": {
     // Not bookkeeping for its own sake: the footer has to be rebuilt when the branch changes, because
