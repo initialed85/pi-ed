@@ -307,7 +307,7 @@ describe("turn-stats", () => {
     const compact = one(pi, entries, 200, false);
     const expanded = one(pi, entries, 200, true);
     expect(compact).not.toContain("cache");
-    expect(expanded).toContain("8 tok");
+    expect(expanded).toContain("out 8");
     expect(expanded).toContain("cache 91%");
     expect(expanded).toContain("pre 27.0 tok/s");
     // rooter said 0.004ms, which is four microseconds and is not the same claim as "no wait".
@@ -336,9 +336,9 @@ describe("turn-stats", () => {
     const entries = pi.appendedEntries.filter((entry) => entry.type === ENTRY_TYPE);
     expect(entries).toHaveLength(2);
     // Each row describes the call that produced it, so neither is an average of the other.
-    expect(paint(pi, entries[0], 200, true)).toContain("8 tok");
-    expect(paint(pi, entries[1], 200, true)).toContain("12 tok");
-    expect(paint(pi, entries[0], 200, true)).not.toContain("12 tok");
+    expect(paint(pi, entries[0], 200, true)).toContain("out 8");
+    expect(paint(pi, entries[1], 200, true)).toContain("out 12");
+    expect(paint(pi, entries[0], 200, true)).not.toContain("out 12");
   });
 
   it("reports a turn that ended without an answer, rather than nothing", async () => {
@@ -396,5 +396,120 @@ describe("turn-stats", () => {
     // A second turn with no provider call has nothing to report, and repeating the last turn's
     // numbers would be the worst thing a stats line could do.
     expect(pi.appendedEntries.filter((entry) => entry.type === ENTRY_TYPE)).toHaveLength(1);
+  });
+
+  /**
+   * The tail of a stream carries what a header cannot.
+   *
+   * On a stream rooter sends only the routing headers, because the headers and the first byte are the
+   * same instant and the tokens do not exist yet. The runner's own `usage` and `timings` arrive in the
+   * last chunk instead - which is exactly where rooter reads them from for its event ring, and Pi
+   * hands the same parsed object to an extension. These payloads are copied out of live responses on
+   * strata and on sushi rather than composed here.
+   */
+  const strataWarmTail = {
+    id: "chatcmpl-48c1f88ef05c4b4fa0d67a36",
+    model: "qwen3.8-flash-next-iq3_xxs",
+    choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+    usage: {
+      prompt_tokens: 95589,
+      completion_tokens: 810,
+      total_tokens: 96399,
+      prompt_tokens_details: { cached_tokens: 95545 },
+    },
+    timings: {
+      cache_n: 95545,
+      prompt_n: 44,
+      prompt_ms: 560.5,
+      prompt_per_second: 78.5,
+      predicted_n: 810,
+      predicted_ms: 12101.4,
+      predicted_per_second: 66.9,
+    },
+  };
+
+  const sushiWarmTail = {
+    id: "chatcmpl-1793773452936",
+    model: "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw",
+    choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+    usage: {
+      prompt_tokens: 72292,
+      completion_tokens: 866,
+      total_tokens: 73158,
+      prompt_tokens_details: { cached_tokens: 71550 },
+    },
+    timings: {
+      prompt_n: 72292,
+      cached_n: 71550,
+      prompt_ms: 2711.65,
+      prompt_per_second: 273.634,
+      predicted_n: 866,
+      predicted_ms: 10886.543,
+      predicted_per_second: 42.805,
+      tokenize_ms: 71.136,
+    },
+  };
+
+  it("reads the shape of the prompt out of the final chunk of the stream", async () => {
+    const entries = await drive(pi, {
+      headers: streamHeaders(),
+      streamEvents: [
+        { data: { choices: [{ delta: { content: "here" } }] }, advanceMs: 2000 },
+        { data: strataWarmTail, advanceMs: 11000 },
+      ],
+      assistant: { model: "auto", responseModel: "qwen3.8-flash-next-iq3_xxs", output: 810 },
+    });
+    const expanded = one(pi, entries, 200, true);
+    expect(expanded).toContain("prompt 95589 (95545 cached)");
+    // 95589 - 95545, the tokens this call actually had to evaluate.
+    expect(expanded).toContain("read 44");
+    expect(expanded).toContain("cache 100%");
+    expect(expanded).toContain("pre 561ms @ 78.5 tok/s");
+    expect(expanded).toContain("gen 12.1s @ 66.9 tok/s");
+  });
+
+  it("keeps a warm prompt off the scan line and puts a cold one on it", async () => {
+    const warm = await drive(pi, {
+      headers: streamHeaders(),
+      streamEvents: [
+        { data: { choices: [{ delta: { content: "here" } }] }, advanceMs: 2000 },
+        { data: strataWarmTail, advanceMs: 11000 },
+      ],
+    });
+    // 561ms of prefill in a 13s turn is not what made this slow, and the line should not advertise it.
+    expect(one(pi, warm, 200, false)).not.toContain("pre ");
+
+    // `drive` reports everything appended so far, and one() insists a row describes exactly one call.
+    pi.appendedEntries.length = 0;
+
+    const loaded = await drive(pi, {
+      headers: streamHeaders(),
+      streamEvents: [
+        { data: { choices: [{ delta: { content: "here" } }] }, advanceMs: 2000 },
+        { data: sushiWarmTail, advanceMs: 11550 },
+      ],
+    });
+    // 2.71s of a 13.6s turn spent reading the prompt: that is the fact a reader needs next to the speed.
+    expect(one(pi, loaded, 200, false)).toContain("pre 2.71s");
+  });
+
+  it("works out the size of the job where the two runners agree, not where they do not", async () => {
+    // Live sushi payload. Its `timings.prompt_n` is 72292 - the whole prompt, with the 71550 cached
+    // tokens still counted inside it - while strata's `prompt_n` means the work done. Taking
+    // `prompt_n` at face value here is the arithmetic that put a 166,000 tok/s prefill into the
+    // telemetry store, so the extension never reads that field for this number and subtracts the
+    // cache from the usage block instead, which both runners spell the same way.
+    const entries = await drive(pi, {
+      headers: streamHeaders(),
+      streamEvents: [
+        { data: { choices: [{ delta: { content: "here" } }] }, advanceMs: 2000 },
+        { data: sushiWarmTail, advanceMs: 11550 },
+      ],
+    });
+    const expanded = one(pi, entries, 200, true);
+    expect(expanded).toContain("read 742");
+    expect(expanded).not.toContain("read 72292");
+    expect(expanded).toContain("pre 2.71s @ 274 tok/s");
+    expect(expanded).toContain("gen 10.9s @ 42.8 tok/s");
   });
 });

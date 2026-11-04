@@ -29,17 +29,42 @@
  *     measures it locally - first chunk carrying a real word minus request start - which is the
  *     arrival the client actually experienced. It is marked `~` so a server measurement and a local
  *     one are not read as the same kind of number.
- *   - `tok/s` prefers `X-Rooter-Decode-Tok-S`, the runner's own decode rate. The fallback divides
- *     tokens by the window they arrived in - last parsed stream event minus first - because that is
- *     the only window that is actually decoding. A held body exposes no arrival window at all, so a
- *     call with no runner rate and no stream shows no rate rather than tokens over however long the
- *     proxy spent queueing, which is a different quantity wearing the same unit.
+ *   - `tok/s` prefers the runner's own decode rate, whether it arrived as `X-Rooter-Decode-Tok-S` on a
+ *     held body or as `timings.predicted_per_second` in the last chunk of a stream. The fallback
+ *     divides tokens by the window they arrived in - last parsed stream event minus first - because
+ *     that is the only window that is actually decoding. A held body exposes no arrival window at all,
+ *     so a call with no runner rate and no stream shows no rate rather than tokens over however long
+ *     the proxy spent queueing, which is a different quantity wearing the same unit.
+ *   - `pre` is the time the runner spent on the prompt, and it appears only when the prompt is what
+ *     made the turn slow: at least a second, and at least 15% of the turn. It is a duration and not a
+ *     rate, deliberately. A warm 44-token read runs at 78 tok/s in 0.56s while a cold 93,857-token
+ *     read runs at 1,513 tok/s in 62s - the *rate* is better on the call that took a minute longer -
+ *     so a prefill rate on a line meant for scanning would train a reader to watch the wrong column.
+ *     The rate is under `ctrl+o`.
+ *
+ * On a stream, everything after the routing headers arrives in the body, not the headers. Rooter sends
+ * `X-Rooter-Backend`, `-Model`, `-Route`, `-Request-Id`, `-Streamed` and `-Wait-Ms` and nothing else,
+ * because the headers and the first byte are the same instant and the tokens do not exist yet; the
+ * runner's `usage` and `timings` land in the final SSE chunk, which is the same tail rooter reads for
+ * its own event ring, and Pi hands the parsed object to an extension. So the prompt size, the cached
+ * prefix, the prefill window and both rates come out of the stream.
+ *
+ * `read N` - the tokens a call actually had to evaluate - is computed as `prompt_tokens - cached_tokens`
+ * from the usage block rather than taken from `timings.prompt_n`, and that is not a stylistic choice.
+ * `prompt_n` means the work done on strata and the whole prompt, cached prefix included, on sushi;
+ * trusting it produced 166,000 tok/s prefills in the telemetry store. `prompt_tokens` and
+ * `cached_tokens` are spelled the same way by both runners, so the subtraction is the one route that
+ * works without knowing which llama.cpp build is on the other end.
  *   - `model` is the model that answered, which is not always the one requested: `auto` and a backend
  *     alias are routing decisions, and rooter reports `auto` in the header because it genuinely does
  *     not yet know which model the box will pick. On a stream the runner names the model in its own
  *     chunks, so that wins.
- *   - `ctrl+o` (expand) adds the numbers that are worth having occasionally but not every line:
- *     token count, cache hit rate, prefill rate, and the proxy's own queue wait.
+ *   - `ctrl+o` (expand) writes a second line under the first rather than appending to it: the prompt
+ *     length and how much of it was cached, the work done, the cache rate, the prefill window and its
+ *     rate, the generation window and its rate, the output token count with how much of it was
+ *     thinking, and the proxy's own queue wait. A second line because the scan line is right-aligned
+ *     and truncates from the left in a narrow terminal, and those are the numbers that would be
+ *     truncated away.
  *
  * No flag and no configuration, and nothing at all outside TUI modes: `pi -p` and `--json` have no
  * transcript to decorate, and appending an entry there costs a write to a session nobody is reading.
@@ -89,6 +114,23 @@ interface TurnStatsData {
   waitMs?: number;
   cacheHitPercent?: number;
   prefillRate?: number;
+  /**
+   * How long the runner spent on the prompt. On the collapsed line this is the number that explains a
+   * slow turn, and the prefill *rate* is not: a warm 44-token read runs at 78 tok/s in 0.56s, while a
+   * cold 93,857-token read runs at 1,513 tok/s in 62s. The rate is better on the call that took a
+   * minute longer, so a prefill rate on the scan line would train a reader to watch the wrong column.
+   */
+  prefillMs?: number;
+  decodeMs?: number;
+  promptTokens?: number;
+  cachedTokens?: number;
+  /**
+   * Tokens the runner actually evaluated, taken from the usage block rather than from `prompt_n`.
+   * Both runners spell `prompt_tokens` and `cached_tokens` identically, so this is the one place a
+   * client can work out the size of the job without knowing which llama.cpp build it is talking to.
+   */
+  computedTokens?: number;
+  reasoningTokens?: number;
   /** Set when the answer never arrived, so the line says so instead of showing nothing. */
   aborted?: boolean;
 }
@@ -123,6 +165,14 @@ interface CallStats {
   decodeTokensPerSecond?: number;
   prefillTokensPerSecond?: number;
   cacheHitRate?: number;
+  /** Prompt length and cached prefix, from the runner's usage block. Known on both runners. */
+  promptTokens?: number;
+  cachedTokens?: number;
+  /** The runner's own prefill and decode windows, from `timings`. */
+  prefillMs?: number;
+  decodeMs?: number;
+  /** Tokens the runner spent thinking rather than answering, when it bothers to say. */
+  reasoningTokens?: number;
   /** True when the response arrived as a stream, which is what decides who measures TTFT. */
   streamed: boolean;
   /** Why the provider stopped, read from the assistant message. */
@@ -210,6 +260,16 @@ export default function turnStats(pi: ExtensionAPI): void {
     let decodeMeasured = false;
     let prefillRate: number | undefined;
     let cacheHitPercent: number | undefined;
+    let prefillMs: number | undefined;
+    let decodeMs: number | undefined;
+    let promptTokens = 0;
+    let hasPromptTokens = false;
+    let cachedTokens = 0;
+    let hasCachedTokens = false;
+    let computedTokens = 0;
+    let hasComputedTokens = false;
+    let reasoningTokens = 0;
+    let hasReasoningTokens = false;
     let streamed = false;
     const models: string[] = [];
     const backends: string[] = [];
@@ -233,7 +293,28 @@ export default function turnStats(pi: ExtensionAPI): void {
         decodeMeasured ||= rate.measured;
       }
       if (call.prefillTokensPerSecond !== undefined) prefillRate = call.prefillTokensPerSecond;
+      // Rooter's rate is the fallback for a held body, where the header exists and the counts arrive
+      // as a single derived figure instead of two numbers this code can see.
       if (call.cacheHitRate !== undefined) cacheHitPercent = call.cacheHitRate * 100;
+      if (call.prefillMs !== undefined) prefillMs = (prefillMs ?? 0) + call.prefillMs;
+      if (call.decodeMs !== undefined) decodeMs = (decodeMs ?? 0) + call.decodeMs;
+      if (call.promptTokens !== undefined) {
+        promptTokens += call.promptTokens;
+        hasPromptTokens = true;
+      }
+      if (call.cachedTokens !== undefined) {
+        cachedTokens += call.cachedTokens;
+        hasCachedTokens = true;
+      }
+      if (call.reasoningTokens !== undefined) {
+        reasoningTokens += call.reasoningTokens;
+        hasReasoningTokens = true;
+      }
+      // The size of the job, derived where the two runners agree instead of where they do not.
+      if (call.promptTokens !== undefined) {
+        computedTokens += Math.max(0, call.promptTokens - (call.cachedTokens ?? 0));
+        hasComputedTokens = true;
+      }
       const model = answeredModelByCall(call);
       if (model && !models.includes(model)) models.push(model);
       if (call.backend && !backends.includes(call.backend)) backends.push(call.backend);
@@ -261,8 +342,16 @@ export default function turnStats(pi: ExtensionAPI): void {
       backends,
       streamed,
       waitMs: waitMs || undefined,
-      cacheHitPercent,
+      cacheHitPercent:
+        cacheHitPercent ??
+        (hasPromptTokens && promptTokens > 0 && hasCachedTokens ? (cachedTokens / promptTokens) * 100 : undefined),
       prefillRate,
+      prefillMs,
+      decodeMs,
+      promptTokens: hasPromptTokens ? promptTokens : undefined,
+      cachedTokens: hasCachedTokens ? cachedTokens : undefined,
+      computedTokens: hasComputedTokens ? computedTokens : undefined,
+      reasoningTokens: hasReasoningTokens ? reasoningTokens : undefined,
       aborted: aborted || undefined,
     };
   }
@@ -341,8 +430,33 @@ export default function turnStats(pi: ExtensionAPI): void {
     // Strata and sushi both put usage in the final chunk, so a streaming turn gets real token counts
     // rather than one counted off rendered text.
     const usage = data?.usage;
-    if (usage && typeof usage.completion_tokens === "number" && Number.isFinite(usage.completion_tokens)) {
-      call.completionTokens = usage.completion_tokens;
+    if (usage) {
+      const completion = numField(usage.completion_tokens);
+      if (completion !== undefined) call.completionTokens = completion;
+      const prompt = numField(usage.prompt_tokens);
+      if (prompt !== undefined) call.promptTokens = prompt;
+      const cached = numField(usage.prompt_tokens_details?.cached_tokens);
+      if (cached !== undefined) call.cachedTokens = cached;
+      const reasoning = numField(usage.completion_tokens_details?.reasoning_tokens);
+      if (reasoning !== undefined) call.reasoningTokens = reasoning;
+    }
+    // The runner's timings ride in the same chunk. Rooter reads that tail for its own event ring and
+    // deliberately does not edit a stream, so this is the same data, arriving the same way, and it
+    // arrives here as well whether or not the call went through rooter at all.
+    const timings = data?.timings;
+    if (timings) {
+      const prefillMs = numField(timings.prompt_ms);
+      if (prefillMs !== undefined) call.prefillMs = prefillMs;
+      const prefillRate = numField(timings.prompt_per_second);
+      if (prefillRate !== undefined) call.prefillTokensPerSecond = prefillRate;
+      const decodeMs = numField(timings.predicted_ms);
+      if (decodeMs !== undefined) call.decodeMs = decodeMs;
+      const decodeRate = numField(timings.predicted_per_second);
+      if (decodeRate !== undefined) call.decodeTokensPerSecond = decodeRate;
+      if (call.cachedTokens === undefined) {
+        const cached = numField(timings.cached_n) ?? numField(timings.cache_n);
+        if (cached !== undefined) call.cachedTokens = cached;
+      }
     }
   });
 
@@ -412,22 +526,27 @@ class StatsLine implements Component {
 
   render(width: number): string[] {
     if (this.cachedWidth === width && this.cachedLines.length) return this.cachedLines;
-    const text = format(this.data, this.expanded);
-    const w = visibleWidth(text);
-    let line: string;
-    if (w <= width) line = " ".repeat(Math.max(0, width - w)) + text;
-    else {
+    const { primary, detail } = format(this.data, this.expanded);
+    const lines = [primary, ...(detail ? [detail] : [])].map((text) => {
+      const w = visibleWidth(text);
       // Prefer losing the left padding to losing the model name, then truncate hard.
-      line = truncateToWidth(text, width, "…");
-    }
-    this.cachedLines = [this.theme?.fg?.("dim", line) ?? line];
+      const aligned = w <= width ? " ".repeat(Math.max(0, width - w)) + text : truncateToWidth(text, width, "…");
+      return this.theme?.fg?.("dim", aligned) ?? aligned;
+    });
+    this.cachedLines = lines;
     this.cachedWidth = width;
     return this.cachedLines;
   }
 }
 
-/** The line itself, in the order a reader actually scans it: when, how long, how fast, what answered. */
-function format(data: TurnStatsData, expanded: boolean): string {
+/**
+ * The line itself, in the order a reader actually scans it: when, how long, how fast, what answered.
+ *
+ * Expansion adds a second line rather than appending to the first. The scan line is right-aligned and
+ * truncates from the left when the terminal is narrow; the detail line carries the numbers that would
+ * have been the first casualties of that truncation.
+ */
+function format(data: TurnStatsData, expanded: boolean): { primary: string; detail?: string } {
   const parts: string[] = [];
   parts.push(clock(data.finishedAt));
   if (data.aborted) parts.push("aborted");
@@ -435,20 +554,61 @@ function format(data: TurnStatsData, expanded: boolean): string {
   if (data.hasTtft && data.ttftMs !== undefined) {
     parts.push(`ttft ${data.ttftMeasured ? "~" : ""}${duration(data.ttftMs)}`);
   }
+  // A prompt that took a noticeable slice of the turn is worth naming on the scan line, because it is
+  // the difference between "the model is slow" and "this call had to read 93,857 tokens cold". A
+  // warm call spends most of its time decoding and needs nothing here.
+  if (prefillIsSignificant(data)) parts.push(`pre ${duration(data.prefillMs!)}`);
   if (data.hasDecode && data.decodeRate !== undefined) {
     parts.push(`${data.decodeMeasured ? "~" : ""}${rate(data.decodeRate)} tok/s`);
-  }
-  if (expanded) {
-    if (data.tokens !== undefined) parts.push(`${data.tokens} tok`);
-    if (data.cacheHitPercent !== undefined) parts.push(`cache ${Math.round(data.cacheHitPercent)}%`);
-    if (data.prefillRate !== undefined) parts.push(`pre ${rate(data.prefillRate)} tok/s`);
-    if (data.waitMs !== undefined) parts.push(`queued ${duration(data.waitMs)}`);
   }
   const answered = data.models.join(", ");
   const boxes = data.backends.join(", ");
   if (answered) parts.push(shortenModel(answered));
   if (boxes) parts.push(`→ ${boxes}`);
-  return parts.join("  ");
+
+  return { primary: parts.join("  "), detail: expanded ? detailLine(data) : undefined };
+}
+
+/**
+ * Whether the prompt itself, rather than the queue or the decode, is what made this turn slow.
+ *
+ * Both halves matter: a 3s prefill inside a 40s turn is a detail, and a 1s prefill in a 1.2s turn is
+ * the whole story. Neither is answered by the duration alone.
+ */
+function prefillIsSignificant(data: TurnStatsData): boolean {
+  if (data.prefillMs === undefined || data.prefillMs < 1000) return false;
+  return data.prefillMs >= data.durationMs * 0.15;
+}
+
+/** The second line, only under ctrl+o: the shape of the prompt and where the wall clock actually went. */
+function detailLine(data: TurnStatsData): string | undefined {
+  const parts: string[] = [];
+  if (data.promptTokens !== undefined) {
+    const cached = data.cachedTokens !== undefined ? ` (${data.cachedTokens} cached)` : "";
+    parts.push(`prompt ${data.promptTokens}${cached}`);
+    if (data.computedTokens !== undefined) parts.push(`read ${data.computedTokens}`);
+  }
+  if (data.cacheHitPercent !== undefined) parts.push(`cache ${Math.round(data.cacheHitPercent)}%`);
+  // Either half on its own is still worth saying. A held body knows the rate and not the window; a
+  // runner that reports timings but no usage knows the window and not the rate.
+  if (data.prefillMs !== undefined || data.prefillRate !== undefined) {
+    const head = data.prefillMs !== undefined ? duration(data.prefillMs) : undefined;
+    const ratePart = data.prefillRate !== undefined ? `${head ? " @ " : ""}${rate(data.prefillRate)} tok/s` : "";
+    parts.push(`pre ${head ?? ""}${ratePart}`.trimEnd());
+  }
+  // The decode rate is already on the scan line. Here it is the *window* that earns its place,
+  // because "gen 27s" is what tells a reader where the rest of the turn went.
+  if (data.decodeMs !== undefined) {
+    const ratePart = data.decodeRate !== undefined ? ` @ ${rate(data.decodeRate)} tok/s` : "";
+    parts.push(`gen ${duration(data.decodeMs)}${ratePart}`);
+  }
+  if (data.tokens !== undefined) {
+    const thinking =
+      data.reasoningTokens !== undefined && data.reasoningTokens > 0 ? ` (${data.reasoningTokens} thinking)` : "";
+    parts.push(`out ${data.tokens}${thinking}`);
+  }
+  if (data.waitMs !== undefined) parts.push(`queued ${duration(data.waitMs)}`);
+  return parts.length ? parts.join("  ") : undefined;
 }
 
 function clock(value: number): string {
@@ -512,7 +672,41 @@ interface StreamChunk {
   text?: unknown;
   textDelta?: unknown;
   choices?: Array<{ delta?: { content?: unknown; reasoning_content?: unknown }; text?: unknown } | null>;
-  usage?: { completion_tokens?: unknown };
+  /**
+   * The token block a runner puts in its final chunk. Read from the body rather than a header
+   * because on a stream there is no header left to set: the headers and the first byte are the same
+   * instant, and the tokens do not exist yet.
+   *
+   * `prompt_tokens` and `prompt_tokens_details.cached_tokens` are the two that matter most, and
+   * they are worth naming because of what they avoid. llama.cpp's `timings.prompt_n` means the work
+   * done on strata and the whole prompt, cached prefix included, on sushi - which has already put
+   * 166,000 tok/s prefills into the telemetry store. The usage block is spelled the same way by
+   * both runners, so `prompt_tokens - cached_tokens` is the work done on either of them without
+   * having to know which one this is.
+   */
+  usage?: {
+    prompt_tokens?: unknown;
+    completion_tokens?: unknown;
+    prompt_tokens_details?: { cached_tokens?: unknown };
+    completion_tokens_details?: { reasoning_tokens?: unknown };
+  };
+  /** The runner's own timings, in the same final chunk. Present on strata and on sushi. */
+  timings?: {
+    prompt_n?: unknown;
+    cached_n?: unknown;
+    cache_n?: unknown;
+    prompt_ms?: unknown;
+    prompt_per_second?: unknown;
+    predicted_n?: unknown;
+    predicted_ms?: unknown;
+    predicted_per_second?: unknown;
+  };
+}
+
+/** Loose readers for a provider body: these fields are the runner's, not ours, and any of them can be absent. */
+function numField(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return value;
 }
 
 function isRoutingPlaceholder(model: string): boolean {
