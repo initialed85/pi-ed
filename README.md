@@ -1,6 +1,6 @@
 # pi-ed
 
-Ten [Pi](https://github.com/earendil-works/pi) extensions I wrote to stop my agents doing the things
+The [Pi](https://github.com/earendil-works/pi) extensions I wrote to stop my agents doing the things
 that were wasting my time, plus the tests that keep them honest.
 
 They live in `~/.pi/agent/extensions/` on my machines. This repository is the source of truth: the
@@ -9,8 +9,8 @@ discovery accepts symlinked extension files (`loader.js`: `entry.isFile() || ent
 and `/reload` follows them.
 
 ```
-extensions/   the ten extensions
-test/         vitest suite, 249 tests, no Pi runtime and no network needed
+extensions/   the extensions
+test/         vitest suite, no Pi runtime and no network needed
 hack/         check-package-shape.mjs, the CI gate on the package manifest
 .woodpecker/  CI: workflow lint + typecheck + tests
 ```
@@ -36,7 +36,7 @@ class registries.
 
 ## The extensions
 
-`turn-stats.ts` is the tenth and is documented in its own file header: it replaces the client's guesses
+`turn-stats.ts` is documented in its own file header: it replaces the client's guesses
 about throughput and timing with the numbers Rooter already publishes in response headers, drawn as one
 dim line under each assistant answer.
 
