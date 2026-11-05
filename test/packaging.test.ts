@@ -60,6 +60,16 @@ const EXPECTED: Record<string, Surface> = {
     messageRenderers: [],
     entryRenderers: [],
   },
+  "schedule.ts": {
+    events: ["session_start", "session_info_changed", "session_shutdown"],
+    tools: ["schedule_jobs"],
+    commands: ["at", "cron", "every", "schedule"],
+    flags: ["schedules-off", "schedule-name", "schedule-tz", "schedule-tick"],
+    // Two render paths on purpose: the injected prompt (a message the model sees) and the audit line (an
+    // entry only the transcript shows).
+    messageRenderers: ["schedule-run"],
+    entryRenderers: ["schedule"],
+  },
   "searxng.ts": {
     events: [],
     // The whole point of this file is that it replaces the built-in tool of the same name.

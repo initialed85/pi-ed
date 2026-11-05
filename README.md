@@ -1,6 +1,6 @@
 # pi-ed
 
-Eight [Pi](https://github.com/earendil-works/pi) extensions I wrote to stop my agents doing the things
+Ten [Pi](https://github.com/earendil-works/pi) extensions I wrote to stop my agents doing the things
 that were wasting my time, plus the tests that keep them honest.
 
 They live in `~/.pi/agent/extensions/` on my machines. This repository is the source of truth: the
@@ -9,8 +9,8 @@ discovery accepts symlinked extension files (`loader.js`: `entry.isFile() || ent
 and `/reload` follows them.
 
 ```
-extensions/   the eight extensions
-test/         vitest suite, 166 tests, no Pi runtime and no network needed
+extensions/   the ten extensions
+test/         vitest suite, 249 tests, no Pi runtime and no network needed
 hack/         check-package-shape.mjs, the CI gate on the package manifest
 .woodpecker/  CI: workflow lint + typecheck + tests
 ```
@@ -35,6 +35,10 @@ run. They are deliberately **not** in `dependencies`: a bundled copy gives exten
 class registries.
 
 ## The extensions
+
+`turn-stats.ts` is the tenth and is documented in its own file header: it replaces the client's guesses
+about throughput and timing with the numbers Rooter already publishes in response headers, drawn as one
+dim line under each assistant answer.
 
 ### `autopilot.ts` — the model writes the next prompt from your shoes
 
@@ -98,6 +102,95 @@ summary that happened to be a bit long.
 | | |
 | --- | --- |
 | Knobs | `SUMMARY_OUTPUT_TOKENS` (8192), `SUMMARY_TARGET_TOKENS` (4000, so 16000 characters), `SOFT_OVERLIMIT_RATIO` (1.3, accept without retrying), `TRIM_OVERLIMIT_RATIO` (2, trim rather than pass through), `RETRY_POLICY` (`maxRetries: 2`, `baseDelayMs: 2000`, `maxAgentDelayMs: 15000`) |
+
+### `schedule.ts` — `/at`, `/every`, `/cron`: a prompt that arrives at a wall time
+
+A Pi session that stays open is a scheduler nobody is using. This lets a long-lived session be told, in
+advance, what to do and when: `/at 2am perth pull the checkout`, `/every day at 2am perth …`,
+`/cron "*/30 4-17 * * mon-fri" …`. When the time comes the prompt is injected as a user-level message
+that starts a turn, with the job's note attached so the agent knows which runbook to read.
+
+**Schedules are wall times, not instants.** Cron is a promise about a *local* clock, and a repository that
+lives in Perth (UTC+8, no DST anywhere in its year) should not have its 02:00 job drift an hour every
+summer the way an instant-based schedule does. Occurrences are computed by civil-date arithmetic in the
+job's own zone, and each one is keyed by its wall time — `w2026-11-06T0200`. That is what makes the two
+DST cases behave: on a fall-back morning, local 02:00 happens twice and is still **one** run (both instants
+carry the same key); on a spring-forward night, 02:30 does not exist and the occurrence is **skipped**
+rather than slid an hour sideways into the user's morning.
+
+**Three layers decide who runs an occurrence**, because several Pis can sit in the same checkout, on one
+machine or on several nodes:
+
+1. **Ownership.** A job carries an `owner` session-name pattern (`home-ops`, `home-*`). A session that does
+   not match never fires it and never claims anything for it. `SCHEDULE_REQUIRE_OWNER=1` (or
+   `defaults.requireOwner`) turns "any Pi in this directory may run it" into a refusal, so a shared repo
+   cannot end up with a prompt that every agent will run.
+2. **A file lease per occurrence.** `.pi/schedule/locks/<job>/<occurrence>.lock` is created with `O_CREAT|O_EXCL`:
+   one winner by construction, everyone else sees `EEXIST` and stands down. This is mutual exclusion for
+   every Pi that shares the filesystem, not a cooperative protocol.
+3. **A cross-node election, when pi-team-room is installed.** The room's `sessions[]` are read, peers that
+   are connected, recent and in the same repository are kept, and the lowest live session id runs the
+   occurrence. Two nodes with no shared disk cannot race on a lock file, so the election is the layer that
+   covers them; losing one never leaves a lease behind that would block the winner.
+
+**Two sources, one of them reviewable.** `.pi/schedule.json` is committed: a schedule that belongs in a
+diff, re-read when the file changes, so a nightly `git pull` can add tomorrow's job without restarting
+anything. Slash commands and the tool **refuse to edit it** — a committed file is changed in a diff, not
+from a running session. Jobs created in-session go to `.pi/schedule/jobs.jsonl` as operations
+(add/pause/resume/remove), replayed from scratch on each read.
+
+**Catch-up is about downtime, not polling.** An occurrence is fired if it is no older than the job's
+window, and the window never falls below two ticks — so a live session notices a run that came due while
+its tick was mid-flight, while a cluster that was down for a week does not run a week-old maintenance job
+at boot. `--catchup <duration>`, `--catchup none`, `--catchup always`.
+
+**What a fired job looks like.** `pi.sendMessage` with `customType: "schedule-run"`, `display: false` and
+`triggerTurn: true` — `triggerTurn` is the whole reason a 02:00 run happens in an idle session at all.
+`--deliver followUp|steer|nextTurn` chooses what happens when the session is *not* idle; `nextTurn`
+deliberately does not trigger, for a job that should attach to the next real turn. `--skip-if-busy` drops
+an occurrence instead of queueing it. The injected message carries the job id and the occurrence key, so
+the agent can say which schedule it is acting on, and every fire and every skip also lands in
+`.pi/schedule/events.jsonl` plus a transcript entry the model never sees. `/schedule history` answers
+"did the 2am job run, and which session ran it?" without archaeology.
+
+`pi -p` and `--mode json` neither fire nor claim anything: a throwaway instance that claimed tonight's
+lease would cost the session that was supposed to run it.
+
+```bash
+/at in 20m refresh the checkout          # one shot, away from now
+/at 2am perth pull home-ops              # the next 02:00 Perth, once
+/at 2026-11-06T02:00 --tz Australia/Perth run the drill
+every day at 2am perth pull home-ops     # a committed wall-clock promise
+/every 6h check the fleet                # an interval, anchored at creation
+/cron "*/30 4-17 * * mon-fri" --tz Australia/Brisbane tail the audit log
+/schedule list · show <id> · history [id] · next · who
+/schedule pause|resume|remove <id> · run <id> · off | on
+```
+
+Flags are per-session: `--schedules-off`, `--schedule-name <identity>` (when the session name is not what
+owns the repository), `--schedule-tz <IANA>`, `--schedule-tick <ms>`. Environment mirrors:
+`SCHEDULE_OFF`, `SCHEDULE_NAME`, `SCHEDULE_TZ`, `SCHEDULE_TICK_MS`, `SCHEDULE_REQUIRE_OWNER`,
+`SCHEDULE_STATE_DIR`, `NODE_NAME`. A bare `2am` is one run and `2am perth` is one run *in Perth* — the
+zone is what the prompt was timed against, and `Etc` offsets keep their POSIX sign inversion, because
+`Etc/GMT-8` is the one spelling Intl accepts for Perth's own UTC+8.
+
+```bash
+jq -r 'select(.customType=="schedule")
+       | [.timestamp, .data.op, .data.id, .data.key, .data.wall // "", .data.reason // ""] | @tsv' \
+  ~/.pi/agent/sessions/*/*.jsonl
+# the same audit, outside the session tree:
+jq -r '[(.at / 1000 | todate), .op, .id, .key, .session, .node] | @tsv' .pi/schedule/events.jsonl
+```
+
+| | |
+| --- | --- |
+| Commands | `/at <when> <prompt>` · `/every <recurrence> <prompt>` · `/cron <expr> <prompt>` · `/schedule <verb>` |
+| Tool | `schedule_jobs` — `list · show · add · pause · resume · remove · run · next`; `add` writes local jobs only |
+| Flags | `--schedules-off` · `--schedule-name <name>` · `--schedule-tz <IANA>` · `--schedule-tick <ms>` |
+| Env | `SCHEDULE_OFF` · `SCHEDULE_NAME` · `SCHEDULE_TZ` · `SCHEDULE_TICK_MS` · `SCHEDULE_REQUIRE_OWNER` · `SCHEDULE_STATE_DIR` · `PI_TEAM_ROOM_STATE` · `NODE_NAME` |
+| Per job | `--tz` · `--owner <pattern>` · `--note <text>` · `--id <name>` · `--deliver followUp\|steer\|nextTurn` · `--catchup <dur>\|none\|always` · `--skip-if-busy` · `--quiet` · `--repo <path>` |
+| State | `.pi/schedule.json` (committed) · `.pi/schedule/jobs.jsonl` · `.pi/schedule/events.jsonl` · `.pi/schedule/locks/<job>/<occurrence>.lock` |
+| Knobs | `DEFAULT_TICK_MS` (20000), `DEFAULT_CATCHUP_MS` (3h), `CATCHUP_PERIOD_CAP_MS` (24h), `LOCK_PRUNE_MS` (30d), `CRON_SEARCH_DAYS` (800), `TEAM_STALE_MS` (90000, pi-team-room's own window) |
 
 ### `searxng.ts` — web search through my own SearXNG
 
@@ -239,7 +332,9 @@ extension has not been written against — a half-built code path shows up as a 
 mystery in a live session. There is no Pi runtime, no provider and no network: `searxng.ts` is tested
 against a stubbed `fetch`, `test/autopilot.test.ts` holds the hop-limit surface still,
 `test/session-markers.test.ts` proves the marks do not reach the model using Pi's own context builder,
-`test/tags.test.ts` holds the tag grammar and the branch-relative replay of the append-only log, and
+`test/tags.test.ts` holds the tag grammar and the branch-relative replay of the append-only log,
+`test/schedule.test.ts` holds the DST arithmetic (a gap occurrence, a repeated hour that must fire once),
+the lease that a sibling session already holds and the peer election that a lower session id wins, and
 `test/packaging.test.ts` asserts each extension's whole registration
 surface, so a file that quietly registers nothing cannot pass.
 

@@ -2,7 +2,7 @@
   "name": "pi-ed",
   "version": "0.1.0",
   "private": true,
-  "description": "Ed's Pi extensions: autopilot, loop guard, compaction summary guard, SearXNG web search, queue-reload, session commands, session markers and hashtags",
+  "description": "Ed's Pi extensions: autopilot, loop guard, compaction summary guard, SearXNG web search, wall-clock schedules, queue-reload, session commands, session markers and hashtags",
   "keywords": [
     "pi-package",
     "pi",

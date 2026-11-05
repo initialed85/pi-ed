@@ -58,6 +58,8 @@ export interface PiRecord {
   entryRenderers: Map<string, AnyHandler>;
   busChannels: Map<string, AnyHandler[]>;
   sentUserMessages: Array<{ content: unknown; options?: { deliverAs?: string } }>;
+  /** Custom messages an extension injected with pi.sendMessage(), with the delivery options it asked for. */
+  sentMessages: Array<{ message: any; options?: { triggerTurn?: boolean; deliverAs?: string } }>;
   appendedEntries: Array<{ type: string; data: unknown }>;
   sessionNames: string[];
   calls: RecordedCall[];
@@ -77,6 +79,9 @@ export interface FakePi extends PiRecord {
   /** Test helper: Pi fills flags in from the CLI after extensions load. */
   setFlag(name: string, value: boolean | string | undefined): void;
   sendUserMessage(content: unknown, options?: { deliverAs?: string }): void;
+  /** pi.sendMessage(): recorded rather than projected, because the assertion that matters is what an
+   *  extension injected and how it asked for delivery. */
+  sendMessage(message: any, options?: { triggerTurn?: boolean; deliverAs?: string }): void;
   appendEntry(type: string, data?: unknown): void;
   getSessionName(): string | undefined;
   /** Handler(s) an extension registered for an event, in registration order. */
@@ -102,6 +107,7 @@ export function createFakePi(): FakePi {
     entryRenderers: new Map(),
     busChannels: new Map(),
     sentUserMessages: [],
+    sentMessages: [],
     appendedEntries: [],
     sessionNames: [],
     calls: [],
@@ -169,6 +175,10 @@ export function createFakePi(): FakePi {
     sendUserMessage(content: unknown, options?: { deliverAs?: string }) {
       track("sendUserMessage")([content, options]);
       record.sentUserMessages.push({ content, options });
+    },
+    sendMessage(message: any, options?: { triggerTurn?: boolean; deliverAs?: string }) {
+      track("sendMessage")([message, options]);
+      record.sentMessages.push({ message, options });
     },
     appendEntry(type: string, data?: unknown) {
       track("appendEntry")([type, data]);
