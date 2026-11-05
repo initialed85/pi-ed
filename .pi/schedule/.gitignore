@@ -1,0 +1,4 @@
+# Written by the pi-ed schedules extension: everything in here is
+# runtime state (jobs created in-session, fired/skipped audit, occurrence leases).
+*
+!.gitignore

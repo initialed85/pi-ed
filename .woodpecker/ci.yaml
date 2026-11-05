@@ -1,4 +1,4 @@
-# The test lane for pi-ed: six hand-written Pi extensions and the vitest suite that pins what they do.
+# The test lane for pi-ed: every extension in this directory, and the vitest suite that pins what they do.
 #
 # Everything here runs without infrastructure. That is the point of the suite: the extensions are driven
 # against a fake ExtensionAPI (test/harness.ts) that records registrations, tool calls, notifications and
