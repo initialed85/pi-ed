@@ -192,6 +192,55 @@ jq -r '[(.at / 1000 | todate), .op, .id, .key, .session, .node] | @tsv' .pi/sche
 | State | `.pi/schedule.json` (committed) · `.pi/schedule/jobs.jsonl` · `.pi/schedule/events.jsonl` · `.pi/schedule/locks/<job>/<occurrence>.lock` |
 | Knobs | `DEFAULT_TICK_MS` (20000), `DEFAULT_CATCHUP_MS` (3h), `CATCHUP_PERIOD_CAP_MS` (24h), `LOCK_PRUNE_MS` (30d), `CRON_SEARCH_DAYS` (800), `TEAM_STALE_MS` (90000, pi-team-room's own window) |
 
+### `auto-resume.ts` — `/auto-resume`: a resumed session knows where it stopped
+
+`pi -c` hands the agent a transcript and a prompt box, and nothing in either says whether the session
+stopped with work in flight or with nothing left to do. So a resumed session guesses, usually by
+re-running the last step it can see — which is the step that already happened. The sentence that fixes it,
+"continue the unfinished task from the latest verified state", is otherwise a human typing it by hand
+every morning.
+
+This writes one line on each side of the gap. As the session runs it appends quiet session entries: a run
+started, a run settled (with how many tool calls it took and how the last one ended), and the process
+stopped — recording whether the agent was mid-run or waiting for input. Those entries are the only record
+of the case a transcript cannot show: a killed tmux window, a `SIGKILL`, a node that lost power in the
+middle of a tool call.
+
+On the way back in it reads its own entries, or the tail of the transcript when there is nothing recorded,
+and injects one custom message the model reads before it acts: when it stopped, what the last action was,
+what the last words on screen were, and the judgement reached — with instructions to continue only if the
+work is genuinely unfinished, to say one line and stop if it was idle, and to leave an Escape-interrupted
+run alone because that was the human stopping it on purpose.
+
+Two things worth knowing before turning it on:
+
+- `pi -c` arrives as `session_start` with reason `startup`, not `resume` — only `/resume` says `resume`.
+  So the reason is not the signal; the session's own entries are. A session with no activity in it is left
+  alone, and so are `new`, `fork` and `reload`.
+- Re-arming a session costs one model turn before you type anything. `/auto-resume skip-idle on` drops
+  that turn when the record already says the session was idle. It is off until you turn it on per
+  repository, because that turn is a real cost on a repo you only occasionally resume.
+
+It never injects in print or JSON mode: the prompt there already came from the command line. A silent
+no-op is still explainable — `/auto-resume status` prints what was read and what it would have done, and
+`AUTO_RESUME_DEBUG=<path>` records every decision including the skips.
+
+```bash
+# what a session recorded about how it ended, straight out of the session file
+jq -r 'select(.customType=="auto-resume")
+       | [.timestamp, .data.op, .data.idle // "", .data.tools // "", .data.lastTool // "", .data.lastToolFailed // ""] | @tsv' \
+  ~/.pi/agent/sessions/*/*.jsonl
+```
+
+| | |
+| --- | --- |
+| Commands | `/auto-resume` (toggle) · `on` · `off` · `status` · `why` · `fire` · `max-age <dur\|off>` · `skip-idle on\|off` |
+| Flags | `--auto-resume-off` |
+| Env | `AUTO_RESUME_OFF` · `AUTO_RESUME_MAX_AGE` · `AUTO_RESUME_SKIP_IDLE` · `AUTO_RESUME_STATE_FILE` · `AUTO_RESUME_DEBUG` |
+| State | `.pi/auto-resume.json` (settings) · the evidence lives in the session file as `customType: "auto-resume"` entries |
+| Reads | `session_start` reason, its own markers, and the last action in the branch: a model turn and its `stopReason`, a tool result, or a prompt nobody answered |
+
+
 ### `searxng.ts` — web search through my own SearXNG
 
 Registers a tool named `web_search`, which **replaces** Pi's built-in DuckDuckGo search (registering a

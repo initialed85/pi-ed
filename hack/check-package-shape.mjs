@@ -18,7 +18,24 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const EXPECTED_EXTENSIONS = 10;
+/**
+ * The extensions Pi should find after an install, pinned by name. A count would pass when a file
+ * disappears and another appears; these names fail when either happens. test/packaging.test.ts holds
+ * the same list next to each file's registered surface, so the two agree by being read together.
+ */
+const EXPECTED_EXTENSIONS = [
+  "auto-resume.ts",
+  "autopilot.ts",
+  "compaction-summary-guard.ts",
+  "loop-guard.ts",
+  "queue-reload.ts",
+  "schedule.ts",
+  "searxng.ts",
+  "session-commands.ts",
+  "session-markers.ts",
+  "tags.ts",
+  "turn-stats.ts",
+];
 const HOST_PACKAGES = [
   "@earendil-works/pi-ai",
   "@earendil-works/pi-agent-core",
@@ -41,10 +58,12 @@ if (!Array.isArray(dirs) || dirs.length !== 1) {
   fail(`package.json pi.extensions must list exactly one directory, got ${JSON.stringify(dirs)}`);
 } else {
   const dir = dirs[0].replace(/^\.\//, "");
-  const files = readdirSync(path.join(ROOT, dir)).filter((f) => f.endsWith(".ts"));
+  const files = readdirSync(path.join(ROOT, dir)).filter((f) => f.endsWith(".ts")).sort();
   console.log(`${dir}: ${files.join(" ")}`);
-  if (files.length !== EXPECTED_EXTENSIONS) {
-    fail(`expected ${EXPECTED_EXTENSIONS} extensions in ${dir}, found ${files.length}`);
+  const missing = EXPECTED_EXTENSIONS.filter((name) => !files.includes(name));
+  const extra = files.filter((name) => !EXPECTED_EXTENSIONS.includes(name));
+  if (missing.length || extra.length) {
+    fail(`expected ${EXPECTED_EXTENSIONS.join(", ")} in ${dir}, missing ${missing.join(", ") || "nothing"}, unexpected ${extra.join(", ") || "nothing"}`);
   }
 }
 

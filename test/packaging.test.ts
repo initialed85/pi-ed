@@ -28,6 +28,18 @@ interface Surface {
 }
 
 const EXPECTED: Record<string, Surface> = {
+  "auto-resume.ts": {
+    // It has to see a run begin, see each tool finish, see the run settle and see the process stop:
+    // that is the evidence a later resume reads, and none of it can be reconstructed afterwards.
+    events: ["session_start", "agent_start", "tool_result", "agent_settled", "session_shutdown"],
+    tools: [],
+    commands: ["auto-resume"],
+    flags: ["auto-resume-off"],
+    // The resume prompt is a message, so the model reads it. The markers are entries, so the model
+    // never sees them and the transcript does not fill up with bookkeeping.
+    messageRenderers: ["auto-resume-prompt"],
+    entryRenderers: [],
+  },
   "autopilot.ts": {
     events: ["session_start", "session_shutdown", "input", "agent_before_settle"],
     tools: [],
