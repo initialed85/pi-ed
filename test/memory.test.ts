@@ -61,6 +61,22 @@ function spool(): string[] {
 }
 
 /** A branch that looks like a real turn: a prompt, an answer with a tool call, and the tool's result. */
+/**
+ * A refused write lands asynchronously, on a real socket to a port nothing is listening on, and waiting for it with
+ * a fixed sleep is the wrong shape of wait. Measured on this machine: four suites run concurrently produced four
+ * failures, three of them here, at 10s and 15s timeouts - failures that described the machine, not the writer. Poll
+ * for what the test actually needs and let the deadline carry the diagnosis.
+ */
+async function spooled(deadlineMs = 15_000): Promise<string[]> {
+  const until = Date.now() + deadlineMs;
+  for (;;) {
+    const lines = spool();
+    if (lines.length) return lines;
+    if (Date.now() > until) return lines;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
 function branch(): any[] {
   return [
     { type: "message", id: "e1", parentId: null, timestamp: "2026-11-08T01:00:00.000Z", message: { role: "user", content: "ship the pgvector store" } },
@@ -618,9 +634,8 @@ describe("the extension", () => {
     vi.advanceTimersByTime(5_000);
     vi.useRealTimers();
     // The connect is real and asynchronous: refuse is fast on a closed port, and the rows must still land on disk.
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    const lines = spool();
-    expect(lines.length).toBeGreaterThan(0);
+    const lines = await spooled();
+    expect(lines.length, "rows never reached the spool; the writer swallowed them").toBeGreaterThan(0);
     const first = JSON.parse(lines[0]!);
     expect(first.sessionId).toBe("session-1");
     expect(["user", "assistant", "tool_call", "tool_result", "marker", "system"]).toContain(first.kind);
@@ -732,7 +747,10 @@ describe("the extension", () => {
   it("refuses to write a dream whose events never reached the store", async () => {
     const { context } = contextFor();
     await pi.emit("turn_end", { turnIndex: 0, messageEntryId: "e2", toolResultEntryIds: ["e3"] }, context);
-    await new Promise((resolve) => setTimeout(resolve, 700));
+    // The precondition is the spool: memory_dream can only refuse honestly once the stretch it would summarise is
+    // known to be unsaved.
+    const landed = await spooled();
+    expect(landed.length, "the stretch never reached the spool, so this test would be asserting a message about a case that did not happen").toBeGreaterThan(0);
     const result = await callTool(pi, "memory_dream", { summary: "shipped the store", subjects: ["infra"], feel: "wary" }, context);
     const text = String(result.content[0]?.text ?? "");
     // The point of the wording: the agent should learn the events are missing, not be handed a foreign key error and
@@ -746,7 +764,9 @@ describe("the extension", () => {
   it("tells the user what memory holds, that the store is unreachable, and what is spooled", async () => {
     const { context, ui } = contextFor();
     await pi.emit("turn_end", { turnIndex: 0, messageEntryId: "e2", toolResultEntryIds: ["e3"] }, context);
-    await new Promise((resolve) => setTimeout(resolve, 700));
+    // "recorded row(s)" in the widget is only an honest claim after the spool exists to be reported.
+    const landed = await spooled();
+    expect(landed.length, "nothing spooled, so the widget text this test reads would have nothing to report").toBeGreaterThan(0);
     const command = pi.commands.get("memory")!;
     await command.handler!("", context);
     const widget = [...(ui.widgets.get("memory") as string[] | undefined) ?? []].join("\n");
