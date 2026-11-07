@@ -55,6 +55,17 @@ const KINDS = ["user", "assistant", "tool_call", "tool_result", "marker", "syste
 type Kind = (typeof KINDS)[number];
 
 const TRIGGERS = ["idle10m", "pre_compaction", "resume10m", "manual"] as const;
+export type StampKind = "activity" | "flush" | "failure";
+
+/**
+ * Stamps have independent clocks per kind, which is the whole reason the throttle is keyed this way. A single clock
+ * per agent makes the first stamp win - a session that opens and immediately flushes records that it was *here* and
+ * then never records that it committed, which is the exact pair this table exists to distinguish.
+ */
+export function heartbeatKey(agentId: string, kind: StampKind): string {
+  return `${agentId}|${kind}`;
+}
+
 type Trigger = (typeof TRIGGERS)[number];
 
 interface Config {
@@ -445,6 +456,99 @@ export function agentStatement(agentId: string, repo: string): Statement {
   };
 }
 
+/**
+ * How often one agent may stamp its heartbeat.
+ *
+ * The alert window this feeds is hours, so a per-minute cap costs nothing in detection and stops a busy session from
+ * writing a diagnostic row every few seconds. It also means `failures` counts *reported* failures rather than every
+ * rolled-back transaction - honest about what the column is, and `last_error` carries the reason either way.
+ */
+export const HEARTBEAT_THROTTLE_MS = 60_000;
+
+export function heartbeatDue(lastAt: number, nowMs: number, throttleMs = HEARTBEAT_THROTTLE_MS): boolean {
+  return nowMs - lastAt >= throttleMs;
+}
+
+/** "A writer is here." Bumped when a session opens and whenever a flush is attempted, successfully or not. */
+export function heartbeatActivityStatement(agentId: string, repo: string): Statement {
+  return {
+    sql: `insert into writer_heartbeat (agent_id, repo)
+          values ($1, $2)
+          on conflict (agent_id) do update set last_activity_at = now(), repo = excluded.repo`,
+    values: [agentId, repo],
+  };
+}
+
+/** "A writer committed." The only stamp that moves `last_flush_at`, which is what makes the pair readable. */
+export function heartbeatFlushStatement(agentId: string, repo: string): Statement {
+  return {
+    sql: `insert into writer_heartbeat (agent_id, repo)
+          values ($1, $2)
+          on conflict (agent_id) do update set last_activity_at = now(), last_flush_at = now(),
+            flushes = writer_heartbeat.flushes + 1, spool_rows = 0`,
+    values: [agentId, repo],
+  };
+}
+
+/** "A writer was refused." Written after the batch rolled back, in its own transaction, with the backlog it left on disk. */
+export function heartbeatFailureStatement(agentId: string, repo: string, error: string, spoolRows: number): Statement {
+  return {
+    sql: `insert into writer_heartbeat (agent_id, repo, last_error, spool_rows)
+          values ($1, $2, $3, $4)
+          on conflict (agent_id) do update set last_activity_at = now(), failures = writer_heartbeat.failures + 1,
+            last_error = excluded.last_error, last_error_at = now(), spool_rows = excluded.spool_rows`,
+    values: [agentId, repo, error, spoolRows],
+  };
+}
+
+/** How long a writer may be active without committing before it is worth waking someone. */
+export const HEARTBEAT_ALERT_WINDOW = "2 hours";
+
+/**
+ * The query that should page someone: a writer that is working and not committing.
+ *
+ * Two shapes, both unreadable from the data tables. A writer that arrived and never committed anything (`last_flush_at`
+ * null for longer than the window) is the `array_concat` class of bug from boot. A writer that committed once and then
+ * kept running turns without committing is the same bug arriving later in a session. Idle agents match neither, because
+ * their activity is old too - which is the entire reason this table carries two timestamps instead of one.
+ */
+export function heartbeatPageAlertStatement(): Statement {
+  return {
+    sql: `select agent_id, repo, last_activity_at, last_flush_at, failures, spool_rows, last_error
+          from writer_heartbeat
+          where (last_flush_at is null and last_activity_at < now() - interval '${HEARTBEAT_ALERT_WINDOW}')
+             or (last_flush_at is not null and last_activity_at - last_flush_at > interval '${HEARTBEAT_ALERT_WINDOW}')
+          order by last_activity_at desc`,
+    values: [],
+  };
+}
+
+/**
+ * The query that should not page anyone: a writer that has been refused, or that has rows stranded on disk, recently.
+ *
+ * Deliberately advisory rather than paging. A planned Postgres restart - a `shared_preload_libraries` edit, an image
+ * bump - produces exactly one of these for a few seconds while the pool reconnects, and an alert that fires on every
+ * planned restart is an alert that gets muted the first time it is right.
+ */
+export function heartbeatAdvisoryAlertStatement(): Statement {
+  return {
+    sql: `select agent_id, repo, failures, last_error, last_error_at, spool_rows
+          from writer_heartbeat
+          where (failures > 0 and last_error_at > now() - interval '24 hours')
+             or (spool_rows > 0 and last_activity_at > now() - interval '2 hours')
+          order by last_error_at desc nulls last`,
+    values: [],
+  };
+}
+
+export function heartbeatReadStatement(agentId: string): Statement {
+  return {
+    sql: `select last_activity_at, last_flush_at, flushes, failures, spool_rows, last_error, last_error_at
+          from writer_heartbeat where agent_id = $1`,
+    values: [agentId],
+  };
+}
+
 export function sessionStatement(options: { sessionId: string; agentId: string; cwd: string; repo: string; firstAt: string; lastAt: string }): Statement {
   return {
     sql: `insert into session (id, agent_id, repo, cwd, source, started_at, last_activity_at)
@@ -775,6 +879,7 @@ const DREAM_TURN_TIMEOUT_MS = 5 * 60_000;
 
 type Db = {
   connect: () => Promise<{ query: (sql: string, values?: unknown[]) => Promise<{ rows: Record<string, unknown>[] }>; release: () => void }>;
+  query: (sql: string, values?: unknown[]) => Promise<{ rows: Record<string, unknown>[] }>;
   end: () => Promise<void>;
 };
 
@@ -791,6 +896,9 @@ export default function memoryExtension(api: ExtensionAPI): void {
   let connectError = "";
   let lastError = "";
   let lastFlushAt = 0;
+  /** `agent|kind` -> wall time of the last such stamp this process sent, for the throttle. */
+  const heartbeats = new Map<string, number>();
+  let lastStampError = "";
   let written = 0;
   let lastEmbed: { at: number; tokens?: number; chunks?: number; model?: string; error?: string } | undefined;
   let queued: Row[] = [];
@@ -853,6 +961,9 @@ export default function memoryExtension(api: ExtensionAPI): void {
     const agent = ctx ? agentIdentity(ctx, cfg) : "unknown-agent";
 
     if (!db) {
+      // No stamp is possible here, and that absence is worth naming: a store that cannot be reached at all leaves no
+      // watermark anywhere, which is indistinguishable from nobody working. That is why the signal is the *pair* of
+      // columns - activity without a commit - and it only goes asymmetric when the store is reachable and refusing.
       writeSpool(batch.map((row) => ({ ...row, sessionId })));
       lastError = connectError || "no database connection";
       return lastError;
@@ -860,13 +971,15 @@ export default function memoryExtension(api: ExtensionAPI): void {
 
     const replay = readSpool().rows;
     const all = [...replay, ...batch];
+    // Hoisted above the transaction because the failure path reports to the same heartbeat row, and a stamp that
+    // cannot name the agent or the repo is not worth reading.
+    const cwd = ctx?.cwd ?? process.cwd();
+    const repo = basename(cwd);
     let client: Awaited<ReturnType<Db["connect"]>> | undefined;
     try {
       client = await db.connect();
       const branch = ctx?.sessionManager.getBranch() ?? [];
       const firstAt = branch.length ? entryTime(branch[0] as unknown as Record<string, unknown>) : new Date().toISOString();
-      const cwd = ctx?.cwd ?? process.cwd();
-      const repo = basename(cwd);
 
       await client.query("begin");
       await client.query(agentStatement(agent, repo).sql, agentStatement(agent, repo).values);
@@ -884,6 +997,12 @@ export default function memoryExtension(api: ExtensionAPI): void {
       lastError = "";
       lastFlushAt = Date.now();
       rewriteSpool([]);
+      // Released before the stamp so the stamp is a separate connection and a separate implicit transaction. A
+      // heartbeat written inside the batch's transaction would roll back with the failure it is supposed to report,
+      // which is not evidence of anything.
+      client.release();
+      client = undefined;
+      await stamp(agent, repo, "flush");
       return undefined;
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
@@ -897,9 +1016,41 @@ export default function memoryExtension(api: ExtensionAPI): void {
       // The batch and whatever was already spooled both go back to disk together.
       writeSpool(all.map((row) => ({ ...row, sessionId: row.sessionId ?? sessionId })));
       if (ctx?.hasUI) ctx.ui.notify(`memory: write failed, ${all.length} row(s) spooled (${lastError})`, "warning");
+      client?.release();
+      client = undefined;
+      await stamp(agent, repo, "failure", lastError, all.length);
       return lastError;
     } finally {
       client?.release();
+    }
+  }
+
+  /**
+   * Stamp the store with what this writer just did, if it is allowed to stamp yet.
+   *
+   * Diagnostics that can break the thing they observe are worse than no diagnostics, so every failure here is
+   * swallowed into `lastStampError` and shown by `/memory`. The heartbeat never takes a turn down and never retries.
+   */
+  async function stamp(agent: string, repo: string, kind: StampKind, error?: string, spoolRows = 0): Promise<void> {
+    const db = await database();
+    if (!db) return;
+    const key = heartbeatKey(agent, kind);
+    const lastAt = heartbeats.get(key) ?? 0;
+    // A refused batch is the reason the table exists, so it gets a shorter interval than routine stamps.
+    const interval = kind === "failure" ? HEARTBEAT_THROTTLE_MS / 4 : HEARTBEAT_THROTTLE_MS;
+    if (!heartbeatDue(lastAt, Date.now(), interval)) return;
+    const statement =
+      kind === "flush"
+        ? heartbeatFlushStatement(agent, repo)
+        : kind === "failure"
+          ? heartbeatFailureStatement(agent, repo, error ?? "unknown failure", spoolRows)
+          : heartbeatActivityStatement(agent, repo);
+    try {
+      await db.query(statement.sql, statement.values);
+      heartbeats.set(key, Date.now());
+      lastStampError = "";
+    } catch (err) {
+      lastStampError = err instanceof Error ? err.message : String(err);
     }
   }
 
@@ -955,6 +1106,9 @@ export default function memoryExtension(api: ExtensionAPI): void {
     dreamStartedAt = 0;
     // A session that came back is continuing something; ten minutes in is long enough to know what it is continuing.
     // `pi -c` reports "startup" rather than "resume", so both are treated as a session that arrived from history.
+    // The activity half of the watermark: an agent that opened a session and then never committed anything is the
+    // exact shape a broken write path leaves behind.
+    void stamp(agentIdentity(ctx, cfg), basename(ctx.cwd ?? process.cwd()), "activity");
     if (event.reason === "resume" || event.reason === "startup") scheduleDream(ctx, cfg.resumeDreamMinutes ?? DEFAULTS.resumeDreamMinutes, "resume10m");
   });
 
@@ -1187,6 +1341,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
       if (lastFlushAt) lines.push(`last write ${new Date(lastFlushAt).toISOString()}`);
       if (lastError) lines.push(`last error ${lastError}`);
       if (connectError) lines.push(`driver      ${connectError}`);
+      if (lastStampError) lines.push(`heartbeat   could not be written: ${lastStampError}`);
       const spool = readSpool();
       if (spool.rows.length) lines.push(`spooled     ${spool.rows.length} row(s) waiting for a reachable store`);
       if (db) {
@@ -1205,6 +1360,14 @@ export default function memoryExtension(api: ExtensionAPI): void {
           const subjects = await client.query(subjectsStatement(agent).sql, subjectsStatement(agent).values);
           const listed = subjects.rows.map((subject) => `${String(subject.subject)}(${String(subject.memories)})`);
           lines.push(`subjects   ${listed.join(" ") || "none yet"}`);
+        const beat = heartbeatReadStatement(agent);
+        const heart = await client.query(beat.sql, beat.values);
+        const h = heart.rows[0];
+        lines.push(
+          h
+            ? `heartbeat  flushed ${Number(h.flushes)}x (last ${h.last_flush_at ? new Date(String(h.last_flush_at)).toISOString() : "never"}), ${Number(h.failures)} refused batch(es)${h.last_error ? `: ${String(h.last_error)}` : ""}${Number(h.spool_rows) ? `, ${Number(h.spool_rows)} row(s) spooled` : ""}`
+            : `heartbeat  never stamped - this agent has not reached the store`,
+        );
         } catch (error) {
           lines.push(`store      unreadable: ${error instanceof Error ? error.message : String(error)}`);
         } finally {

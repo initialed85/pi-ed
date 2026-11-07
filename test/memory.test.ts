@@ -196,6 +196,51 @@ describe("redaction", () => {
   });
 });
 
+describe("the writer's heartbeat", () => {
+  it("throttles stamps without throttling reports of failure", async () => {
+    const { heartbeatDue, HEARTBEAT_THROTTLE_MS } = await loadModule();
+    const now = 1_800_000_000_000;
+    expect(heartbeatDue!(0, now)).toBe(true);
+    expect(heartbeatDue!(now - 30_000, now)).toBe(false);
+    expect(heartbeatDue!(now - HEARTBEAT_THROTTLE_MS!, now)).toBe(true);
+    // A failure is the reason the table exists, so it gets a shorter interval than routine activity.
+    expect(heartbeatDue!(now - 20_000, now, HEARTBEAT_THROTTLE_MS! / 4)).toBe(true);
+    expect(heartbeatDue!(now - 5_000, now, HEARTBEAT_THROTTLE_MS! / 4)).toBe(false);
+  });
+
+  it("separates having been here from having committed", async () => {
+    const { heartbeatActivityStatement, heartbeatFlushStatement, heartbeatFailureStatement, heartbeatReadStatement } = await loadModule();
+    const activity = heartbeatActivityStatement!("pi-ed:pi-ed", "pi-ed");
+    const flush = heartbeatFlushStatement!("pi-ed:pi-ed", "pi-ed");
+    const failure = heartbeatFailureStatement!("pi-ed:pi-ed", "pi-ed", "syntax error at or near \"array_concat\"", 12);
+
+    // Two columns, two meanings: an idle fleet is old in both, a broken writer is fresh in one.
+    expect(activity.sql).toContain("set last_activity_at = now()");
+    expect(activity.sql).not.toContain("last_flush_at");
+    expect(flush.sql).toContain("last_flush_at = now()");
+    expect(flush.sql).toContain("flushes = writer_heartbeat.flushes + 1");
+    expect(flush.sql).toContain("spool_rows = 0");
+    expect(failure.sql).toContain("failures = writer_heartbeat.failures + 1");
+    expect(failure.sql).toContain("last_error = excluded.last_error");
+    expect(failure.sql).toContain("spool_rows = excluded.spool_rows");
+    // A refused batch does not move the commit watermark, and it must not pretend to.
+    expect(failure.sql).not.toContain("last_flush_at = now()");
+    expect(failure.values).toEqual(["pi-ed:pi-ed", "pi-ed", 'syntax error at or near "array_concat"', 12]);
+    expect(heartbeatReadStatement!("a1").values).toEqual(["a1"]);
+  });
+
+  it("gives each kind of stamp its own clock", async () => {
+    const { heartbeatKey } = await loadModule();
+    // One clock per agent would let the session_start stamp suppress the first flush stamp, and the table would then
+    // say "was here, never committed" about a writer that worked perfectly. That is exactly what the first live run
+    // of this table did before the clocks were separated.
+    expect(heartbeatKey!("a1", "activity")).not.toBe(heartbeatKey!("a1", "flush"));
+    expect(heartbeatKey!("a1", "failure")).not.toBe(heartbeatKey!("a1", "flush"));
+    expect(heartbeatKey!("a1", "flush")).toBe(heartbeatKey!("a1", "flush"));
+    expect(heartbeatKey!("a2", "flush")).not.toBe(heartbeatKey!("a1", "flush"));
+  });
+});
+
 describe("recording a branch", () => {
   it("splits one assistant entry into what the model said and what it asked to do", async () => {
     const { rowsFromBranch } = await loadModule();

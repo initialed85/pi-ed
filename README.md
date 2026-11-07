@@ -245,7 +245,8 @@ jq -r 'select(.customType=="auto-resume")
 
 Nothing Pi does today survives a machine being rebuilt. This puts the session itself in Postgres: every turn
 recorded raw, and a smaller set of things the agent decided were worth remembering, in `pi_ed` on home-dev
-(`memory/schema/001_init.sql` explains why those are two tables and not one).
+(`memory/schema/001_init.sql` explains why those are two tables and not one; `003_writer_heartbeat.sql` adds the
+watermark that makes a rolled-back flush visible from outside the cluster).
 
 Recording is ordinary and asynchronous: turns land on `turn_end` and when a run settles, on a debounce, through a
 pool that never makes a turn wait for a database. If the store refuses, the rows go to a spool file and ride in with

@@ -152,6 +152,22 @@ try {
   const spoolRemain = await readFile(path.join(scratch, "spool.jsonl"), "utf8").then((text) => text.split("\n").filter((line) => line.trim()).length).catch(() => 0);
   console.log(`rows after: ${JSON.stringify(after)}`);
 
+  // The watermark is the part of this check that exists to outlive the rows it describes. A flush that rolls back
+  // leaves the tables empty and the store looking healthy; only this row can say the writer was refused.
+  const beat = await db.query(
+    `select flushes, failures, spool_rows, last_error, last_activity_at, last_flush_at from writer_heartbeat
+     where agent_id = (select id from agent where name = $1)`,
+    [agent],
+  );
+  const h = beat.rows[0];
+  if (!h) throw new Error("no heartbeat row: the writer never stamped the store");
+  if (Number(h.flushes) < 1) throw new Error(`heartbeat says ${h.flushes} committed flush(es)`);
+  if (Number(h.failures) !== 0) throw new Error(`heartbeat reports ${h.failures} refused batch(es): ${h.last_error}`);
+  if (Number(h.spool_rows) !== 0) throw new Error(`heartbeat says ${h.spool_rows} row(s) are stranded on the spool`);
+  const staleness = Date.now() - new Date(h.last_flush_at).getTime();
+  if (staleness > 5 * 60_000) throw new Error(`heartbeat last flushed ${Math.round(staleness / 1000)}s ago`);
+  console.log(`heartbeat: ${h.flushes} committed flush(es), ${h.failures} refused, spool_rows ${h.spool_rows}, activity ${new Date(h.last_activity_at).toISOString()}, commit ${new Date(h.last_flush_at).toISOString()}`);
+
   const plantedText = "The bluehammer drill was retired after the tabletop exercise proved the handover was unclear.";
   const embed = await fetch(`${process.env.PI_MEMORY_EMBED_URL ?? "https://embeddings.dev.initialed85.cc"}/v1/embeddings`, {
     method: "POST",
@@ -252,14 +268,16 @@ async function cleanProbeRows() {
   // Deleting in dependency order one statement at a time: a single statement with several DELETE CTEs would let
   // Postgres check the foreign keys in an order this script does not control.
   const deleted = {};
-  for (const table of ["memory", "event", "session", "agent"]) {
+  // The heartbeat is deleted with the rest of it, and before the agent rows, because it is keyed by agent id and the
+  // subquery below is how it finds them. Leaving one behind would put a probe agent in a table someone might alert on.
+  for (const table of ["memory", "event", "session", "writer_heartbeat", "agent"]) {
     const result =
       table === "agent"
         ? await db.query(`delete from agent where name = any($1::text[])`, [[agent, teammateAgent]])
         : await db.query(`delete from ${table} where agent_id in (select id from agent where name = any($1::text[]))`, [[agent, teammateAgent]]);
     deleted[table] = result.rowCount;
   }
-  const left = await db.query(`select (select count(*) from agent) as agents, (select count(*) from event) as events, (select count(*) from memory) as memories`, []);
+  const left = await db.query(`select (select count(*) from agent) as agents, (select count(*) from event) as events, (select count(*) from memory) as memories, (select count(*) from writer_heartbeat) as heartbeats`, []);
   console.log(`cleaned up: ${JSON.stringify(deleted)}; store now holds ${JSON.stringify(left.rows[0] ?? {})}`);
   await db.query("refresh materialized view subject_index");
 }

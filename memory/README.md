@@ -192,12 +192,80 @@ prints extension notifications: an invisible warning is how a write path stays b
 - **Rollbacks.** Every flush is a transaction, so a rejected statement is a rollback - the `22` rolled back against
   `2807` commits was the live check's own failing statements, not a write path silently breaking. When that did happen
   for real (the `array_concat` bug above), the symptom was visible: every row went to the spool and the check said so.
+- **`n_live_tup` is an estimate, not a count.** Measured on this store: `pg_stat_user_tables` reported
+  `memory | 24 ins | 23 upd | 1 del | 24 live` in the same minute that `select count(*) from memory.memory` returned
+  `0`. The visibility map had not been brought up to date after the prune. Quoting that number as residue would have
+  reported rows that do not exist. The honest external read is `relkind` plus `count(*)`, with `pg_stat_database`'s
+  `xact_rollback` as the database-wide signal.
+- **Read `relkind` before believing anything about a "table".** Join `pg_stat_user_tables` to `pg_class` and look:
+  `m` is a materialized view, `r` is a table. home-ops read `subject_index` as a table with vanished rows, and every
+  real `r` table here has deletes nearly equal to inserts (`agent 14/13`, `event 264/264`, `session 23/22`), which is
+  the probe writing and then cleaning up. Their side of this is `MAINTENANCE.md` (home-ops `7ce76ac`), with the
+  `relkind` query tested against this live store rather than written from memory.
+
 - **Cumulative counters.** `pg_stat_database` counts since the statistics were last reset, not since the last vacuum:
   `3068` inserts and `1054` deletes against a store holding a handful of rows is a testing history, not a leak.
 
 If a future incident needs real statement-level visibility, ask for `pg_stat_statements` in the Deployment's
 `shared_preload_libraries` plus `log_min_duration_statement = 250ms`. It costs a Postgres restart, and a restart is
 safe by design: the writer spools to disk while the store is unreachable and replays on the next flush.
+
+## Writer visibility: the heartbeat table
+
+`74b2818` made failures *quieter* on purpose - a rejected batch rolls back, the rows go to the local spool, the dream
+says so to the agent, and the store is pruned clean afterwards. Nothing cluster-visible remains. `writer_heartbeat`
+(`schema/003_writer_heartbeat.sql`) is the fix for that: the writer stamps the store on its way out, in its own
+implicit transaction, never inside the batch's transaction - a stamp that rolls back with the failure it is meant to
+report is not evidence of anything.
+
+Two timestamps, and the pair is the whole design:
+
+| column | meaning |
+| --- | --- |
+| `last_activity_at` | a writer was here - a session opened, or a flush was attempted, successfully or not |
+| `last_flush_at` | a writer *committed* a batch |
+
+Plus `flushes`, `failures`, `spool_rows` (how deep the backlog on local disk is), `last_error`, `last_error_at`.
+
+The reason both exist is that "the watermark is old" is not a signal: an agent that is not running has an old
+watermark too. Activity without a commit is the signal, and it only appears when the store is reachable and refusing -
+which is exactly the `array_concat` shape: every flush rolled back, every row went to the spool, and the only trace
+was `xact_rollback` climbing while the tables stayed empty.
+
+`schema/003_writer_heartbeat.sql` - the table itself; `heartbeatPageAlertStatement` and
+`heartbeatAdvisoryAlertStatement` in `extensions/memory.ts` - the two queries, exported from the writer so the
+documentation and the alerts cannot drift apart; `test/writer-heartbeat.test.ts` - the proof, which runs only against
+a store (`PI_LIVE_DSN=... npx vitest run test/writer-heartbeat.test.ts`) and fabricates each shape: stale without a
+commit, healthy, recently refused, refused long ago:
+
+```sql
+-- page someone when a writer is working and not committing
+select agent_id, repo, last_activity_at, last_flush_at, failures, spool_rows, last_error
+from writer_heartbeat
+where (last_flush_at is null and last_activity_at < now() - interval '2 hours')
+   or (last_flush_at is not null and last_activity_at - last_flush_at > interval '2 hours')
+order by last_activity_at desc;
+
+-- note it, do not page anyone, when a writer was refused recently or has rows stranded
+select agent_id, repo, failures, last_error, last_error_at, spool_rows
+from writer_heartbeat
+where (failures > 0 and last_error_at > now() - interval '24 hours')
+   or (spool_rows > 0 and last_activity_at > now() - interval '2 hours')
+order by last_error_at desc nulls last;
+```
+
+**Two hours** is the page window, chosen for the failure mode rather than for the fastest possible detection: a normal
+session flushes every few seconds, so a writer that is functioning does not go two hours without a commit, while two
+hours is long enough that a laptop session that was closed, a checkout that was moved, or a Postgres restart that the
+pool rode out does not page anyone. The advisory query's 24 hours is deliberately a *record* window rather than an
+alert threshold - a planned restart produces exactly one refused batch, and an alert that fires on every planned
+restart is an alert that gets muted the first time it is right.
+
+What is *not* covered, and is worth saying plainly: a store that cannot be reached at all leaves no stamp anywhere,
+and an absent stamp is indistinguishable from nobody working. That is a property of option (b) - a watermark written
+by the writer - and it is why the page query looks for asymmetry between two columns rather than for age. Whether a
+`pi-ed-postgres` exporter is scraped by vmagent on top of this is a separate decision for Ed, not something to settle
+by inference from the heartbeat.
 
 ## Backups, and the window not to roll in
 
@@ -218,10 +286,16 @@ store the live check has just cleaned out; a `Complete` CronJob with no new file
 
 ## Apply
 
+Apply them in filename order - `001` is the store, `002` added `event.source_entry_id`, `003` added
+`writer_heartbeat`:
+
 ```sh
-kubectl --context home-dev -n pi-ed exec -i deploy/pi-ed-postgres -- \
-  psql -U pi_ed -d pi_ed -v ON_ERROR_STOP=1 < memory/schema/001_init.sql
+for f in memory/schema/*.sql; do
+  kubectl --context home-dev -n pi-ed exec -i deploy/pi-ed-postgres -- \
+    psql -U pi_ed -d pi_ed -v ON_ERROR_STOP=1 < "$f" || break
+done
 ```
 
-It is idempotent - `create table if not exists`, `create or replace function`, `create schema if not exists` - so
-re-applying it after a restore is a no-op rather than an event.
+Each is idempotent - `create table if not exists`, `create or replace function`, `create index if not exists`,
+`create schema if not exists` - so re-applying them after a restore is a no-op rather than an event, and applying
+them out of order fails loudly on a missing dependency rather than half-building a schema.
