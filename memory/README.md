@@ -297,8 +297,9 @@ than a mystery.
 If a future incident needs real statement-level visibility, ask for `pg_stat_statements` in the Deployment's
 `shared_preload_libraries` plus `log_min_duration_statement = 250ms`. It costs a Postgres restart, and a restart is
 safe by design: the writer spools to disk while the store is unreachable and replays on the next flush. A clean
-restart also preserves the statistics window - clean and crash stops both - so the cost is downtime rather than lost
-history; what a crash does damage is the view's *contents*, which is the more subtle half. See the cost section below.
+restart also preserves the statistics window - clean and crash stops both, on an `emptyDir` and on a Longhorn volume -
+so the cost is downtime rather than lost history. What a crash *may* damage is the view's contents, observed once and
+not reproduced on a volume-backed run. See the cost section below.
 
 ## Writer visibility: the heartbeat table
 
@@ -334,7 +335,7 @@ statement at 143.89 ms. A first-load stamp, not a restart stamp.
 | --- | --- | --- |
 | first load of the extension | starts the window | this store: stamp 19:27:33.116Z, 16 s after `status.startTime` 19:27:17Z, with the `CREATE EXTENSION` in the view |
 | clean stop and a genuinely new postmaster | **unchanged**, counters keep accumulating | home-ops `b3e16d7`, throwaway Postgres 16 in dev: postmaster `20:34:56` to `20:35:28` with `stats_reset` fixed at `20:34:56.355296` and probe `calls` continuing rather than restarting at 1. `pg_stat_statements.save = on` there, and `show pg_stat_statements.save` reads `on` in this store too |
-| crash stop - `pg_ctl -m immediate`, restart showing `redo starts at 0/19AC538` | **unchanged**, counters keep accumulating | home-ops `5a26b08`, throwaway `postgres:16` (16.15, pgss 1.10) in dev on an `emptyDir`, deleted afterwards: `stats_reset` held at `21:21:15.410482+00` across *two* crash stops while `pg_postmaster_start_time` moved `21:21:15 → 21:23:44 → 21:27:44 → 21:31:12 → 21:34:38`. The anchor survives a crash, not just a clean stop |
+| crash stop - `pg_ctl -m immediate`, restart showing `redo starts at 0/19AC538` | **unchanged**, counters keep accumulating | home-ops `5a26b08` on an `emptyDir` (`stats_reset` held at `21:21:15.410482+00` across *two* crash stops while `pg_postmaster_start_time` moved `21:21:15 → 21:23:44 → 21:27:44 → 21:31:12 → 21:34:38`), then home-ops `83ab606` variant A on a **Longhorn PVC**, where a crashed restart with `redo starts at 0/19AC488` left the stamp *and* a marker's `5 calls / 0.035 ms` identical. The anchor survives a crash, not just a clean stop, and it survives the volume this store actually uses |
 
 The middle row is a correction of this file, and it is worth keeping in the history rather than quietly editing out.
 An earlier version of this section said a restart resets the view on its own, "sixteen seconds after the container
@@ -362,6 +363,13 @@ mechanism, which is the right way to write it down:
 - in a second crash run, a statement executed immediately after recovery never appeared in the view at all;
 - and a surviving row reported **2 calls for a statement that had been executed once**.
 
+Those three were on an `emptyDir`, and home-ops' later `pg_ctl -m immediate` crash on a **volume-backed** Postgres
+came back the other way: the marker row survived with `5 calls / 0.035 ms` identical before and after, stamp unmoved.
+So contents damage after a crash is **observed but not reliable**, and it is worth stating it that way rather than as
+a rule - the operational conclusion does not change (a `calls` figure from a post-crash window is not safe for
+arithmetic, and absence of a row is not proof a statement did not run) but the *prediction* is weaker than the first
+probe made it look.
+
 So a sweep can read an intact, long window over a **partly missing** view: `stats_reset` says "107.9 minutes of
 history" while some statements in it are absent and another's `calls` is inflated. Two consequences for anyone reading
 this view after a crash:
@@ -378,12 +386,56 @@ which is precisely how a threshold gets argued down from the wrong row. The numb
 250ms` tripwire is argued from is the recurring one: `refresh materialized view subject_index`, currently 18 calls at
 **15.55 ms mean / 22.70 ms max**.
 
-One gap remains open, and it is the one home-ops' probe could not close by design: their Postgres ran on an
-`emptyDir`, and this store is single-replica Postgres on a Longhorn volume with `strategy: Recreate`. The stamp
-surviving a crash is a property of `pg_stat_statements.save` and the stats file, which should not care what sits
-underneath, but "should" is not a measurement. The natural experiment is available at this store's next rollout -
-read the stamp and one recurring statement's `calls` immediately before and immediately after, and note whether
-`calls` continues or restarts:
+The gap that followed - `emptyDir` is not how this store is attached - was closed by the same teammate, on a
+**PVC-backed** scratch Postgres: 1 Gi Longhorn RWO, `postgres:16.15`, `shared_preload_libraries=pg_stat_statements`,
+`track=all`, `save=on`, in `default`, 21:52-22:12Z, everything deleted afterwards (home-ops `83ab606`, finding 17).
+Baseline `stats_reset 21:52:32.817365+00`, `pg_postmaster_start_time 21:52:33.318554+00`, marker `select $1 as
+probe_alpha`.
+
+| variant | before | after | what it proves |
+| --- | --- | --- | --- |
+| **A** unclean stop, same volume, container boundary (`pg_ctl -m immediate`, log shows `database system was not properly shut down; automatic recovery in progress`, `redo starts at 0/19AC488`, `restartCount=1`, new postmaster `21:58:27.543761+00`) | `5 calls / 0.035 ms` | `5 calls / 0.035 ms / 0.0071 ms mean`, stamp **identical** | an unclean stop preserves the window *and* the counters on a Longhorn volume |
+| **B** graceful `kubectl delete pod`, replacement on the **same node**, log `database system was shut down at 21:59:35 UTC` | `6 calls / 0.041 ms` | `6 calls / 0.041 ms`, stamp unmoved | the most likely thing to happen to this store keeps its window |
+| **C** `kubectl delete pod --grace-period=0 --force` while running | `8 calls / 0.050 ms` | `8 calls / 0.050 ms`, stamp unmoved, rows 34 → 35 - but the replacement's first log line was `database system was shut down at 22:00:27 UTC` | **`--force` is a scheduling model, not a node-loss model**: the node still shut Postgres down cleanly three seconds before the new pod started. Anyone building an incident drill on `--force` is drilling the wrong thing |
+| **C′** crash with no shutdown, then a pod boundary that lands on a **different node** | - | **never measured, because the pod never started** | the statistics question is still open, and what blocked it is the interesting result |
+
+**The cost clause therefore needs no unclean caveat.** A rollout, a crash, or a pod boundary on this store does not
+end the statistics window, and a window that has not moved in days is ordinary rather than suspicious.
+
+**What is actually reachable, and it is not a Postgres problem.** C′ was blocked by Longhorn: `FailedAttachVolume …
+Multi-Attach error … Volume is already exclusively attached to one node`, then `SuccessfulAttachVolume`, then
+`MountVolume.MountDevice failed … mount failed: exit status 32` **eleven times over 7m6s**. Longhorn's own plugin gave
+the words kubelet hides - `/dev/longhorn/pvc-… is in use.` and `… already mounted or mount point busy.` - while its
+`volumeattachments.longhorn.io` object held exactly one ticket, `Satisfied`, for the *new* node, and a debug pod on
+that node found the device in `/dev/longhorn/` with **no mount of it in the host mount table** and a manual
+`mount -o ro` failing with the same exit 32. The busy state was inside CSI staging, not a visible host mount.
+
+That sequence - crash with no shutdown → pod deleted while the container had already exited → scheduler free to move
+nodes → volume will not stage on the new node - is reachable for `pi-ed-postgres`: single replica, `strategy:
+Recreate`, and a `nodeSelector` of only `kubernetes.io/arch: amd64`, so nothing pins it to a node. Its volume
+(`pvc-4b1dccc5-…`) currently holds one attachment ticket, `Satisfied`, for `k3s-bee-2`, which is the thing to read
+first if a restarted pod sits in `ContainerCreating`. The recovery levers - force-detach, restarting
+`longhorn-csi-plugin` or an instance-manager on that node - are **Ed's call**, not something to try from an agent
+session on a production volume; the containment lesson home-ops found for a scratch volume was that deleting the
+Deployment and the PVC released the stuck staging immediately.
+
+Worth knowing that this store does not do the multi-attach damage to itself: `pg-backup` mounts a *different* claim
+(`pi-ed-pgdump`) and reaches Postgres over the Service, so a backup run can't contend for the data volume.
+
+Two probe traps, so nobody re-learns them: `kill -9 1` from `kubectl exec` in a `postgres` container does nothing
+(you land as the `postgres` user, `restartCount` stays 0, the postmaster never moves - the reachable unclean lever
+from inside is `pg_ctl -m immediate`), and mounting a Longhorn volume root at `PGDATA` CrashLoops with `initdb: error:
+directory "/var/lib/postgresql/data" exists but is not empty … It contains a lost+found directory, perhaps due to it
+being a mount point` - Longhorn formats the volume, so `PGDATA` has to be a subdirectory.
+
+And one observation with no mechanism attached, which is how it stayed: **`$PGDATA/pg_stat/` was empty at every check
+while the postmaster ran** - baseline, after crash recovery, after the pod boundary - while
+`pg_stat_tmp/pgss_query_texts.stat` existed after recovery (8049 bytes, 21:59). Counters kept accumulating with no
+stats file in the directory you would expect. The practical reading is that **you cannot reason about statistics
+durability from the filesystem on this image**; ask the view (`pg_stat_statements_info`) and not the directory.
+
+`hack/pg-cost-snapshot.mjs` prints the window's age on its before line, so if a rollout happens to be underway
+anyway, the pair of readings that would close the C′ gap costs nothing extra:
 
 ```sql
 select stats_reset, round(extract(epoch from (now() - stats_reset)) / 60.0, 1) as window_minutes
@@ -392,8 +444,8 @@ select calls, mean_exec_time, max_exec_time from pg_stat_statements
 where queryid is not null and query like 'refresh materialized view subject_index%';
 ```
 
-`hack/pg-cost-snapshot.mjs` prints the window's age on its before line, so a rollout that ends a window announces
-itself in the measurement instead of requiring a second query.
+Closing the *last* gap - no shutdown at all, then a new node - needs a node-loss drill, which is a different kind of
+permission than a scratch Deployment.
 
 Three consequences that did not change:
 
