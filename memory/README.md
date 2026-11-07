@@ -223,13 +223,28 @@ Measured from `pg_stat_statements` (on since home-ops `9325af4`, `track = all`) 
 | `select * from memory_search($1, $2::vector, …)` | 5 | 4.34 ms | 17.11 ms |
 | `insert into writer_heartbeat (…)` | 6 | 0.29 ms | 0.54 ms |
 
-The matview refresh is the most expensive routine thing this store does, and it costs twenty milliseconds. Two
+Read those numbers the way the view produces them, or a future comparison invents a regression. `pg_stat_statements`
+is **cumulative since the last reset or server start**, so `calls` is a running total, not a measurement of anything
+that happened today: home-ops read this same view earlier in the same evening as my run above and got `4 calls,
+14.78 ms mean, 17.77 ms max` for the matview refresh where I read `6 calls, 16.01 ms mean, 21.72 ms max`. Same
+reality, different moments. **Compare means and maxima across time; never compare `calls`.** If a run genuinely needs
+per-run counts, the tool is `select pg_stat_statements_reset()` - and that is shared state in a database other people
+are reading mid-afternoon, so it is a thing to say out loud first, not a thing to slip into a measurement script.
+
+The matview refresh is the most expensive routine thing this store does, and it costs twenty milliseconds - which is
+also why `log_min_duration_statement = 250 ms` is defensible as a number rather than a preference: it sits roughly
+**twelve times above the priciest recurring statement here**, so anything that clears it is pathological by
+definition. The check home-ops added to the daily sweep follows from that directly and has a counter-intuitive
+healthy reading: `kubectl logs deploy/pi-ed-postgres --since=24h | grep duration:` should print **nothing**, and a
+line is the finding. Two
 consequences worth recording so nobody re-derives them:
 
 - **`log_min_duration_statement = 250ms` logs nothing normal, on purpose.** It is a tripwire for a statement that has
   gone pathological, not a way to see ordinary cost - `pg_stat_statements` is where ordinary cost lives, without
   writing statement text into logs the fleet scrapes. Statement text here is agent-authored content, so logging at
   10 ms to catch a 16 ms refresh trades a store's reasoning for a number that is already available in the view.
+  Defended in git now, in the manifest comment where the setting lives (home-ops `e23a14d`), with the twelve-times
+  ratio as the justification so a future sweep cannot "optimise" the threshold down by intuition.
 - **Event inserts are one row per statement (53 calls, 53 rows) and stay that way.** Batching them into one statement
   per flush would save roughly fifteen milliseconds in a whole run - real, and not worth losing the ability to name
   which statement a failed transaction failed on. If a future session ever does batch them, it should say which
