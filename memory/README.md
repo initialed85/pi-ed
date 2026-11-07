@@ -277,6 +277,41 @@ where (failures > 0 and last_error_at > now() - interval '24 hours')
 order by last_error_at desc nulls last;
 ```
 
+If a maintenance sweep only gets to run **one** statement, run the sweep variant - `heartbeatSweepStatement()` - which
+is both conditions in one result set, page rows first, with the number a human actually reads:
+
+```sql
+select * from (
+  select agent_id, repo,
+    case when (last_flush_at is null and last_activity_at < now() - interval '2 hours')
+           or (last_flush_at is not null and last_activity_at - last_flush_at > interval '2 hours')
+         then 'page' else 'note' end as severity,
+    case
+      when last_flush_at is null then round(extract(epoch from (now() - last_activity_at)) / 60.0, 1)
+      else round(extract(epoch from (last_activity_at - last_flush_at)) / 60.0, 1)
+    end as minutes_without_commit,
+    flushes, failures, spool_rows, last_error, last_error_at, last_activity_at, last_flush_at
+  from writer_heartbeat
+  where (last_flush_at is null and last_activity_at < now() - interval '2 hours')
+     or (last_flush_at is not null and last_activity_at - last_flush_at > interval '2 hours')
+     or (failures > 0 and last_error_at > now() - interval '24 hours')
+     or (spool_rows > 0 and last_activity_at > now() - interval '2 hours')
+) as flagged
+order by (severity = 'page') desc, last_activity_at desc nulls last;
+```
+
+The severity column is the point of this variant: a daily sweep should not depend on which query the operator
+remembered to run. It also exists because a sweep has to read an *empty* result honestly - **zero rows means no
+writers are active**, not no problem - so the same sweep should check `pi-ed-postgres` readiness alongside it, and
+treat "no rows" and "app unhealthy" as one finding rather than two clean ones. `minutes_without_commit` is measured
+against the last commit when there is one and against arrival when there is none, which is why the column is a `case`
+rather than a subtraction: the two page shapes have different clocks available.
+
+One trap worth naming here, because it cost a test run: Postgres comments start with `--` or a slash-star, never a
+pair of slashes. A `//` comment written neatly inside a SQL template string parses as division and fails at the first
+word of the sentence, with the typechecker completely uninvolved. The sweep statement carries no comments for that
+reason.
+
 **Two hours** is the page window, chosen for the failure mode rather than for the fastest possible detection: a normal
 session flushes every few seconds, so a writer that is functioning does not go two hours without a commit, while two
 hours is long enough that a laptop session that was closed, a checkout that was moved, or a Postgres restart that the

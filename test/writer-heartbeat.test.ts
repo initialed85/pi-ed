@@ -121,6 +121,40 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
     expect(stranded).not.toContain("heartbeat-probe-live");
   });
 
+  it("gives a daily sweep one result set, page rows first", async () => {
+    const { heartbeatSweepStatement } = await loadModule();
+    const sweep = heartbeatSweepStatement!();
+    expect(sweep.values).toEqual([]);
+    // The severity column is the whole point of the sweep variant: one query, and the thing that should wake someone
+    // is at the top of the output rather than in whichever query the operator remembered to run.
+    expect(sweep.sql).toContain(`case when`);
+    expect(sweep.sql).toContain(`then 'page' else 'note' end as severity`);
+    // Postgres will accept an output column name as a bare `order by` key but not inside an expression, so the
+    // severity column has to be a real column of an inner select before it can be sorted on.
+    expect(sweep.sql).toContain(`) as flagged`);
+    expect(sweep.sql).toContain(`order by (severity = 'page') desc`);
+    expect(sweep.sql).toContain(`as minutes_without_commit`);
+    // A writer that has never committed has no last commit to measure against, so its number is measured from
+    // arrival. Same meaning, different clock - the sweep has to say which one it used.
+    expect(sweep.sql).toContain(`when last_flush_at is null then round(extract(epoch from (now() - last_activity_at))`);
+
+    const rows = (await query(sweep.sql)).rows;
+    const byId = new Map(rows.map((row) => [String(row.agent_id), row]));
+    // From the earlier tests: heartbeat-probe-stale has been "active" for 3 hours with no commit, and
+    // heartbeat-probe-live was refused 12 rows ago and then committed.
+    const stale = byId.get("heartbeat-probe-stale");
+    expect(stale?.severity).toBe("page");
+    expect(Number(stale?.minutes_without_commit)).toBeGreaterThanOrEqual(179);
+    const refused = byId.get("heartbeat-probe-live");
+    expect(refused?.severity).toBe("note");
+    expect(Number(refused?.failures)).toBe(1);
+    expect(byId.has("heartbeat-probe-idle")).toBe(false);
+    expect(byId.has("heartbeat-probe-old-failure")).toBe(false);
+    const firstPage = rows.findIndex((row) => String(row.severity) === "page");
+    const lastNote = rows.map((row) => String(row.severity)).lastIndexOf("note");
+    expect(firstPage).toBeLessThan(lastNote);
+  });
+
   it("lets an old refusal age out of the advisory set", async () => {
     const { heartbeatAdvisoryAlertStatement, heartbeatPageAlertStatement } = await loadModule();
     await query(`insert into writer_heartbeat (agent_id, repo, last_activity_at, last_flush_at, flushes, failures, last_error, last_error_at)

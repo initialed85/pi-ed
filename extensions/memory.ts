@@ -541,6 +541,53 @@ export function heartbeatAdvisoryAlertStatement(): Statement {
   };
 }
 
+/**
+ * Both signals in one statement, page rows first, for a sweep that only gets to run once a day.
+ *
+ * home-ops has no alert engine - no vmalert, no Alertmanager, no PrometheusRule - so the interim home for these
+ * queries is the daily maintenance sweep. That changes what is useful: a sweep that runs once wants one result set
+ * with a severity column rather than two queries it has to remember to run, and it wants the number a human reads
+ * ("how long has this writer been working without committing") rather than an interval to eyeball.
+ *
+ * The conditions are the same two, verbatim, so a real alert engine can be built on the page half later without
+ * this statement changing.
+ *
+ * `minutes_without_commit` means "how long has this writer gone without committing", measured against the last
+ * commit when there is one and against arrival when there is none - the two page shapes have different clocks and
+ * the column says which one it used. Comments are kept out of this statement's text on purpose: Postgres comments
+ * start with a pair of hyphens or a slash-star, never a pair of slashes, and a JavaScript-ism inside a SQL string is
+ * a syntax error the typechecker cannot see.
+ */
+export function heartbeatSweepStatement(): Statement {
+  const page = `(last_flush_at is null and last_activity_at < now() - interval '${HEARTBEAT_ALERT_WINDOW}')
+             or (last_flush_at is not null and last_activity_at - last_flush_at > interval '${HEARTBEAT_ALERT_WINDOW}')`;
+  return {
+    sql: `select * from (
+            select
+              agent_id,
+              repo,
+              case when ${page} then 'page' else 'note' end as severity,
+              case
+                when last_flush_at is null then round(extract(epoch from (now() - last_activity_at)) / 60.0, 1)
+                else round(extract(epoch from (last_activity_at - last_flush_at)) / 60.0, 1)
+              end as minutes_without_commit,
+              flushes,
+              failures,
+              spool_rows,
+              last_error,
+              last_error_at,
+              last_activity_at,
+              last_flush_at
+            from writer_heartbeat
+            where ${page}
+               or (failures > 0 and last_error_at > now() - interval '24 hours')
+               or (spool_rows > 0 and last_activity_at > now() - interval '2 hours')
+          ) as flagged
+          order by (severity = 'page') desc, last_activity_at desc nulls last`,
+    values: [],
+  };
+}
+
 export function heartbeatReadStatement(agentId: string): Statement {
   return {
     sql: `select last_activity_at, last_flush_at, flushes, failures, spool_rows, last_error, last_error_at
