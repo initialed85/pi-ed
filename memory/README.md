@@ -297,8 +297,8 @@ than a mystery.
 If a future incident needs real statement-level visibility, ask for `pg_stat_statements` in the Deployment's
 `shared_preload_libraries` plus `log_min_duration_statement = 250ms`. It costs a Postgres restart, and a restart is
 safe by design: the writer spools to disk while the store is unreachable and replays on the next flush. A clean
-restart also preserves the statistics window, so the cost is downtime rather than lost history - see the cost section
-below for what that claim is measured on, and for the unclean case that is not measured yet.
+restart also preserves the statistics window - clean and crash stops both - so the cost is downtime rather than lost
+history; what a crash does damage is the view's *contents*, which is the more subtle half. See the cost section below.
 
 ## Writer visibility: the heartbeat table
 
@@ -334,7 +334,7 @@ statement at 143.89 ms. A first-load stamp, not a restart stamp.
 | --- | --- | --- |
 | first load of the extension | starts the window | this store: stamp 19:27:33.116Z, 16 s after `status.startTime` 19:27:17Z, with the `CREATE EXTENSION` in the view |
 | clean stop and a genuinely new postmaster | **unchanged**, counters keep accumulating | home-ops `b3e16d7`, throwaway Postgres 16 in dev: postmaster `20:34:56` to `20:35:28` with `stats_reset` fixed at `20:34:56.355296` and probe `calls` continuing rather than restarting at 1. `pg_stat_statements.save = on` there, and `show pg_stat_statements.save` reads `on` in this store too |
-| unclean stop - `SIGKILL`, node loss, forced pod delete | **not measured** | home-ops' probe tested the clean case; this pod has `restartCount = 0` since 19:27Z, so there is no natural experiment here either |
+| crash stop - `pg_ctl -m immediate`, restart showing `redo starts at 0/19AC538` | **unchanged**, counters keep accumulating | home-ops `5a26b08`, throwaway `postgres:16` (16.15, pgss 1.10) in dev on an `emptyDir`, deleted afterwards: `stats_reset` held at `21:21:15.410482+00` across *two* crash stops while `pg_postmaster_start_time` moved `21:21:15 → 21:23:44 → 21:27:44 → 21:31:12 → 21:34:38`. The anchor survives a crash, not just a clean stop |
 
 The middle row is a correction of this file, and it is worth keeping in the history rather than quietly editing out.
 An earlier version of this section said a restart resets the view on its own, "sixteen seconds after the container
@@ -345,18 +345,63 @@ Their sweep design got better at the same time: since a clean restart cannot mov
 one known cause, someone calling `pg_stat_statements_reset()` in a database another reader is measuring. A movement
 with nobody saying so *is* the finding, with no restart noise to argue past.
 
-The open gap is the third row, and it matters specifically because of how this store is attached: a single-replica
-Postgres on a Longhorn volume, `strategy: Recreate`. If an unclean stop does drop the counters, then a node failure
-or an attach failure starts a fresh window during the exact incident when someone most wants the history of what the
-store was doing. Until that is measured, the honest rule is: **treat a moved stamp as a human until the unclean case
-is measured, and treat a stamp that is much older than your oldest reading as the safe case.**
+The third row was this file's open gap, and home-ops measured it rather than waiting for an incident to do it. The
+result does not just fill the gap, it invalidates a rule this file was about to recommend. An earlier draft of the
+norm here said "assume a reset at every start, unless someone says otherwise", which the clean-stop measurement had
+already made too cautious; the crash measurement kills it outright, **in the direction that matters most**: a window
+that is quietly still accumulating gets under-read, so a reader discounts history that is actually there and treats a
+long-running store as if it had just been restarted. The rule that survives is narrower and stronger: **a stamp that
+moves has one known cause, someone calling `pg_stat_statements_reset()`; a stamp that has not moved is not evidence
+of anything about how the postmaster stopped.**
+
+What a crash *does* cost is the other half of the view, and home-ops reported it as observations rather than a
+mechanism, which is the right way to write it down:
+
+- a marker statement run just before an explicit `checkpoint`, and another just after it, were both absent from the
+  view after a crash, while a row created before an earlier *clean* restart survived;
+- in a second crash run, a statement executed immediately after recovery never appeared in the view at all;
+- and a surviving row reported **2 calls for a statement that had been executed once**.
+
+So a sweep can read an intact, long window over a **partly missing** view: `stats_reset` says "107.9 minutes of
+history" while some statements in it are absent and another's `calls` is inflated. Two consequences for anyone reading
+this view after a crash:
+
+- absence of a statement after a crash is not evidence the statement did not run, so a "who is hammering this
+  database" question cannot be answered by the view alone in that window; and
+- `calls` after a crash is not safe for arithmetic (doubling a count in a cumulative counter is exactly the kind of
+  number a threshold argument gets built on), while a *mean* over recurring statements degrades far more gracefully.
+
+**Rank by mean over recurring statements** is therefore not a style preference, and home-ops' live counter-example is
+the cleanest demonstration of why: ordering this store's view by `total_exec_time` puts `CREATE EXTENSION` at
+143.89 ms on **one call** on top, with the extension script's internals behind it at 10.05 ms mean / 32.25 ms max -
+which is precisely how a threshold gets argued down from the wrong row. The number the `log_min_duration_statement =
+250ms` tripwire is argued from is the recurring one: `refresh materialized view subject_index`, currently 18 calls at
+**15.55 ms mean / 22.70 ms max**.
+
+One gap remains open, and it is the one home-ops' probe could not close by design: their Postgres ran on an
+`emptyDir`, and this store is single-replica Postgres on a Longhorn volume with `strategy: Recreate`. The stamp
+surviving a crash is a property of `pg_stat_statements.save` and the stats file, which should not care what sits
+underneath, but "should" is not a measurement. The natural experiment is available at this store's next rollout -
+read the stamp and one recurring statement's `calls` immediately before and immediately after, and note whether
+`calls` continues or restarts:
+
+```sql
+select stats_reset, round(extract(epoch from (now() - stats_reset)) / 60.0, 1) as window_minutes
+from pg_stat_statements_info;
+select calls, mean_exec_time, max_exec_time from pg_stat_statements
+where queryid is not null and query like 'refresh materialized view subject_index%';
+```
+
+`hack/pg-cost-snapshot.mjs` prints the window's age on its before line, so a rollout that ends a window announces
+itself in the measurement instead of requiring a second query.
 
 Three consequences that did not change:
 
-- **A "this got slower" claim has to quote `stats_reset` first.** Means are comparable only *within* one window, and
-  every number in this file - `4 / 14.78 / 17.77`, `6 / 16.01 / 21.72`, `18 / 15.55 / 22.70` - sits inside the single
-  window that began at 19:27Z. Quote the stamp, and quote the window's age, because a 40-minute window and a 3-day
-  window are not the same measurement.
+- **A "this got slower" claim has to quote `stats_reset` and the window's length.** Means are comparable only
+  *within* one window, and every number in this file - `4 / 14.78 / 17.77`, `6 / 16.01 / 21.72`, `18 / 15.55 / 22.70`
+  - sits inside the single window that began at 19:27Z. Quote the stamp *and* `round(extract(epoch from (now() -
+  stats_reset)) / 60.0, 1)`, because a 40-minute window and a 3-day window are not the same measurement, and because
+  a stamp that has not moved in days is now known to be ordinary rather than suspicious.
 - **It is per database.** `pg_stat_statements_info` does not exist in this pod's `postgres` database - the extension
   is installed in `pi_ed`. A sweep that measures one database and reads the window from another is reading nothing.
 - **Rank by mean, not by total, and drop the one-offs.** The same reading contains `CREATE EXTENSION IF NOT EXISTS

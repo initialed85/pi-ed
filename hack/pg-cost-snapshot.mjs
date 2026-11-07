@@ -44,23 +44,37 @@ if (!dsn) {
 // Qualified on purpose, and the reason is the `search_path` asymmetry documented in memory/README.md: this script
 // must still find the extension when the reader's role resolves `public` first.
 const SNAPSHOT = `
-  select queryid, calls, total_exec_time, mean_exec_time, max_exec_time, rows, left(query, 70) as query
+  select queryid, calls, total_exec_time, mean_exec_time, max_exec_time, rows, left(query, 70) as query, query as full_query
   from pg_stat_statements
   where queryid is not null
 `;
 
-const RESET = `select stats_reset from pg_stat_statements_info`;
+const RESET = `select stats_reset, round(extract(epoch from (now() - stats_reset)) / 60.0, 1) as window_minutes
+  from pg_stat_statements_info`;
 
 // This script measures the command it runs, not itself. Both queries above are tracked by the view like anything
 // else, and the after-snapshot would otherwise hand back its own cost as part of the run's.
-const SELF = [SNAPSHOT, RESET].map((sql) => sql.replace(/\s+/g, " ").trim());
-const isSelf = (text) => SELF.some((sql) => text.startsWith(sql.slice(0, 40)));
+//
+// Two properties a self-signature has to survive, both learned by watching this script fail to exclude itself:
+//
+//   - the view stores a parameterised query with its literals replaced (`extract($1 from ...)`), so a signature that
+//     spans a literal - `epoch`, `60.0`, `1` - matches the script's source and not the row the view holds; and
+//   - the printed query text is deliberately truncated for readability, so a signature near the end of a statement is
+//     invisible to a filter that reads the same column it prints.
+//
+// Hence: the filter reads the untruncated `full_query`, and the signature is the table clause, which is both late in
+// the statement and never sent as a bind parameter.
+const SELF = ["from pg_stat_statements"];
+const isSelf = (text) => {
+  const oneLine = String(text ?? "").replace(/\s+/g, " ").trim();
+  return SELF.some((signature) => oneLine.includes(signature));
+};
 
 async function snapshot(db) {
   const [statements, info] = await Promise.all([db.query(SNAPSHOT), db.query(RESET).catch(() => ({ rows: [] }))]);
   const byId = new Map();
   for (const row of statements.rows) byId.set(String(row.queryid), row);
-  return { byId, statsReset: info.rows[0]?.stats_reset ?? null };
+  return { byId, statsReset: info.rows[0]?.stats_reset ?? null, windowMinutes: info.rows[0]?.window_minutes ?? null };
 }
 
 const client = new pg.Client({ connectionString: dsn, application_name: "pi-ed pg-cost-snapshot" });
@@ -68,7 +82,9 @@ await client.connect();
 const db = { query: async (sql) => ({ rows: (await client.query(sql)).rows }) };
 
 const before = await snapshot(db);
-console.log(`before: ${before.byId.size} tracked statements, window since stats_reset ${before.statsReset ?? "unknown"}`);
+// The window's age travels with the stamp. A mean from a 40-minute window and a mean from a 3-day window are not the
+// same measurement, and home-ops reads the same view from their own sweep, so both sides report the same quantity.
+console.log(`before: ${before.byId.size} tracked statements, window ${before.windowMinutes ?? "?"} min since stats_reset ${before.statsReset ?? "unknown"}`);
 
 const { spawn } = await import("node:child_process");
 await new Promise((resolve) => {
@@ -88,7 +104,9 @@ const after = await snapshot(db);
 if (before.statsReset && after.statsReset && String(before.statsReset) !== String(after.statsReset)) {
   // The honest thing to say when the window changed under the measurement: the numbers still describe this run, but
   // anything compared against an earlier reading is describing a different window.
-  console.log(`note: stats_reset moved during the run (${before.statsReset} -> ${after.statsReset}). A clean restart does not do that, so someone reset the view - do not compare this run against an older reading.`);
+  // Measured, not assumed: neither a clean stop nor a crash stop moves this stamp (see the memory README's cost
+  // section), so a movement during a run has one known cause and it is a person, not a restart.
+  console.log(`note: stats_reset moved during the run (${before.statsReset} -> ${after.statsReset}). Neither a clean nor a crash restart does that, so someone called pg_stat_statements_reset() - do not compare this run against an older reading.`);
 }
 
 const includeDdl = flags["includeDdl"] === true;
@@ -100,12 +118,13 @@ for (const [queryid, row] of after.byId) {
   const rowsOut = Number(row.rows) - Number(was?.rows ?? 0);
   if (calls <= 0) continue;
   const text = String(row.query).replace(/\s+/g, " ").trim();
+  const full = String(row.full_query ?? row.query).replace(/\s+/g, " ").trim();
   // One-off init and DDL dominate total time without recurring at all: in this store a single
   // `CREATE EXTENSION pg_stat_statements` logged 143.89 ms, more than any real query here. Ranking by total time is
   // how a threshold argument gets built out of the wrong row, so DDL is excluded unless asked for.
   // `refresh materialized view subject_index` is deliberately NOT excluded: it recurs on every writer run and it is
   // the priciest thing this store does on purpose, which is the number the 250 ms threshold is argued from.
-  if (isSelf(text)) continue;
+  if (isSelf(full)) continue;
   if (!includeDdl && /^(create|alter|drop|comment|grant|begin|commit|with a as|insert into agent)/i.test(text)) continue;
   rows.push({ queryid, calls, totalMs, perCall: totalMs / calls, rowsOut, text });
 }
