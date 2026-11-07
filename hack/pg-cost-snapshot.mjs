@@ -110,6 +110,20 @@ if (before.statsReset && after.statsReset && String(before.statsReset) !== Strin
 }
 
 const includeDdl = flags["includeDdl"] === true;
+
+// home-ops measured the hazard this guard exists for (home-ops `12fa5e9`): nine structurally identical probes -
+// `select 901 as m_alpha`, `select 1001 as sentinel_two`, `select 3001 as uniq_gamma_99` - held ONE row in the view,
+// `select $1 as m_alpha`, with `calls` reading 3, then 6, then 9 as each batch landed. The aliases said nine
+// statements; the row counted nine calls of one statement, and the text on it was whichever variant arrived first.
+//
+// That is a property of normalisation, not of crashes: constants become `$1`, and a statement whose whole structure
+// is a constant select list normalises to something another probe already occupied. It bites this script's output
+// directly, because the script prints text as a label and the label is not a record of what the counter counted.
+// Deltas stay correct - they are keyed on `queryid` - so the fix is to name the queryid and flag the shapes where the
+// label is least trustworthy.
+const MERGE_PRONE = /^select( distinct)? (\$\d+|\d+|'[^']*'|"[^"]*"|[a-z_]+\(\))(( as [a-z_0-9]+)?(, ?|$))+$/i;
+const mergeProne = (text) => MERGE_PRONE.test(String(text).replace(/\s+/g, " ").trim());
+
 const rows = [];
 for (const [queryid, row] of after.byId) {
   const was = before.byId.get(queryid);
@@ -126,15 +140,26 @@ for (const [queryid, row] of after.byId) {
   // the priciest thing this store does on purpose, which is the number the 250 ms threshold is argued from.
   if (isSelf(full)) continue;
   if (!includeDdl && /^(create|alter|drop|comment|grant|begin|commit|with a as|insert into agent)/i.test(text)) continue;
-  rows.push({ queryid, calls, totalMs, perCall: totalMs / calls, rowsOut, text });
+  rows.push({ queryid, calls, totalMs, perCall: totalMs / calls, rowsOut, text, merged: mergeProne(full) || mergeProne(text) });
 }
 
 rows.sort((a, b) => b.totalMs - a.totalMs);
 const top = Number(flags.top) || 6;
 console.log(`\nduring the run (${rows.length} distinct statements, deltas not totals):`);
 for (const row of rows.slice(0, top)) {
-  console.log(`  ${row.totalMs.toFixed(2)} ms total | ${row.perCall.toFixed(2)} ms per call | ${row.calls} call(s) | ${row.rowsOut} row(s) | ${row.text}`);
+  console.log(
+    `  ${row.totalMs.toFixed(2)} ms total | ${row.perCall.toFixed(2)} ms per call | ${row.calls} call(s) | ` +
+      `${row.rowsOut} row(s) | queryid ${row.queryid} | ${row.text}${row.merged ? "  [merge-prone shape: this text is one variant, the counter is shared]" : ""}`,
+  );
 }
 if (!rows.length) console.log("  nothing attributable to the run");
+
+// The other direction of the same warning: a row can also *disappear*. home-ops saw a 9-call row and a 2-call row
+// absent on a later read with no crash anywhere, `max = 5000` and only 41 rows present. So the diff below is a lower
+// bound whenever the view shrank without anybody resetting it, and saying so is cheaper than a reader assuming the
+// run got cheaper.
+if (after.byId.size < before.byId.size && String(before.statsReset) === String(after.statsReset)) {
+  console.log(`note: ${before.byId.size - after.byId.size} tracked statement(s) disappeared with no reset. The view evicts; a missing "before" row makes this run's delta a lower bound, not a measurement.`);
+}
 
 await client.end();

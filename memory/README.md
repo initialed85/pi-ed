@@ -467,6 +467,16 @@ a rule - the operational conclusion does not change (a `calls` figure from a pos
 arithmetic, and absence of a row is not proof a statement did not run) but the *prediction* is weaker than the first
 probe made it look.
 
+Weaker, and pointed in a different direction: home-ops re-ran the crash with markers chosen by **structure** rather
+than by alias (home-ops `12fa5e9`) - `select 901 as m_alpha` and friends replaced, the marker rows untouchable by
+whatever merges around them - and the crash then took nothing. Same store, `stats_reset 22:25:57.124131+00`, marker
+`calls` 2 and 2; `pg_ctl -m immediate` with `database system was not properly shut down; automatic recovery in
+progress`, `redo starts at 0/196B018`, exit 137; afterwards a new postmaster at `22:28:14.558`, both marker texts
+intact, calls still 2 and 2, and the next execution continued them to 3. Nothing lost, nothing doubled. Which means
+the three bullets above - absent markers, and especially "2 calls for a statement that ran once" - were most likely
+**the merging described in the next section**, not crash damage: statements whose counters had been folded into
+another statement's row look missing when you search by text, and look doubled when you count them by alias.
+
 So a sweep can read an intact, long window over a **partly missing** view: `stats_reset` says "107.9 minutes of
 history" while some statements in it are absent and another's `calls` is inflated. Two consequences for anyone reading
 this view after a crash:
@@ -475,6 +485,70 @@ this view after a crash:
   database" question cannot be answered by the view alone in that window; and
 - `calls` after a crash is not safe for arithmetic (doubling a count in a cumulative counter is exactly the kind of
   number a threshold argument gets built on), while a *mean* over recurring statements degrades far more gracefully.
+
+### The view merges statements, and a row's text is not a record of what it counted
+
+The most load-bearing property of `pg_stat_statements` is not a crash behaviour at all. Constants are normalised to
+`$1`, `$2`…, and the identity of a row is a **jumble hash of the parse tree**, which does not include column aliases.
+So these are not three statements:
+
+```sql
+select 7001 as stat_probe_alpha;
+select 7002 as stat_probe_beta;
+select 7003 as stat_probe_gamma;
+```
+
+One row, one counter, and its text is whichever variant happened to arrive first. Measured here, in the
+Longhorn-backed store, by `test/statistics-view.test.ts`: three aliases, one row, `calls >= 3`, and the two aliases
+that never appear in the view ran exactly as many times as the one that does. home-ops reached the same row from the
+other side with nine probes - three `m_*`, three `sentinel_*`, three `uniq_*` - held by one row reading `calls` 3,
+then 6, then 9 as each batch landed (home-ops `12fa5e9`).
+
+The part that makes it a trap rather than a curiosity: **both sides computed the same `queryid`,
+`6865378226349601843`**, for `select $1 as m_alpha` in their scratch store and `select $1 as probe_alpha`,
+`select $1 as reset_order_probe`, `select $1 as seq_probe_alpha` in mine. The alias is not part of the identity, so
+*any* `select <constant> as <anything>` in a shared store lands on one row, whatever it is named, and my earlier
+"two of four marker statements vanished" note was this merge rather than anything being lost.
+
+Structure does separate them. `select 7011 as stat_probe_shape_unused from pg_database where false` gets its own
+`queryid`, distinct from the constant row above; running it again as `... where true` adds a call to *that same row*
+rather than creating a second one. Literals merge, structure separates.
+
+Three rules follow, and the first two are rewrites of crash-scoped caveats into ordinary-operation ones:
+
+- **`calls` is unsafe for arithmetic in ordinary operation**, not only after a crash. Two agents using the same
+  constant-select shape share a counter, and neither sees it.
+- **Absence from the view is weak evidence in both directions, always** - a statement that ran may be folded into a
+  row whose text names a different statement, and a row can also be evicted (`max = 5000`, and home-ops watched a
+  9-call and a 2-call row disappear with no crash and no reset).
+- **A row's text is a label, not a record.** Attribute by `queryid`. A probe statement earns its own counter by being
+  structurally distinctive - a table clause, a join, a filter - not by having a more creative alias.
+
+`hack/pg-cost-snapshot.mjs` prints `queryid` on every line and marks the merge-prone shapes:
+
+```
+during the run (3 distinct statements, deltas not totals):
+  0.02 ms total | 0.02 ms per call | 1 call(s) | 1 row(s) | queryid -7526065195108227228 | select count(*) as readme_demo_count from memory.agent
+  0.01 ms total | 0.00 ms per call | 3 call(s) | 3 row(s) | queryid 6865378226349601843 | select $1 as readme_demo_alpha  [merge-prone shape: this text is one variant, the counter is shared]
+  0.01 ms total | 0.00 ms per call | 2 call(s) | 4 row(s) | queryid 7869201947645579313 | select $1 as readme_demo_shape_unused from pg_database where $2
+```
+
+That block is real output from a run of three constant selects named `readme_demo_alpha`, `readme_demo_beta` and
+`readme_demo_gamma`. The row that reports them is named `readme_demo_alpha` because it arrived first, and the same
+`queryid 6865378226349601843` that carried home-ops' `m_alpha` probe in their scratch store carried it.
+
+and warns when the view shrank between its two snapshots without anyone resetting it, because a missing "before" row
+makes that run's delta a lower bound rather than a measurement.
+
+**Cleaning a probe up is its own contract.** `pg_stat_statements` is a view over shared memory and is not deletable
+in this build (`cannot delete from view "pg_stat_statements"`), so the only surgical route is
+`pg_stat_statements_reset` with its three-argument form - and this build declares the arguments as **(`userid`,
+`dbid`, `queryid`)**, read from `pg_proc.proargnames` rather than assumed from a manual page. Passing the first two
+the other way round is a **silent no-op**: no error, `stats_reset` unmoved, counters unchanged, nothing in the
+response saying the cleanup did not happen. In the declared order it removes the row outright - not merely zeroes it
+- and leaves `stats_reset` and the window's length untouched, which is what makes it safe: a probe can be removed
+without disturbing the window another reader is measuring against. Both halves are asserted live, including the
+no-op, and the live file refuses to finish unless the stamp it started with is the stamp it ends with.
 
 **Rank by mean over recurring statements** is therefore not a style preference, and home-ops' live counter-example is
 the cleanest demonstration of why: ordering this store's view by `total_exec_time` puts `CREATE EXTENSION` at
@@ -563,7 +637,9 @@ one thing known to move a stamp other readers are relying on: `hack/pg-cost-snap
 `pg_stat_statements`, runs a command, snapshots again, and prints per-statement deltas with per-call means, excluding
 its own queries from the result. `pg_stat_statements_reset()` clears a shared window other agents are reading; a
 before/after diff reads a slice of it. Nothing is lost, nothing needs announcing, and a concurrent writer shows up as
-extra rows you can see rather than as a ruined baseline.
+extra rows you can see rather than as a ruined baseline. If a run genuinely needs a probe statement of its own, give
+it structure rather than a distinctive name, and clean it with `pg_stat_statements_reset` in the declared argument
+order - see the merge contract above.
 
 ```
 PI_MEMORY_DSN="$DSN" node ./hack/pg-cost-snapshot.mjs -- npx vitest run test/writer-heartbeat.test.ts
