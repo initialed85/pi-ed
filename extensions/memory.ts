@@ -731,6 +731,38 @@ export function keywordSearch(query: string, agentId: string, options: { limit?:
   };
 }
 
+/** How many memories this agent id actually has in the store. One cheap indexed count, asked only when a search
+returned nothing that belonged to it. */
+export function ownRowCountStatement(agentId: string): Statement {
+  return { sql: `select count(*)::int as own from memory where agent_id = $1`, values: [agentId] };
+}
+
+/**
+ * "Nothing matched" and "this agent has nothing" are different claims, and only one of them can be answered by the
+ * rows a search returned.
+ *
+ * A retrieval result that contains no row belonging to the searching agent is the shape where a store can look
+ * perfectly healthy while an agent is being told about somebody else's work. Two quite different situations produce
+ * it, and they need different responses: the agent's own memories exist but were not near enough to this query
+ * (candidate-window starvation, or a teammate row simply being much nearer - see the 0.65 crossover), or the agent's
+ * own memories exist under a *different id* and the identity this checkout writes as has drifted. The first is a
+ * quality question. The second is a scoping bug, and the crossover hides it well, because "teammate rows came back"
+ * looks like retrieval working.
+ *
+ * So the tool says which one it is, in the same text the agent reads, rather than leaving it to be inferred from an
+ * absence. home-ops asked for exactly this distinction after noticing that the crossover finding could mask it.
+ */
+export function ownCoverageNote(options: { agentId: string; ownInStore: number; returned: number }): string {
+  const plural = options.ownInStore === 1 ? "memory" : "memories";
+  if (options.ownInStore > 0) {
+    const rest = options.returned
+      ? "Everything listed belongs to another agent, so treat it as a teammate's recollection rather than as this agent's experience."
+      : "Nothing matched for anyone, so this query found no memory at all.";
+    return `\nnote: this agent has ${options.ownInStore} ${plural} in the store and none of them came back for this query. ${rest}`;
+  }
+  return `\nnote: this agent has no memories in the store under the id "${options.agentId}"${options.returned ? ", so everything listed belongs to another id" : ", and nothing matched for another id either"}. If this agent expected its own history here, check which id this checkout writes as - a session name, or host:directory when there is no name.`;
+}
+
 /** The lean view of an agent's head: which subjects it actually has memories about, most recent first. */
 export function subjectsStatement(agentId: string, limit = 12): Statement {
   return { sql: `select subject, memories, most_recent from subject_index where agent_id = $1 order by most_recent desc limit $2`, values: [agentId, limit] };
@@ -1324,10 +1356,20 @@ export default function memoryExtension(api: ExtensionAPI): void {
           }
         }
         const lines = rows.map((row) => formatMemoryHit(row, agent, Number.isFinite(Number(row.similarity)) ? "vector" : "text"));
-        const text = rows.length ? lines.join("\n") : `no memories match "${query}" for ${agent}${note}`;
+        // Zero rows belonging to this agent is the one case worth a second query, and it is worth it because the
+        // search result on its own cannot say whether the agent has nothing or merely nothing near. The count is
+        // indexed on (agent_id, created_at) and this path is the rare one.
+        const ownReturned = rows.filter((row) => (typeof row.mine === "boolean" ? row.mine === true : String(row.agent_id) === agent)).length;
+        let coverage = "";
+        if (ownReturned === 0) {
+          const count = ownRowCountStatement(agent);
+          const ownRows = await client.query(count.sql, count.values);
+          coverage = ownCoverageNote({ agentId: agent, ownInStore: Number(ownRows.rows[0]?.own ?? 0), returned: rows.length });
+        }
+        const text = rows.length ? lines.join("\n") + coverage : `no memories match "${query}" for ${agent}${note}${coverage}`;
         return {
           content: [{ type: "text", text }],
-          details: { count: rows.length, vector: embedded.ok, note: note || undefined },
+          details: { count: rows.length, ownReturned, vector: embedded.ok, note: note || undefined, coverage: coverage || undefined },
         };
       } catch (error) {
         const message = describeStoreError(error instanceof Error ? error.message : String(error));

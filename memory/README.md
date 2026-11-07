@@ -88,6 +88,54 @@ The check now asserts the mechanism rather than the ranking - every row it gets 
 make a store check depend on which of two sentences happens to be nearer the question, which is a fact about phrasing
 and not about retrieval.
 
+### "Own rows exist and none came back" is a different failure class
+
+The crossover answers *is this memory good enough*. The question next to it is *is this the right agent's memory at
+all*, and that one is the failure where the store looks perfectly healthy while an agent is handed somebody else's
+recollection - because "teammate rows came back" reads like retrieval working. home-ops named this while the crossover
+was fresh, and it is now tested rather than noted.
+
+Nothing here filters on `repo`. `memory_search` in `001_init.sql` has **no agent filter at all**: the candidate set is
+the whole store, and the only thing an agent id does is set `mine`, the weight, and the label. So own rows can only
+disappear three ways:
+
+1. **candidate-window starvation** - hnsw takes `p_limit * 5` nearest neighbours before weighting is applied, so with
+   `limit 1` the window is five rows wide and an own row that is merely farther cannot enter it;
+2. **the `p_since` window**, which is a deliberate age cut, not a bug;
+3. **identity drift**, which is the interesting one. `agentIdentity` is a config override, else the session name, else
+   `host:directory` - deliberately *not* repo-scoped, so that one agent in two repositories stays one agent. That
+   choice is also what makes drift possible: rename a session, move a checkout, or run on another host, and the id
+   your rows were written under stops being the id that searches.
+
+The pair that tells them apart is two counts, not a ranking:
+
+```sql
+select count(*) from memory where agent_id = 'the id searching now';   -- 0 with rows elsewhere is drift
+select count(*) from memory where agent_id = 'the id that wrote them'; -- >0 confirms the rows are still there
+```
+
+Drift is config - silently wrong rather than visibly broken, the same drawer as a bad `search_path` or an Argo
+`OutOfSync` with an empty diff list, and a note rather than a page. Starvation is a quality question about the query.
+
+The tool now says which one it is, in the text the agent reads, rather than leaving it to be inferred from an absence:
+
+```
+note: this agent has 1 memory in the store and none of them came back for this query. Nothing matched for anyone,
+      so this query found no memory at all.
+
+note: this agent has no memories in the store under the id "pi-ed", so everything listed belongs to another id. If
+      this agent expected its own history here, check which id this checkout writes as - a session name, or
+      host:directory when there is no name.
+```
+
+`ownReturned` travels in the tool's `details` as well, so a check can read the fact instead of parsing prose.
+`test/retrieval-scoping.test.ts` holds all three shapes against the live store with fabricated vectors - identity
+drift (a perfect vector match, similarity above 0.99, returned as a 0.65-weighted teammate row while the searching id
+has nothing), window starvation (own row orthogonal to the query, six nearer teammate rows, `limit 1`, own count still
+1), and both notes emitted by the real tool for the right shape. The vectors are fabricated on purpose: which rows
+come back and whose they are labelled does not depend on a model, and a test that needs the embedder fails for a
+reason unrelated to retrieval scope.
+
 ## The Pi side
 
 `extensions/memory.ts` is the writer and the reader. It records turns as `event` rows on `turn_end` and when a run

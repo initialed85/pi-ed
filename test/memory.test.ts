@@ -738,6 +738,28 @@ describe("the extension", () => {
     expect(describeStoreError!("")).toBe("error: unknown failure");
   });
 
+  it("says which kind of absence a retrieval result is", async () => {
+    const { ownCoverageNote, ownRowCountStatement } = await loadModule();
+    // The agent has memories and none of them came back. A quality question, answered without letting the teammate
+    // rows pass for this agent's own experience.
+    const crowded = ownCoverageNote!({ agentId: "pi-ed", ownInStore: 3, returned: 2 });
+    expect(crowded).toContain("3 memories in the store and none of them came back for this query");
+    expect(crowded).toContain("another agent");
+    expect(crowded).toContain("teammate's recollection");
+    expect(ownCoverageNote!({ agentId: "pi-ed", ownInStore: 1, returned: 0 })).toContain("1 memory in the store");
+    expect(ownCoverageNote!({ agentId: "pi-ed", ownInStore: 1, returned: 0 })).toContain("Nothing matched for anyone");
+    // The agent has nothing under this id. A scoping question, and the wording points at identity rather than at the
+    // store's judgement about the query, because that is the thing the reader has to go and check.
+    const drifted = ownCoverageNote!({ agentId: "pi-ed", ownInStore: 0, returned: 4 });
+    expect(drifted).toContain('no memories in the store under the id "pi-ed"');
+    expect(drifted).toContain("belongs to another id");
+    expect(drifted).toContain("host:directory");
+    expect(drifted).not.toContain("none of them came back for this query");
+    expect(ownCoverageNote!({ agentId: "pi-ed", ownInStore: 0, returned: 0 })).toContain("nothing matched for another id either");
+    expect(ownRowCountStatement!("pi-ed").values).toEqual(["pi-ed"]);
+    expect(ownRowCountStatement!("pi-ed").sql).toContain("from memory where agent_id = $1");
+  });
+
   it("refuses to write a dream with no summary", async () => {
     const { context } = contextFor();
     const result = await callTool(pi, "memory_dream", { summary: "   ", subjects: ["infra"], feel: "flat" }, context);
