@@ -590,6 +590,46 @@ first if a restarted pod sits in `ContainerCreating`. The recovery levers - forc
 session on a production volume; the containment lesson home-ops found for a scratch volume was that deleting the
 Deployment and the PVC released the stuck staging immediately.
 
+### Reading an attachment without lying to yourself
+
+`hack/pi-ed-attach-state.sh` prints the four views side by side and is read-only, so the reason it exists is a field
+layout that produces a confident wrong answer if it is guessed. In `volumeattachments.longhorn.io`, the object holds a
+request half and an answer half:
+
+```text
+spec.attachmentTickets.<id>.nodeID                                     the REQUEST: who is being asked to mount it
+status.attachmentTicketStatuses.<id>.satisfied                         the ANSWER: whether that mount happened
+status.attachmentTicketStatuses.<id>.conditions[].lastTransitionTime   when the answer last changed
+```
+
+**`nodeID` is not a field in the answer half.** Reading it there succeeds, prints nothing, and a shell assembles that
+into "attached to no node, but satisfied" on a volume that is fine - the same class of mistake as querying a
+Deployment's name where a Service resolves, and the same consequence: a query that works, an answer that is wrong, and
+a node-side fix nobody needed. home-ops found it in their own runbook (home-ops `51e4ea4`) while corroborating this
+baseline, and it is worth saying plainly that a wrong read here is dangerous rather than merely untidy, because the
+response a wrong "not attached to any node" invites is exactly the force-detach that is not an agent's to pull.
+
+The healthy reading, taken now rather than described:
+
+| object | field | value |
+| --- | --- | --- |
+| k8s `volumeattachment` | `attacher`, `nodeName`, `attached` | `driver.longhorn.io`, `k3s-bee-2`, `True`, created `19:27:20Z` |
+| Longhorn `volumeattachments.longhorn.io` | `spec.attachmentTickets.<id>.nodeID`, `type` | `k3s-bee-2`, `csi-attacher` - **one ticket** |
+| the same object's status half | `satisfied`, `conditions[0]` | `True`, `Satisfied=True since 19:27:25Z` |
+| Longhorn `volume` | `spec.nodeID`, `status.robustness`, `numberOfReplicas` | `k3s-bee-2`, `healthy`, `2` |
+
+The timestamps line up into a story, which is what makes them useful as a baseline: pod created `19:27:17Z`, attach
+requested `19:27:20Z`, answer satisfied `19:27:25Z`, and this store's `stats_reset` is `19:27:33Z` - volume,
+database, extension, in that order, eight seconds apart.
+
+**What has never been recorded is which of those fields flips in the stuck shape.** Finding 17's stranded staging was
+diagnosed from kubelet events and Longhorn plugin logs (`is in use.`, `already mounted or mount point busy.`), not
+from these fields, so "compare against the healthy baseline" is currently a wish rather than a method. The ask -
+which costs nothing, because it applies to the *accidental* stuck attach, the kind that actually happens - is to run
+`hack/pi-ed-attach-state.sh` and keep its output at the first moment a pod sits in `ContainerCreating` with
+`MountVolume.MountDevice … exit status 32`, **before** anything is detached or restarted. Detaching first destroys
+the only measurement that would close this gap.
+
 Worth knowing that this store does not do the multi-attach damage to itself: `pg-backup` mounts a *different* claim
 (`pi-ed-pgdump`) and reaches Postgres over the Service, so a backup run can't contend for the data volume.
 
