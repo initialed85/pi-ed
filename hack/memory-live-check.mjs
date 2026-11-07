@@ -64,6 +64,8 @@ const audit = [];
 const db = new pg.Client({ connectionString: DSN, connectTimeoutMs: 5000 });
 
 let pi;
+let piExit = Promise.resolve();
+let piStopping = false;
 try {
   await db.connect();
   const before = await counts(agent);
@@ -75,6 +77,7 @@ try {
     stdio: ["pipe", "pipe", "pipe"],
   });
   pi.stderr.on("data", (chunk) => process.stderr.write(`[pi] ${chunk}`));
+  piExit = new Promise((resolve) => pi.on("exit", resolve));
 
   // Extension notifications travel as RPC ui records. Without printing them, a failed write is invisible until a
   // later statement trips a foreign key - which is exactly how the first run of this check misled me.
@@ -199,6 +202,11 @@ try {
   console.log(`vector written: ${memory.rows[0]?.has_vector ?? false} via ${memory.rows[0]?.embedding_model ?? "no embedder"}; dim ${memory.rows[0]?.embedding_dim ?? "-"}`);
   if (searchResult.isError) problems.push("memory_search reported an error");
 
+  // The prune has to come after the writer is dead. Every run before this ordering existed left a tail behind: the
+  // last turn's rows flush on `agent_settled`, which happens after the tool result I waited for, so the delete ran
+  // first and the insert landed after it - four events, a session row and an agent row resurrected from a check that
+  // had just reported a clean store.
+  await stopPi();
   if (!keep) await cleanProbeRows();
   else console.log(`--keep-rows: left the "${agent}" rows in the store`);
 
@@ -211,6 +219,7 @@ try {
   console.log("PASS: turns recorded, read path answered, dream wrote a memory with a subject line and a feel.");
 } catch (error) {
   console.error(`FAILED: ${error?.message ?? error}`);
+  await stopPi().catch(() => undefined);
   // A probe that dies halfway must not leave its rows behind: a fabricated memory in a shared store is worse than a
   // failed check, and every run before this rule existed left another dozen events in there.
   if (!keep) {
@@ -222,12 +231,21 @@ try {
   }
   process.exit(1);
 } finally {
-  if (pi && !pi.killed) pi.kill("SIGTERM");
+  await stopPi().catch(() => undefined);
   try {
     await db.end();
   } catch {
     /* the connection may already be gone */
   }
+}
+
+async function stopPi() {
+  if (!pi || piStopping) return;
+  piStopping = true;
+  pi.kill("SIGTERM");
+  // Bounded: a writer that will not die should not turn a cleanup into a hang, and an unwaited kill is exactly the
+  // race this ordering exists to remove.
+  await Promise.race([piExit, new Promise((resolve) => setTimeout(resolve, 5_000))]);
 }
 
 async function cleanProbeRows() {

@@ -224,6 +224,34 @@ describe("recording a branch", () => {
     expect(rows.some((row) => row.sourceEntryId === "e6")).toBe(false);
   });
 
+  it("knows that a dream's own rows are not new work", async () => {
+    const { rowsFromBranch, dreamPending } = await loadModule();
+    const dreamBranch: any[] = [
+      { type: "message", id: "d1", timestamp: "2026-11-08T02:00:00.000Z", message: { role: "user", content: "the real work happened here" } },
+      { type: "custom", id: "d2", customType: "memory:dream", timestamp: "2026-11-08T02:00:10.000Z", content: "You are dreaming: write down what a future you should remember." },
+      {
+        type: "message",
+        id: "d3",
+        timestamp: "2026-11-08T02:00:20.000Z",
+        message: { role: "assistant", content: [{ type: "text", text: "the store was shipped and verified" }, { type: "toolCall", name: "memory_dream", arguments: { summary: "shipped" } }] },
+      },
+      { type: "message", id: "d4", timestamp: "2026-11-08T02:00:30.000Z", message: { role: "toolResult", toolName: "memory_dream", toolCallId: "call-9", isError: false, content: [{ type: "text", text: "dream recorded" }] } },
+      { type: "message", id: "d5", timestamp: "2026-11-08T02:00:40.000Z", message: { role: "user", content: "now the next real thing" } },
+    ];
+    const rows = rowsFromBranch!(dreamBranch, {}) as any[];
+    const tagged = rows.filter((row) => row.meta.dream_turn === true).map((row) => `${row.kind}:${row.sourceEntryId}`);
+    // The hidden request, the answer to it, the tool call and its result: history, but not a stretch worth dreaming
+    // about again. A session whose first dream makes it look like it has unsummarized work dreams about dreaming,
+    // which is how a memory corpus becomes a hall of mirrors.
+    expect(tagged).toEqual(["marker:d2", "assistant:d3", "tool_call:d3", "tool_result:d4"]);
+    const work = rows.filter((row) => row.meta.dream_turn !== true);
+    expect(work.map((row) => row.sourceEntryId)).toEqual(["d1", "d5"]);
+    // Which is the whole point of the tag: after the dream lands, the gate sees the same amount of work it saw
+    // before, and the next idle window has nothing to dream about.
+    expect(dreamPending!(work.length, work.length)).toBe(false);
+    expect(dreamPending!(work.length, 1)).toBe(true);
+  });
+
   it("stores that an image was there rather than the image", async () => {
     const { rowsFromBranch } = await loadModule();
     const rows = rowsFromBranch!([{ type: "message", id: "i", timestamp: "2026-11-08T01:00:00.000Z", message: { role: "user", content: [{ type: "image", mimeType: "image/png", data: "a".repeat(4096) }, { type: "text", text: "look at this" }] } }], {}) as any[];
@@ -338,6 +366,16 @@ describe("sql", () => {
     expect(dream.values).toEqual(["s1", "a1", "idle10m", "shipped it", ["infra"], "pleased", JSON.stringify({ written_by: "memory_dream" }), null, null, null]);
     const cursor = dreamCursorStatement!("s1");
     expect(cursor.sql).toContain("set dream_seq = (select coalesce(max(seq), dream_seq) from event where session_id = $1)");
+  });
+
+  it("spans only the events that are not the residue of a previous dream", async () => {
+    const { dreamStatement, dreamSpanStatement } = await loadModule();
+    const dream = dreamStatement!({ sessionId: "s1", agentId: "a1", trigger: "idle10m", summary: "shipped", subjects: [] });
+    expect(dream.sql).toContain(`and coalesce(meta ->> 'dream_turn', 'false') <> 'true'`);
+    const span = dreamSpanStatement!("s1");
+    expect(span.sql).toContain(`count(*) filter (where coalesce(meta ->> 'dream_turn', 'false') <> 'true') as work_events`);
+    expect(span.sql).toContain("seq > coalesce((select dream_seq from session where id = $1), 0)");
+    expect(span.values).toEqual(["s1"]);
   });
 
   it("carries the model and the dimension with the vector, and nothing when there is no vector", async () => {

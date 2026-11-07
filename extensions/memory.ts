@@ -339,6 +339,20 @@ export function rowsFromBranch(entries: unknown[], cfg: Config): Row[] {
     }
   }
 
+  // A dream is a turn like any other and it leaves rows behind: the hidden request, the agent's answer, the
+  // `memory_dream` call and its result. Those rows belong in the history - but they are not new work, and without
+  // this tag a session that has dreamed once always looks like it has an unsummarized stretch, so it dreams about
+  // dreaming. The boundary is the next user message: everything between a `memory:dream` request and that message is
+  // dream output, including any tool the agent chose to run while answering it. Over-tagging there is the lesser
+  // error; a memory store that re-dreams its own dreams every ten minutes is the bigger one.
+  let inDreamTurn = false;
+  for (const row of rows) {
+    if (row.kind === "marker" && row.toolName === "memory:dream") inDreamTurn = true;
+    else if (row.toolName === "memory_dream") inDreamTurn = true;
+    else if (row.kind === "user") inDreamTurn = false;
+    if (inDreamTurn) row.meta = { ...row.meta, dream_turn: true };
+  }
+
   return rows.filter((row) => !skip.has(row.kind));
 }
 
@@ -685,6 +699,7 @@ export function dreamStatement(options: {
             from event
             where session_id = $1
               and seq > coalesce((select dream_seq from session where id = $1), 0)
+              and coalesce(meta ->> 'dream_turn', 'false') <> 'true'
           )
           insert into memory (agent_id, session_id, trigger, span_first_event, span_last_event, summary, subjects, feel, detail, embedding, embedding_model, embedding_dim)
           select $2, $1, $3, span.first_id, span.last_id, $4, $5, $6, $7::jsonb, $8::vector, $9, $10
@@ -704,6 +719,22 @@ export function dreamStatement(options: {
       vector ? (options.model ?? null) : null,
       vector ? EMBEDDING_DIMENSIONS : null,
     ],
+  };
+}
+
+/**
+ * What a dream would summarise, asked before writing it.
+ *
+ * The insert's `select … from span` silently produces no row when the span is empty, which is correct behaviour
+ * expressed as a foreign key error waiting to happen. Asking first is what lets the tool say "there is nothing here
+ * worth a memory" in words, and it is also where a dream about a previous dream gets caught.
+ */
+export function dreamSpanStatement(sessionId: string): Statement {
+  return {
+    sql: `select coalesce(max(seq), 0) as last_seq, count(*) filter (where coalesce(meta ->> 'dream_turn', 'false') <> 'true') as work_events
+          from event
+          where session_id = $1 and seq > coalesce((select dream_seq from session where id = $1), 0)`,
+    values: [sessionId],
   };
 }
 
@@ -734,6 +765,7 @@ export const DREAM_PROMPT = [
   "subjects: three to six loose, generic labels. They are the index your future self scans, so a label that only makes sense inside one file is a bad label.",
   "feel: one honest line about how this stretch felt to work on. Not decoration — this is the part that shows up over months.",
   "If nothing here is worth remembering, say so in one sentence and use subjects {none}. A dream that admits it was empty is fine.",
+  "If the only thing that has happened since your last dream is other dreams, do not call the tool at all: the store will refuse the write, and a memory about a memory is not a memory.",
 ].join("\n");
 
 /** How long a dream turn is allowed to look in-flight before a later trigger may run again. */
@@ -767,6 +799,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
   let dreamTimer: NodeJS.Timeout | undefined;
   let dreamStartedAt = 0;
   let recorded = 0;
+  let workSeen = 0;
   let dreamed = 0;
   let sessionOpenedAt = Date.now();
   const triggers = new Map<string, Trigger>();
@@ -800,6 +833,10 @@ export default function memoryExtension(api: ExtensionAPI): void {
       fresh += 1;
     }
     recorded = seen.size;
+    // The gate is about work, so it counts rows that are not themselves the residue of a previous dream. Recomputed
+    // from the branch rather than accumulated: a /tree or a resume changes the branch, and a counter that only ever
+    // went up would keep saying "there is new work" for a stretch that no longer exists.
+    workSeen = rowsFromBranch(ctx.sessionManager.getBranch() as unknown[], cfg).filter((row) => row.meta.dream_turn !== true).length;
     return fresh;
   }
 
@@ -882,7 +919,14 @@ export default function memoryExtension(api: ExtensionAPI): void {
     if (!cfg.dreams || dreaming()) return;
     collect(ctx);
     // An unsummarized stretch is the only reason to dream.
-    if (!dreamPending(recorded, dreamed)) return;
+    // "An unsummarized stretch is the only reason to dream" - where a dream's own rows do not count as a stretch.
+    if (!dreamPending(workSeen, dreamed)) {
+      // Silence is what a correctly behaved idle session looks like. The case worth one line of explanation is the
+      // one a watcher cannot distinguish from a broken trigger: this session has already dreamed, and the reason it
+      // is not dreaming again is that the dreaming itself is not work.
+      if (ctx.hasUI && dreamed > 0) ctx.ui.notify(`memory: idle after dreaming - ${workSeen} work row(s), all already summarized`, "info");
+      return;
+    }
     triggers.set(sessionIdOf(ctx), trigger);
     dreamStartedAt = Date.now();
     await api.sendMessage({ customType: "memory:dream", content: DREAM_PROMPT, display: false, details: { trigger } }, { triggerTurn: true });
@@ -906,6 +950,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
     queued = [];
     seen.clear();
     recorded = 0;
+    workSeen = 0;
     dreamed = 0;
     dreamStartedAt = 0;
     // A session that came back is continuing something; ten minutes in is long enough to know what it is continuing.
@@ -1058,6 +1103,22 @@ export default function memoryExtension(api: ExtensionAPI): void {
         if (flushFailure) {
           return { content: [{ type: "text", text: `memory_dream not written: the events it would summarise are not in the store (${flushFailure}). The summary is worth keeping; say it in the reply and try again once the store is reachable.` }], details: { error: flushFailure } };
         }
+        client = await db.connect();
+
+        // Asked before anything is spent on answering: a span with no work in it is not a memory waiting to be
+        // phrased, it is a dream about a previous dream. Checking here rather than letting the insert's
+        // `select … from span` quietly write no row means the agent is told in words, before an embedder call it
+        // did not need to pay for.
+        const span = dreamSpanStatement(sessionId);
+        const spanResult = await client.query(span.sql, span.values);
+        const spanRow = spanResult.rows[0] ?? { last_seq: 0, work_events: 0 };
+        if (!Number(spanRow.work_events)) {
+          return {
+            content: [{ type: "text", text: `memory_dream not written: nothing unsummarized since the last dream (${Number(spanRow.work_events)} non-dream event(s) in the span). Either this stretch is already remembered or the only thing that happened since was dreaming - say what you learned in the reply instead.` }],
+            details: { error: "empty span", workEvents: Number(spanRow.work_events) },
+          };
+        }
+
         // The vector is written when the embedder answers and omitted when it does not. A memory without a vector is
         // still findable by keywords and still says in its own `detail` why it has no vector, which is better than a
         // dream that fails outright because one optional service was having a bad afternoon.
@@ -1065,11 +1126,14 @@ export default function memoryExtension(api: ExtensionAPI): void {
         lastEmbed = embedded.ok
           ? { at: Date.now(), tokens: embedded.tokens, chunks: embedded.chunks, model: embedded.model }
           : { at: Date.now(), error: embedded.error };
-        const detail: Record<string, unknown> = embedded.ok
-          ? { written_by: "memory_dream", embed_model: embedded.model, embed_chunks: embedded.chunks, embed_tokens: embedded.tokens }
-          : { written_by: "memory_dream", embed_error: embedded.error };
+        const detail: Record<string, unknown> = {
+          written_by: "memory_dream",
+          span_events: Number(spanRow.work_events),
+          ...(embedded.ok
+            ? { embed_model: embedded.model, embed_chunks: embedded.chunks, embed_tokens: embedded.tokens }
+            : { embed_error: embedded.error }),
+        };
 
-        client = await db.connect();
         const dream = dreamStatement({
           sessionId,
           agentId: agent,
@@ -1086,7 +1150,10 @@ export default function memoryExtension(api: ExtensionAPI): void {
         await client.query(cursor.sql, cursor.values);
         await client.query("refresh materialized view subject_index");
         dreamStartedAt = 0;
-        dreamed = seen.size;
+        // The gate is in units of work, so this has to be recorded in the same unit. `seen.size` counts every row
+        // this process has walked, including the dream's own residue, and a gate that compares work against
+        // work-plus-residue drifts towards dreaming every idle window.
+        dreamed = workSeen;
         triggers.delete(sessionId);
         const vectorNote = embedded.ok ? `vector from ${embedded.model} (${embedded.tokens} tokens, ${embedded.chunks} chunk(s))` : `no vector (${embedded.error})`;
         if (ctx.hasUI) ctx.ui.notify(`memory: dream written (${subjects.join(", ") || "no subjects"}, ${vectorNote})`, "info");

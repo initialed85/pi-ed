@@ -26,8 +26,11 @@ prompt.
 
 ## When an agent dreams
 
-Three triggers, all gated on the same test: `session.event_count > session.dream_seq`. If there is no unsummarized
-delta, no dream runs - a session that is merely open is not a session worth thinking about.
+Three triggers, all gated on the same test: is there a stretch that has not been summarized yet. In the extension the
+test counts *work* rows in the current branch against how many there were when the last dream landed
+(`dreamPending(workSeen, dreamed)`); `session.event_count > session.dream_seq` is the same idea expressed in the store,
+for anyone looking from outside. If there is no unsummarized stretch, no dream runs - a session that is merely open is
+not a session worth thinking about.
 
 - **10 minutes after going idle** - the ordinary case.
 - **Just before compaction** - the last chance to keep something the harness is about to throw away.
@@ -36,6 +39,15 @@ delta, no dream runs - a session that is merely open is not a session worth thin
 
 `dream_seq` is written only after a dream succeeds, which is what makes an interrupted pass resumable rather than
 lost.
+
+**A dream's own rows are not new work.** Dreaming is a turn like any other, so it leaves rows behind: the hidden
+request, the agent's answer, the `memory_dream` call and its result. They are recorded in `event` and tagged
+`meta.dream_turn`, because a gate that counts them as work makes the first dream look like an unsummarized stretch
+forever - a session left open would then dream about dreaming every ten minutes, and a memory corpus would quietly
+become a hall of mirrors. The live check caught exactly that (an agent dutifully reporting "dream about a previous
+dream" among its subjects, and a memory row whose whole subject list was `none`). Three things hold the line: the gate
+counts work rather than rows, the span a memory is anchored to excludes the residue, and `memory_dream` asks
+`dreamSpanStatement` first so a span with no work in it is refused in words instead of being written.
 
 ## How retrieval weights
 
@@ -154,12 +166,38 @@ through the same embedder, with the teammate row labelled by its own name; and a
 in it - including when the run fails halfway, because a fabricated memory left in a shared store is worse than a
 failed check.
 
+The prune waits for the writer process to exit. That ordering is not pedantry: the last turn's rows flush on
+`agent_settled`, which happens *after* the tool result the check waits for, so a delete that runs first is followed by
+the inserts it just performed. Four check runs left a resurrected session row, four events and an agent row behind,
+and each one had reported a clean store while doing it.
+
 This is the only test that can catch the class of mistake the unit suite cannot: the first live run found
 `array_concat` in an upsert's `on conflict do update` clause. Postgres resolves function names while *parsing*, so a
 statement containing a function that does not exist fails even when the branch containing it never runs - every flush
 rolled back, every row went to the spool, and the only visible symptom was a foreign key error one step later. That is
 why `flush()` reports its failure to the dream instead of letting the dream discover it, and why `hack/memory-live-check.mjs`
 prints extension notifications: an invisible warning is how a write path stays broken for a whole session.
+
+## What the statistics look like from outside
+
+`pi_ed` will look strange in `pg_stat_*` and it is worth writing down why before someone spends an evening worrying:
+
+- **Counts that dwarf the table.** `subject_index` is a materialized view and every dream ends with `refresh
+  materialized view subject_index`, which is a truncate plus a bulk insert. Postgres reports those as large
+  `n_tup_ins` numbers, and the rows it removed are invisible: `0` live and `0` dead next to a few hundred inserts is
+  this view behaving normally, not rows being lost.
+- **Deletes with no rows left.** The live check writes under the agent name `memory-live-check` and deletes everything
+  it wrote at the end of a run, on the failure path as well as the success path. That is where `n_tup_del` comes from
+  while the tables sit near empty.
+- **Rollbacks.** Every flush is a transaction, so a rejected statement is a rollback - the `22` rolled back against
+  `2807` commits was the live check's own failing statements, not a write path silently breaking. When that did happen
+  for real (the `array_concat` bug above), the symptom was visible: every row went to the spool and the check said so.
+- **Cumulative counters.** `pg_stat_database` counts since the statistics were last reset, not since the last vacuum:
+  `3068` inserts and `1054` deletes against a store holding a handful of rows is a testing history, not a leak.
+
+If a future incident needs real statement-level visibility, ask for `pg_stat_statements` in the Deployment's
+`shared_preload_libraries` plus `log_min_duration_statement = 250ms`. It costs a Postgres restart, and a restart is
+safe by design: the writer spools to disk while the store is unreachable and replays on the next flush.
 
 ## Apply
 
