@@ -234,15 +234,15 @@ describe("the writer's heartbeat", () => {
     expect(activity.sql).toContain("set last_activity_at = now()");
     expect(activity.sql).not.toContain("last_flush_at");
     expect(flush.sql).toContain("last_flush_at = now()");
-    expect(flush.sql).toContain("flushes = writer_heartbeat.flushes + 1");
+    expect(flush.sql).toContain("flushes = memory.writer_heartbeat.flushes + 1");
     expect(flush.sql).toContain("spool_rows = 0");
-    expect(failure.sql).toContain("failures = writer_heartbeat.failures + 1");
+    expect(failure.sql).toContain("failures = memory.writer_heartbeat.failures + 1");
     expect(failure.sql).toContain("last_error = excluded.last_error");
     expect(failure.sql).toContain("spool_rows = excluded.spool_rows");
     // The backlog clock starts only on a transition into a backlog, and a committed batch clears it. A reader asking
     // "how long has this been broken" needs the age of the condition, not of the last failure to arrive.
     expect(failure.sql).toContain("spool_since = case");
-    expect(failure.sql).toContain("when writer_heartbeat.spool_rows > 0 then writer_heartbeat.spool_since");
+    expect(failure.sql).toContain("when memory.writer_heartbeat.spool_rows > 0 then memory.writer_heartbeat.spool_since");
     expect(flush.sql).toContain("spool_rows = 0, spool_since = null");
     // A refused batch does not move the commit watermark, and it must not pretend to.
     expect(failure.sql).not.toContain("last_flush_at = now()");
@@ -383,8 +383,8 @@ describe("sql", () => {
       { sourceEntryId: "e2", kind: "assistant", at: "2026-11-08T01:00:10.000Z", text: "hi", meta: {} },
     ]);
     expect(statement.sql).toContain("on conflict (session_id, source_entry_id) do nothing");
-    expect(statement.sql).toContain("(select coalesce(max(seq), 0) from event where session_id = $1) + 1");
-    expect(statement.sql).toContain("(select coalesce(max(seq), 0) from event where session_id = $1) + 2");
+    expect(statement.sql).toContain("(select coalesce(max(seq), 0) from memory.event where session_id = $1) + 1");
+    expect(statement.sql).toContain("(select coalesce(max(seq), 0) from memory.event where session_id = $1) + 2");
     // Two shared parameters plus six per row: a count mismatch is a Postgres error at 3am on a cron run.
     expect(statement.values).toHaveLength(2 + 6 * 2);
     expect(statement.values[0]).toBe("session-1");
@@ -429,10 +429,10 @@ describe("sql", () => {
   it("spans a dream over the events the last dream did not cover", async () => {
     const { dreamStatement, dreamCursorStatement } = await loadModule();
     const dream = dreamStatement!({ sessionId: "s1", agentId: "a1", trigger: "idle10m", summary: "shipped it", subjects: ["infra"], feel: "pleased" });
-    expect(dream.sql).toContain("seq > coalesce((select dream_seq from session where id = $1), 0)");
+    expect(dream.sql).toContain("seq > coalesce((select dream_seq from memory.session where id = $1), 0)");
     expect(dream.values).toEqual(["s1", "a1", "idle10m", "shipped it", ["infra"], "pleased", JSON.stringify({ written_by: "memory_dream" }), null, null, null]);
     const cursor = dreamCursorStatement!("s1");
-    expect(cursor.sql).toContain("set dream_seq = (select coalesce(max(seq), dream_seq) from event where session_id = $1)");
+    expect(cursor.sql).toContain("set dream_seq = (select coalesce(max(seq), dream_seq) from memory.event where session_id = $1)");
   });
 
   it("spans only the events that are not the residue of a previous dream", async () => {
@@ -441,7 +441,7 @@ describe("sql", () => {
     expect(dream.sql).toContain(`and coalesce(meta ->> 'dream_turn', 'false') <> 'true'`);
     const span = dreamSpanStatement!("s1");
     expect(span.sql).toContain(`count(*) filter (where coalesce(meta ->> 'dream_turn', 'false') <> 'true') as work_events`);
-    expect(span.sql).toContain("seq > coalesce((select dream_seq from session where id = $1), 0)");
+    expect(span.sql).toContain("seq > coalesce((select dream_seq from memory.session where id = $1), 0)");
     expect(span.values).toEqual(["s1"]);
   });
 
@@ -769,6 +769,102 @@ describe("the extension", () => {
     expect(counts.sql).toContain("memories_without_vector");
   });
 
+  it("names the schema in every statement it hands to another reader", async () => {
+    const mod = await loadModule();
+    const tables = ["memory", "event", "session", "agent", "writer_heartbeat", "subject_index"];
+    // Detection is by subtraction: delete every properly qualified reference (`memory.memory`, `memory.event`,
+    // `memory.writer_heartbeat.flushes`) and whatever table name is left over was written unqualified. A pattern keyed
+    // on `from`/`join` alone misses the column-qualifier form (`failures = writer_heartbeat.failures + 1`), which this
+    // store actually uses in its ON CONFLICT clauses, and that is the form that resolves through search_path just as
+    // quietly. The store's role has `search_path = memory, public`, so every one of these works today and fails
+    // silently tomorrow - a `public` twin, or a caller connecting as another role, and the read or write lands
+    // somewhere plausible and wrong. home-ops `51e4ea4` found the read half of that class in their own runbook, where a
+    // path that does not exist succeeded and printed nothing.
+    const qualified = new RegExp(`memory\\.(${tables.join("|")})\\b`, "g");
+    const leftover = new RegExp(`\\b(${tables.join("|")})\\b`, "g");
+    // The one statement allowed to name an object without its schema. Its entire job is to report what `memory` and
+    // `public.memory` RESOLVE to for whoever is running it; qualifying it would destroy the thing it measures.
+    const exempt = new Set(["storeReadingSanityStatement"]);
+    const argShapes: unknown[][] = [
+      [],
+      ["agent-id", "repo"],
+      ["agent-id"],
+      ["agent-id", 12],
+      ["agent-id", "a rolled-back flush", 3],
+      [{ sessionId: "s1", agentId: "a", cwd: "/w", repo: "r", firstAt: "2026-01-01T00:00:00Z", lastAt: "2026-01-01T00:00:00Z" }],
+      [{ agentLike: "a%" }],
+      ["how do I roll this back", "agent-id"],
+      ["agent-id", [0.1, 0.2]],
+    ];
+
+    const checked: string[] = [];
+    const offenders: string[] = [];
+    for (const [name, value] of Object.entries(mod)) {
+      if (typeof value !== "function") continue;
+      // An async export is not a statement builder, and calling one with a half-matching argument shape produces a
+      // rejected promise that surfaces as an unhandled rejection somewhere else in the run. This guard reads SQL text,
+      // so it does not want the ones that reach for the network.
+      if ((value as { constructor?: { name?: string } }).constructor?.name === "AsyncFunction") continue;
+      let spec: unknown;
+      for (const args of argShapes) {
+        try {
+          const result = (value as (...a: unknown[]) => unknown)(...args);
+          if (result && typeof (result as Promise<unknown>).then === "function") {
+            void Promise.resolve(result).catch(() => undefined);
+            break;
+          }
+          spec = result;
+          break;
+        } catch {
+          // wrong argument shape for this factory; try the next one
+        }
+      }
+      const sql = (spec as { sql?: unknown } | undefined)?.sql;
+      if (typeof sql !== "string") continue;
+      checked.push(name);
+      if (exempt.has(name)) continue;
+      const bad = sql.replace(/\s+/g, " ").replace(qualified, " ").match(leftover);
+      if (bad) offenders.push(`${name}: ${[...new Set(bad)].join(", ")}`);
+    }
+
+    // A guard, not a census: a factory that stops being callable with these shapes quietly leaves the checked set, so
+    // the number checked is asserted rather than assumed.
+    expect(checked.length).toBeGreaterThanOrEqual(18);
+    expect(checked).toContain("storeShapeCountsStatement");
+    // Inside the checked set, exempt from the rule, for the reason above.
+    expect(checked).toContain("storeReadingSanityStatement");
+    expect(offenders).toEqual([]);
+  });
+
+  it("quotes the statements it exports, not a paraphrase of them", async () => {
+    const mod = await loadModule();
+    const doc = readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../memory/README.md"), "utf8");
+    const flatten = (sql: string) => sql.replace(/\s+/g, " ").trim().replace(/;$/, "");
+    const blocks = [...doc.matchAll(/```sql\n([\s\S]*?)```/g)].map((m) =>
+      flatten(m[1].split("\n").filter((line) => !line.trim().startsWith("--")).join("\n").replace(/--\s.*$/gm, "")),
+    );
+
+    // Statements a reader is expected to run *from the documentation*. Writers and internal helpers are deliberately
+    // not in this list: the README is a reader's entry point, and a sweep that copies a block should be copying a
+    // reader statement. The rule exists because home-ops already got bitten by the alternative - they had to re-copy
+    // my sweep SQL after I changed it - and because a stale block is worse than no block: it looks authoritative.
+    const quoted = [
+      "heartbeatPageAlertStatement",
+      "heartbeatAdvisoryAlertStatement",
+      "heartbeatSweepStatement",
+      "identityPairStatement",
+      "vectorCoverageStatement",
+      "storeReadingSanityStatement",
+    ];
+
+    const missing = quoted.filter((name) => {
+      const build = mod[name] as (() => { sql: string }) | undefined;
+      if (typeof build !== "function") return true;
+      return !blocks.some((block) => block.includes(flatten(build().sql)));
+    });
+    expect(missing).toEqual([]);
+  });
+
   it("counts how much of the store is findable by meaning rather than by wording", async () => {
     const { vectorCoverageStatement } = await loadModule();
     // Whole store by default, because the fleet-level question is "is recall quality dropping", and one checkout's
@@ -780,12 +876,16 @@ describe("the extension", () => {
     expect(whole.values).toEqual([]);
     expect(flatten(whole.sql)).toContain("count(*) filter (where embedding is null)");
     expect(flatten(whole.sql)).toContain("without_vector_24h");
+    // A count cannot tell a small cold store from a degrading one, so the exported statement carries its own
+    // denominator, and `nullif` is what keeps an empty store from erroring at the moment it is most worth reading.
+    expect(flatten(whole.sql)).toContain("without_vector_percent");
+    expect(flatten(whole.sql)).toContain("nullif(count(*), 0)");
     expect(flatten(whole.sql)).not.toContain("agent_id like");
-    // Scoped when the question is about one checkout, and the scope lands before `from memory` rather than after it,
+    // Scoped when the question is about one checkout, and the scope lands before `from memory.memory` rather than after it,
     // which is the kind of mistake a string-concatenated SQL helper makes.
     const scoped = vectorCoverageStatement!({ agentLike: "pi-ed" });
     expect(scoped.values).toEqual(["pi-ed"]);
-    expect(flatten(scoped.sql)).toContain("from memory where agent_id like $1");
+    expect(flatten(scoped.sql)).toContain("from memory.memory where agent_id like $1");
   });
 
   it("says which kind of absence a retrieval result is", async () => {
@@ -807,7 +907,7 @@ describe("the extension", () => {
     expect(drifted).not.toContain("none of them came back for this query");
     expect(ownCoverageNote!({ agentId: "pi-ed", ownInStore: 0, returned: 0 })).toContain("nothing matched for another id either");
     expect(ownRowCountStatement!("pi-ed").values).toEqual(["pi-ed"]);
-    expect(ownRowCountStatement!("pi-ed").sql).toContain("from memory where agent_id = $1");
+    expect(ownRowCountStatement!("pi-ed").sql).toContain("from memory.memory where agent_id = $1");
   });
 
   it("refuses to write a dream with no summary", async () => {

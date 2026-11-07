@@ -141,6 +141,61 @@ describe.skipIf(!liveDsn)("pg_stat_statements contract", () => {
       expect(Number(again[0].calls)).toBe(2);
     });
 
+    it("splits a select * statement's own history when a column is added, and leaves a named-column statement alone", async () => {
+      // A temp table, so the mechanism is measured rather than asserted about this store: what splits is decided by how
+      // `queryid` is computed from the analysed query, not by which database you are in. The table disappears with the
+      // session, and the view rows it created are removed with the same targeted reset the other probes use.
+      // A name unique to this run. pg_stat_statements rows outlive the session that produced them, so a fixed probe
+      // name would read history from earlier runs as if it were this run's - which is the same trap as reading an old
+      // queryid row as a current cost, one level down.
+      const table = `probe_split_${Date.now()}`;
+      const star = `select * from ${table} where agent_id = 'split-probe'`;
+      const named = `select agent_id from ${table} where agent_id = 'split-probe'`;
+      const mine = async () =>
+        query(`select queryid, dbid, userid, calls, md5(query) as text_md5, query from pg_stat_statements where query like $1 order by queryid`, [
+          like(`select%from ${table} where agent_id = $1`),
+        ]);
+
+      await query(`create temp table ${table} (agent_id text, repo text)`);
+      await query(`insert into ${table} values ('split-probe', 'r')`);
+
+      await query(star);
+      await query(named);
+      const beforeAlter = await mine();
+      expect(new Set(beforeAlter.map((row) => String(row.queryid)))).toHaveLength(2);
+
+      await query(`alter table ${table} add column first_seen_at timestamptz`);
+
+      // Same text, run again, with the table's column list changed underneath it.
+      await query(star);
+      await query(named);
+
+      const rows = await mine();
+      const starRows = rows.filter((row) => String(row.query).startsWith(`select * from ${table}`));
+      const namedRows = rows.filter((row) => String(row.query).startsWith(`select agent_id from ${table}`));
+
+      // The `select *` half: identical text, two rows, two counters. `*` is expanded to concrete columns during
+      // analysis, and `queryid` is computed from the analysed tree, so adding a column changes the structure the hash
+      // sees. Nothing about the statement's text changed - the table did.
+      expect(new Set(starRows.map((row) => String(row.text_md5)))).toHaveLength(1);
+      expect(starRows.length).toBe(2);
+
+      // The named-column half: identical text across the same ALTER, one row, one counter, two calls.
+      expect(namedRows.length).toBe(1);
+      expect(Number(namedRows[0].calls)).toBe(2);
+
+      await query(`drop table ${table}`);
+
+      // Every statement this test ran, not just the two selects: the `create temp table`, `insert`, `alter` and `drop`
+      // are tracked too, and a test that leaves nine clutter rows behind teaches the next reader that probes are
+      // permanent. The reset is surgical, so the shared window and every other statement's counter are untouched.
+      // The drop comes first so its own row is inside the set being cleaned.
+      const leftovers = await query(`select queryid, dbid, userid from pg_stat_statements where query like $1`, [like(`%${table}%`)]);
+      for (const row of leftovers) await targetedReset(row);
+      expect(await mine()).toHaveLength(0);
+      expect(await query(`select queryid from pg_stat_statements where query like $1`, [like(`%${table}%`)])).toHaveLength(0);
+    });
+
     it("cleans a probe only when the reset arguments are in the order this build declares", async () => {
       const rows = await probeRows();
       expect(rows.length).toBeGreaterThan(0);

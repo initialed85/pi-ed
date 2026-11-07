@@ -110,8 +110,8 @@ disappear three ways:
 The pair that tells them apart is two counts, not a ranking:
 
 ```sql
-select count(*) from memory where agent_id = 'the id searching now';   -- 0 with rows elsewhere is drift
-select count(*) from memory where agent_id = 'the id that wrote them'; -- >0 confirms the rows are still there
+select count(*) from memory.memory where agent_id = 'the id searching now';   -- 0 with rows elsewhere is drift
+select count(*) from memory.memory where agent_id = 'the id that wrote them'; -- >0 confirms the rows are still there
 ```
 
 Drift is config - silently wrong rather than visibly broken, the same drawer as a bad `search_path` or an Argo
@@ -147,18 +147,25 @@ keyed on agent ids alone can only ever say "a new agent appeared" when the truth
 `identityPairStatement()` reports the pair, with the arrival required to postdate the stall:
 
 ```sql
-select a.repo, a.agent_id as stalled_id, b.agent_id as arriving_id,
-       a.last_activity_at as stalled_last_activity_at, a.flushes as stalled_flushes,
-       b.first_seen_at as arriving_first_seen_at, b.last_activity_at as arriving_last_activity_at,
+select a.repo,
+       a.agent_id as stalled_id,
+       b.agent_id as arriving_id,
+       a.last_activity_at as stalled_last_activity_at,
+       a.last_flush_at as stalled_last_flush_at,
+       a.flushes as stalled_flushes,
+       b.first_seen_at as arriving_first_seen_at,
+       b.last_activity_at as arriving_last_activity_at,
+       b.flushes as arriving_flushes,
        round(extract(epoch from (now() - a.last_activity_at)) / 60.0, 1) as stalled_minutes,
        round(extract(epoch from (b.first_seen_at - a.last_activity_at)) / 60.0, 1) as minutes_from_stall_to_arrival
-from writer_heartbeat a
-join writer_heartbeat b on b.repo = a.repo and b.agent_id <> a.agent_id
+from memory.writer_heartbeat a
+join memory.writer_heartbeat b on b.repo = a.repo and b.agent_id <> a.agent_id
 where a.repo is not null
   and a.last_activity_at < now() - interval '2 hours'
   and b.last_activity_at > now() - interval '2 hours'
   and b.first_seen_at > a.last_activity_at
-  and a.first_seen_at <= a.last_activity_at;
+  and a.first_seen_at <= a.last_activity_at
+order by b.first_seen_at desc;
 ```
 
 Measured against fabricated rows - four probe ids on one repo, and exactly one pair comes back, at `stalled_minutes
@@ -271,15 +278,120 @@ naming, because neither is visible in the row:
 ```sql
 select count(*)::int as memories,
        count(*) filter (where embedding is null)::int as without_vector,
-       count(*) filter (where embedding is null and created_at > now() - interval '24 hours')::int as without_vector_24h
-from memory;   -- optionally: where agent_id like '<pattern>'
+       count(*) filter (where embedding is null and created_at > now() - interval '24 hours')::int as without_vector_24h,
+       round(100.0 * count(*) filter (where embedding is null) / nullif(count(*), 0), 1) as without_vector_percent
+from memory.memory;   -- optionally: where agent_id like '<pattern>'
 ```
 
 `without_vector` rising while the embedder is up is a failing embedder; `without_vector` equal to `memories` means
-embeddings are switched off in that checkout. This is my side of home-ops' cold-versus-gone problem, and it is
+embeddings are switched off in that checkout. The **ratio** is in the same row because a count cannot tell a small
+cold store from a degrading one - 1 vectorless memory out of 3 and 1 out of 300 are different findings, and a sweep
+that carries only the count cannot tell them apart - so the reported fact is a *rise* in `without_vector_percent`,
+per agent id as well as fleet-wide. `nullif(count(*), 0)` is what makes that safe on an empty store: it reports "no
+denominator" rather than dividing by zero, and `null` is a different fact from `0 percent`, which is what a healthy
+store looks like. `test/retrieval-scoping.test.ts` asserts the ratio moves, that it agrees with the counts, and that a
+pattern matching nothing yields `null` rather than an error.
+
+This is my side of home-ops' cold-versus-gone problem, and it is
 deliberately *not* a `writer_heartbeat` row: an embedder failure is not a store failure, the heartbeat table is the
 store's pulse, and a reader of recall quality should read a count it can interpret rather than a new severity in a
 table whose severities are frozen - see the contract at the end of the heartbeat section.
+
+## Why every statement names its schema, and the typo that proved the point
+
+home-ops asked which of three spellings the exported statements should use - `from writer_heartbeat`, `from memory`,
+`memory.memory` - and the answer is a fourth thing: **every statement in `extensions/memory.ts` now names `memory.`
+explicitly, writes included**. The inconsistency they spotted was one step short of the actual exposure.
+
+The store's role has `search_path = memory, public` (set in `schema/001_init.sql`, a file the extension cannot see), so
+unqualified names work today. They work by *inheriting a role setting*, and inheriting one fails quietly rather than
+loudly: a `public` twin table, or a caller connecting as a different role, and the read - or the write - lands somewhere
+plausible and wrong. Writes are the worse half of that. A reader that hits the wrong table shows up at the next sanity
+check; a writer that hits the wrong table is what makes the sanity check necessary.
+
+What each spelling does, measured against this store rather than reasoned about:
+
+- unqualified `writer_heartbeat` in database `postgres`: errors, `relation "writer_heartbeat" does not exist`;
+- qualified `memory.writer_heartbeat` in database `postgres`: errors, `relation "memory.writer_heartbeat" does not exist`;
+- a `public` twin present in the *right* database: **no error in either spelling**, which is the only case the wrong
+  database was ever a proxy for, and the case qualification removes outright.
+
+The `ON CONFLICT` column-qualifier form resolves through `search_path` too - `failures = writer_heartbeat.flushes + 1`,
+`array_cat(agent.repos, ...)`, `greatest(session.last_activity_at, ...)` - and is invisible to a keyword-shaped grep for
+`from <table>`. The qualified forms were verified in that exact position (`begin; … ; rollback;` against the live store,
+so nothing was written):
+
+```sql
+on conflict (agent_id) do update set flushes = memory.writer_heartbeat.flushes + 1, spool_rows = 0, spool_since = null
+```
+
+`storeReadingSanityStatement` is the one deliberate exception, and it is on a named exemption list in the test rather
+than an accident of the pattern: its whole job is to report what an unqualified name *resolves to*, so qualifying it
+would destroy the thing it measures. The rule itself is enforced by subtraction across all 19 exported statement
+builders - delete every `memory.<table>` reference from the SQL and whatever table name is left over is an offender -
+which also catches the column-qualifier shape that a `from`-anchored check misses (`test/memory.test.ts`).
+
+### The typo, because it is the part worth keeping
+
+While applying the rule, a bulk edit turned the session insert into:
+
+```sql
+insert into memory.session (id, agent_id), repo, cwd, source, started_at, last_activity_at)
+```
+
+one stray parenthesis, on the main write path of every session this store records. Three layers let it through:
+
+- **TypeScript**, because SQL in this codebase is a string and the compiler has no opinion about strings.
+- **The unit suite**, because the assertions compare SQL text to expected SQL text, and an expected string copied from
+  the same source agrees with the bug instead of catching it - the failure mode written up in the statistics section,
+  now with a second worked example.
+- **The live suite**, which is the uncomfortable one. A failed flush is deliberately caught, spooled to disk, and
+  reported on the heartbeat, because a memory system has to survive the store being unreachable. That is the right
+  behaviour for the product and a poor property for a test harness: the statement was failing against a real store, the
+  heartbeat row was the thing that would eventually admit it, and the suite stayed green.
+
+Two guards close the gap, both in `test/statements-prepare.test.ts`:
+
+1. **Parenthesis balance and parameter-count agreement, with no database involved** - the cheapest thing that would have
+   caught the typo, and the only half CI can run. Re-running the test against the broken line reports `sessionStatement`
+   as an offender; reverting it goes green. (Checked, not assumed.)
+2. **`PREPARE` against the real store, 19 statements, nothing executed.** `PREPARE` parses the SQL, resolves every table
+   and column name against the actual schema, checks the parameter numbers against the real column list, and writes no
+   rows. It is also what makes schema qualification testable rather than a preference: a name that resolves only through
+   `search_path` and a name that is not there at all fail the same way, in the same place.
+
+Which leaves a rule wider than SQL:
+
+> **A statement nobody executes is a statement nobody has tested, and a system that swallows its own write failures -
+> correctly, for the right reasons - will not test them either.** Resilience and testability are the same axis, and a
+> suite that runs against a live store inherits the product's error handling whether it means to or not.
+
+### One cost consequence of a rename
+
+For anyone reading cost out of `pg_stat_statements` - home-ops, in this case - **renaming a statement does not migrate
+its statistics.** Both spellings of the matview refresh are in the view right now, as a result of this change:
+
+```text
+queryid 2356047425803286870  18 calls  279.97 ms total  refresh materialized view subject_index
+queryid 7120494974204833812   1 call   19.73 ms total  refresh materialized view memory.subject_index
+```
+
+Same physical work, two `queryid`s, `calls` not merged. The old row goes on sitting in the view looking like a live cost
+while the statement that actually runs restarts its own counter from 1. Budget arithmetic keyed on
+`query like '…%'`, or on a remembered `queryid`, has to be re-taken after a rename; the *mean* is the number that
+survives the discontinuity (`15.55 ms` and `19.73 ms`, both inside the window that began `19:27:33Z`).
+
+And the standing note about this file's SQL blocks, which home-ops already solved better than I did: **they are a
+reading aid, not the authority.** The canonical text is `extensions/memory.ts`. home-ops' `hack/check-pied-statements.py`
+extracts the statements from the source, resolves the window constants from the code, refuses anything with an
+unresolved `${…}` left in it, and runs the result - which is the shape that cannot drift, as against a runbook that
+copies prose and slowly stops describing the system it documents.
+
+My own half of that discipline is now enforced rather than intended: `test/memory.test.ts` checks that every reader
+statement quoted in this file matches what the code exports. It found one immediately. The sweep block printed here had
+lost `flushes, failures, spool_rows` from its select list at some point earlier, so a reader copying this page got a
+slightly different query than the one the writer actually runs - not wrong enough to fail, which is the dangerous
+distance.
 
 ## What never gets stored
 
@@ -368,7 +480,7 @@ than a mystery.
 `pi_ed` will look strange in `pg_stat_*` and it is worth writing down why before someone spends an evening worrying:
 
 - **Counts that dwarf the table.** `subject_index` is a materialized view and every dream ends with `refresh
-  materialized view subject_index`, which is a truncate plus a bulk insert. Postgres reports those as large
+  materialized view memory.subject_index`, which is a truncate plus a bulk insert. Postgres reports those as large
   `n_tup_ins` numbers, and the rows it removed are invisible: `0` live and `0` dead next to a few hundred inserts is
   this view behaving normally, not rows being lost.
 - **Deletes with no rows left.** The live check writes under the agent name `memory-live-check` and deletes everything
@@ -538,7 +650,52 @@ That block is real output from a run of three constant selects named `readme_dem
 `queryid 6865378226349601843` that carried home-ops' `m_alpha` probe in their scratch store carried it.
 
 and warns when the view shrank between its two snapshots without anyone resetting it, because a missing "before" row
-makes that run's delta a lower bound rather than a measurement.
+makes that run's delta a lower bound rather than a measurement. The same script now also flags the *other* direction of
+label trouble, described below.
+
+### Identical text, two rows: what a `select *` does to its own history
+
+Three rows in this store's view with byte-identical text - same `md5`, same length, same everything a reader would
+compare:
+
+```text
+queryid -2433359789966523996   48 calls   md5 8d1104499e66b7024017aa51fcc2f4f4   select * from writer_heartbeat where agent_id = $1
+queryid   617268224990037792   36 calls   md5 8d1104499e66b7024017aa51fcc2f4f4   select * from writer_heartbeat where agent_id = $1
+queryid  6140839715704859818   24 calls   md5 8d1104499e66b7024017aa51fcc2f4f4   select * from writer_heartbeat where agent_id = $1
+```
+
+The obvious explanations fail. All three are the same `userid` (`pi_ed`), the same `dbid` (`pi_ed`) and the same
+`toplevel`, so the view's `(userid, dbid, queryid, toplevel)` key does not separate them, and they are not merged rows
+of different texts - the texts are identical.
+
+A temp-table experiment settles it (`test/statistics-view.test.ts`, run against the live store with the probe rows
+removed again afterwards by targeted reset, `stats_reset` unmoved):
+
+- `select * from <probe> where agent_id = 'split-probe'`, run once, then **after `alter table … add column`**, run
+  again: **two rows, one text** (`md5` matches), each with its own `calls`.
+- `select agent_id from <probe> where agent_id = 'split-probe'`, run before and after the same `alter`: **one row, two
+  calls**.
+
+The mechanism is that `queryid` is computed from the *analysed* tree, and `select *` has been expanded into concrete
+columns by then. Adding a column to the table changes the structure the hash sees, so the same SQL text earns a new
+`queryid` and its counter starts again from 1. Nothing in the statement changed; the table did.
+
+Three consequences, in the order they bite:
+
+1. **A statement that runs all day should name its columns.** The rows above are not from a scheduled reader - they
+   came from a test's `select *`, which is throwaway and costs nothing but view clutter. The extension's own heartbeat
+   reader (`heartbeatReadStatement`) already names its columns, and home-ops' sweep statements do too, which is why
+   neither is exposed to this. The exposure is any monitoring statement written for convenience.
+2. **A schema change silently re-baselines the history of every `select *` statement that touches the table.** If a
+   budget is keyed on `calls`, the honest move is to sum the generations and say so, or to keep the mean and drop the
+   counts - `15.55 ms` and `16.76 ms` mean for the two matview spellings agree while their call counts (18 and 2) do
+   not describe the same world.
+3. `hack/pg-cost-snapshot.mjs` now labels `select *` lines **split-prone** - "a column added to the table, or a rename,
+   gives this identical text a new queryid and a counter starting at 1" - next to the existing **merge-prone** label.
+
+This is the rename split above seen from the other side, and the two together give the rule: **what holds a counter
+together is the analysed structure, not the text you wrote.** Text is how a reader identifies a statement; `queryid` is
+how the view identifies it, and those two are not the same thing.
 
 **Cleaning a probe up is its own contract.** `pg_stat_statements` is a view over shared memory and is not deletable
 in this build (`cannot delete from view "pg_stat_statements"`), so the only surgical route is
@@ -652,7 +809,11 @@ anyway, the pair of readings that would close the C′ gap costs nothing extra:
 select stats_reset, round(extract(epoch from (now() - stats_reset)) / 60.0, 1) as window_minutes
 from pg_stat_statements_info;
 select calls, mean_exec_time, max_exec_time from pg_stat_statements
-where queryid is not null and query like 'refresh materialized view subject_index%';
+where queryid is not null and query like 'refresh materialized view%subject_index%';
+-- the `%` in the middle is not slack: since the extension began naming its schema, the view holds both
+-- `refresh materialized view subject_index` (the old text, with its accumulated calls) and
+-- `refresh materialized view memory.subject_index` (the statement that actually runs now, starting from 1 call).
+-- One pattern that matches both is how you see the discontinuity instead of tripping over it.
 ```
 
 Closing the *last* gap - no shutdown at all, then a new node - needs a node-loss drill, which is a different kind of
@@ -741,14 +902,14 @@ commit, healthy, recently refused, refused long ago:
 ```sql
 -- page someone when a writer is working and not committing
 select agent_id, repo, last_activity_at, last_flush_at, failures, spool_rows, last_error
-from writer_heartbeat
+from memory.writer_heartbeat
 where (last_flush_at is null and last_activity_at < now() - interval '2 hours')
    or (last_flush_at is not null and last_activity_at - last_flush_at > interval '2 hours')
 order by last_activity_at desc;
 
 -- note it, do not page anyone, when a writer was refused recently or has rows stranded
 select agent_id, repo, failures, last_error, last_error_at, spool_rows
-from writer_heartbeat
+from memory.writer_heartbeat
 where (failures > 0 and last_error_at > now() - interval '24 hours')
    or (spool_rows > 0 and last_activity_at > now() - interval '2 hours')
 order by last_error_at desc nulls last;
@@ -759,23 +920,31 @@ is both conditions in one result set, page rows first, with the number a human a
 
 ```sql
 select * from (
-  select agent_id, repo,
-    case when (last_flush_at is null and last_activity_at < now() - interval '2 hours')
-           or (last_flush_at is not null and last_activity_at - last_flush_at > interval '2 hours')
-         then 'page' else 'note' end as severity,
-    case
-      when last_flush_at is null then round(extract(epoch from (now() - last_activity_at)) / 60.0, 1)
-      else round(extract(epoch from (last_activity_at - last_flush_at)) / 60.0, 1)
-    end as minutes_without_commit,
-    spool_since, round(extract(epoch from (now() - spool_since)) / 86400.0, 1) as spool_days,
-    flushes, failures, spool_rows, last_error, last_error_at, last_activity_at, last_flush_at
-  from writer_heartbeat
-  where (last_flush_at is null and last_activity_at < now() - interval '2 hours')
-     or (last_flush_at is not null and last_activity_at - last_flush_at > interval '2 hours')
-     or (failures > 0 and last_error_at > now() - interval '48 hours')
-     or (spool_rows > 0)
-) as flagged
-order by (severity = 'page') desc, last_activity_at desc nulls last;
+            select
+              agent_id,
+              repo,
+              case when (last_flush_at is null and last_activity_at < now() - interval '2 hours')
+             or (last_flush_at is not null and last_activity_at - last_flush_at > interval '2 hours') then 'page' else 'note' end as severity,
+              case
+                when last_flush_at is null then round(extract(epoch from (now() - last_activity_at)) / 60.0, 1)
+                else round(extract(epoch from (last_activity_at - last_flush_at)) / 60.0, 1)
+              end as minutes_without_commit,
+              flushes,
+              failures,
+              spool_rows,
+              spool_since,
+              round(extract(epoch from (now() - spool_since)) / 86400.0, 1) as spool_days,
+              last_error,
+              last_error_at,
+              last_activity_at,
+              last_flush_at
+            from memory.writer_heartbeat
+            where (last_flush_at is null and last_activity_at < now() - interval '2 hours')
+             or (last_flush_at is not null and last_activity_at - last_flush_at > interval '2 hours')
+               or (failures > 0 and last_error_at > now() - interval '48 hours')
+               or (spool_rows > 0)
+          ) as flagged
+          order by (severity = 'page') desc, last_activity_at desc nulls last;
 ```
 
 ### Windows that match how often someone actually looks

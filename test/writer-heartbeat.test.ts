@@ -45,12 +45,12 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
     const pg = (await import("pg")) as unknown as { Client: new (options: { connectionString: string }) => Client };
     client = new pg.Client({ connectionString: liveDsn });
     await client.connect();
-    await query(`delete from writer_heartbeat where agent_id like 'heartbeat-probe%'`);
+    await query(`delete from memory.writer_heartbeat where agent_id like 'heartbeat-probe%'`);
   });
 
   afterAll(async () => {
     if (client) {
-      await query(`delete from writer_heartbeat where agent_id like 'heartbeat-probe%'`);
+      await query(`delete from memory.writer_heartbeat where agent_id like 'heartbeat-probe%'`);
       await client.end();
       client = undefined;
     }
@@ -61,7 +61,7 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
     const activity = heartbeatActivityStatement!("heartbeat-probe-live", "pi-ed");
     await query(activity.sql, activity.values);
 
-    const row = (await query(`select * from writer_heartbeat where agent_id = 'heartbeat-probe-live'`)).rows[0];
+    const row = (await query(`select * from memory.writer_heartbeat where agent_id = 'heartbeat-probe-live'`)).rows[0];
     expect(row.agent_id).toBe("heartbeat-probe-live");
     expect(row.last_flush_at).toBeNull();
     expect(Number(row.flushes)).toBe(0);
@@ -73,12 +73,12 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
     expect(page).not.toContain("heartbeat-probe-live");
 
     // The same writer three hours later is exactly the `array_concat` class of bug: turns recorded, nothing committed.
-    await query(`insert into writer_heartbeat (agent_id, repo, last_activity_at) values ('heartbeat-probe-stale', 'pi-ed', now() - interval '3 hours')`);
+    await query(`insert into memory.writer_heartbeat (agent_id, repo, last_activity_at) values ('heartbeat-probe-stale', 'pi-ed', now() - interval '3 hours')`);
     const pageAfter = (await query(heartbeatPageAlertStatement!().sql)).rows.map((r) => String(r.agent_id));
     expect(pageAfter).toContain("heartbeat-probe-stale");
 
     // And a writer that is simply idle is not the same shape at all. Both timestamps old, matching each other.
-    await query(`insert into writer_heartbeat (agent_id, repo, last_activity_at, last_flush_at, flushes)
+    await query(`insert into memory.writer_heartbeat (agent_id, repo, last_activity_at, last_flush_at, flushes)
                  values ('heartbeat-probe-idle', 'pi-ed', now() - interval '9 hours', now() - interval '9 hours', 4)`);
     const pageFinal = (await query(heartbeatPageAlertStatement!().sql)).rows.map((r) => String(r.agent_id));
     expect(pageFinal).toContain("heartbeat-probe-stale");
@@ -92,7 +92,7 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
     const failure = heartbeatFailureStatement!("heartbeat-probe-live", "pi-ed", 'syntax error at or near "array_concat"', 12);
     await query(failure.sql, failure.values);
 
-    const row = (await query(`select * from writer_heartbeat where agent_id = 'heartbeat-probe-live'`)).rows[0];
+    const row = (await query(`select * from memory.writer_heartbeat where agent_id = 'heartbeat-probe-live'`)).rows[0];
     expect(Number(row.failures)).toBe(1);
     // Classified, then verbatim: the reader gets a kind, the diagnosis gets the original text.
     expect(String(row.last_error)).toContain("sql:");
@@ -111,7 +111,7 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
     const flush = heartbeatFlushStatement!("heartbeat-probe-live", "pi-ed");
     await query(flush.sql, flush.values);
 
-    const row = (await query(`select * from writer_heartbeat where agent_id = 'heartbeat-probe-live'`)).rows[0];
+    const row = (await query(`select * from memory.writer_heartbeat where agent_id = 'heartbeat-probe-live'`)).rows[0];
     expect(Number(row.flushes)).toBe(1);
     expect(row.last_flush_at).not.toBeNull();
     expect(Number(row.spool_rows)).toBe(0);
@@ -122,7 +122,7 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
     // backlog, and the backlog is now on disk only in the sense that it is in the store.
     const advisory = (await query(heartbeatAdvisoryAlertStatement!().sql)).rows.map((r) => String(r.agent_id));
     expect(advisory).toContain("heartbeat-probe-live"); // failures > 0 within 24h: honest about the earlier refusal
-    const stranded = (await query(`select agent_id from writer_heartbeat where spool_rows > 0`)).rows.map((r) => String(r.agent_id));
+    const stranded = (await query(`select agent_id from memory.writer_heartbeat where spool_rows > 0`)).rows.map((r) => String(r.agent_id));
     expect(stranded).not.toContain("heartbeat-probe-live");
   });
 
@@ -168,12 +168,12 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
   it("keeps the age of a backlog when the failure repeats", async () => {
     const { heartbeatFailureStatement } = await loadModule();
     // Same probe, second refusal, four days after the first one started stranding rows.
-    await query(`update writer_heartbeat set spool_since = now() - interval '4 days', spool_rows = 12 where agent_id = 'heartbeat-probe-live'`);
-    const first = (await query(`select spool_since from writer_heartbeat where agent_id = 'heartbeat-probe-live'`)).rows[0];
+    await query(`update memory.writer_heartbeat set spool_since = now() - interval '4 days', spool_rows = 12 where agent_id = 'heartbeat-probe-live'`);
+    const first = (await query(`select spool_since from memory.writer_heartbeat where agent_id = 'heartbeat-probe-live'`)).rows[0];
     const failure = heartbeatFailureStatement!("heartbeat-probe-live", "pi-ed", "dns: getaddrinfo ENOTFOUND memory.pi-ed.svc.cluster.local", 20);
     await query(failure.sql, failure.values);
 
-    const after = (await query(`select * from writer_heartbeat where agent_id = 'heartbeat-probe-live'`)).rows[0];
+    const after = (await query(`select * from memory.writer_heartbeat where agent_id = 'heartbeat-probe-live'`)).rows[0];
     expect(Number(after.spool_rows)).toBe(20);
     expect(Number(after.failures)).toBeGreaterThanOrEqual(2);
     expect(String(after.last_error)).toContain("dns:");
@@ -185,7 +185,7 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
 
   it("lets an old refusal age out of the alert set but not out of the sweep", async () => {
     const { heartbeatAdvisoryAlertStatement, heartbeatPageAlertStatement, heartbeatSweepStatement } = await loadModule();
-    await query(`insert into writer_heartbeat (agent_id, repo, last_activity_at, last_flush_at, flushes, failures, last_error, last_error_at)
+    await query(`insert into memory.writer_heartbeat (agent_id, repo, last_activity_at, last_flush_at, flushes, failures, last_error, last_error_at)
                  values ('heartbeat-probe-old-failure', 'pi-ed', now() - interval '10 minutes', now() - interval '10 minutes', 7, 3,
                           'connection to server failed', now() - interval '30 hours')`);
     // A refusal 30 hours old is outside the 24 h window a near-real-time evaluator reads, and inside the 48 h window a
@@ -203,7 +203,7 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
   it("keeps a spool that has been sitting for days on the sweep, where the alert set drops it", async () => {
     const { heartbeatAdvisoryAlertStatement, heartbeatPageAlertStatement, heartbeatSweepStatement } = await loadModule();
     // The laptop closed case: a writer spooled 7 rows three days ago, committed nothing since, and never came back.
-    await query(`insert into writer_heartbeat (agent_id, repo, last_activity_at, last_flush_at, flushes, failures, spool_rows, spool_since, last_error, last_error_at)
+    await query(`insert into memory.writer_heartbeat (agent_id, repo, last_activity_at, last_flush_at, flushes, failures, spool_rows, spool_since, last_error, last_error_at)
                  values ('heartbeat-probe-stranded', 'pi-ed', now() - interval '3 days', now() - interval '4 days', 9, 1, 7,
                           now() - interval '3 days', 'refused: connection to server failed', now() - interval '3 days')`);
 
@@ -244,7 +244,7 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
     // the store's job is to name the pair, because a report keyed on agent ids alone can only ever say "a new agent
     // appeared".
     await query(
-      `insert into writer_heartbeat (agent_id, repo, first_seen_at, last_activity_at, last_flush_at, flushes)
+      `insert into memory.writer_heartbeat (agent_id, repo, first_seen_at, last_activity_at, last_flush_at, flushes)
        values ('heartbeat-probe-old', 'probe-repo', now() - interval '5 days', now() - interval '3 days',
                now() - interval '3 days', 7),
               ('heartbeat-probe-new', 'probe-repo', now() - interval '1 hour', now(), now(), 2)`,
@@ -255,7 +255,7 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
         ["heartbeat-probe-new", "probe-repo", "1 hour", "0 days"],
       ]) {
         await query(
-          `insert into writer_heartbeat (agent_id, repo, first_seen_at, last_activity_at, last_flush_at, flushes)
+          `insert into memory.writer_heartbeat (agent_id, repo, first_seen_at, last_activity_at, last_flush_at, flushes)
            values ($1, $2, now() - interval '${seen}', now() - interval '${moved}', now() - interval '${moved}', 2)
            ${upsert}`,
           [id, repo],
@@ -277,14 +277,14 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
     // Two agents sharing a repository is ordinary here, and the arrival-postdates-the-stall rule is what separates it
     // from an agent that moved.
     await query(
-      `insert into writer_heartbeat (agent_id, repo, first_seen_at, last_activity_at, last_flush_at, flushes)
+      `insert into memory.writer_heartbeat (agent_id, repo, first_seen_at, last_activity_at, last_flush_at, flushes)
        values ('heartbeat-probe-flatmate', 'probe-repo', now() - interval '4 days', now() - interval '30 minutes',
                now() - interval '30 minutes', 3) ${upsert}`,
     );
     // A row that predates the `first_seen_at` column: its `first_seen_at` is the migration time, which is later than
     // its own last activity. Pairing from that would be pairing about an ALTER TABLE.
     await query(
-      `insert into writer_heartbeat (agent_id, repo, first_seen_at, last_activity_at, flushes)
+      `insert into memory.writer_heartbeat (agent_id, repo, first_seen_at, last_activity_at, flushes)
        values ('heartbeat-probe-ancient', 'probe-repo', now(), now() - interval '10 days', 4) ${upsert}`,
     );
 

@@ -432,7 +432,7 @@ export function eventStatement(sessionId: string, agentId: string, rows: Row[]):
   const values: unknown[] = [sessionId, agentId];
   let index = 3;
   for (const row of rows) {
-    tuples.push(`($1, $2, $${index}, $${index + 1}, $${index + 2}, $${index + 3}, $${index + 4}, $${index + 5}, (select coalesce(max(seq), 0) from event where session_id = $1) + ${tuples.length + 1})`);
+    tuples.push(`($1, $2, $${index}, $${index + 1}, $${index + 2}, $${index + 3}, $${index + 4}, $${index + 5}, (select coalesce(max(seq), 0) from memory.event where session_id = $1) + ${tuples.length + 1})`);
     // `text` is a column and `meta` is what surrounded it: which tool produced a result, whether it errored,
     // whether the text was clipped, which redaction rules fired. Collapsing one into the other is how a history
     // table stops being queryable.
@@ -440,18 +440,18 @@ export function eventStatement(sessionId: string, agentId: string, rows: Row[]):
     index += 6;
   }
   return {
-    sql: `insert into event (session_id, agent_id, source_entry_id, at, kind, tool_name, text, meta, seq) values ${tuples.join(", ")} on conflict (session_id, source_entry_id) do nothing`,
+    sql: `insert into memory.event (session_id, agent_id, source_entry_id, at, kind, tool_name, text, meta, seq) values ${tuples.join(", ")} on conflict (session_id, source_entry_id) do nothing`,
     values,
   };
 }
 
 export function agentStatement(agentId: string, repo: string): Statement {
   return {
-    sql: `insert into agent (id, name, host, repos)
+    sql: `insert into memory.agent (id, name, host, repos)
           values ($1, $1, split_part($1, ':', 1), array[$2])
           on conflict (id) do update
             set last_seen = now(),
-                repos = (select array(select distinct unnest(array_cat(agent.repos, array[$2]))))`,
+                repos = (select array(select distinct unnest(array_cat(memory.agent.repos, array[$2]))))`,
     values: [agentId, repo],
   };
 }
@@ -469,10 +469,24 @@ export function heartbeatDue(lastAt: number, nowMs: number, throttleMs = HEARTBE
   return nowMs - lastAt >= throttleMs;
 }
 
+/**
+ * Every statement in this file names its schema: `memory.memory`, `memory.event`, `memory.session`, `memory.agent`,
+ * `memory.writer_heartbeat`, `memory.subject_index`.
+ *
+ * The store's own role has `search_path = memory, public` (set by `memory/schema/001_init.sql`), so unqualified names
+ * work today. They would work by inheriting a role setting that lives in a SQL file this extension cannot see, and the
+ * failure mode of inheriting it is not an error: a `public` twin table, or a caller connecting as another role, makes an
+ * unqualified read - or write - land somewhere plausible and wrong. That is the silent split the sanity statement exists
+ * to detect, and home-ops found the read half of the same class in their own runbook, where querying a field that does
+ * not exist at that path succeeded and printed nothing.
+ *
+ * The one deliberate exception is `storeReadingSanityStatement`, whose whole job is to report what unqualified names
+ * RESOLVE to. Qualifying it would destroy the thing it measures.
+ */
 /** "A writer is here." Bumped when a session opens and whenever a flush is attempted, successfully or not. */
 export function heartbeatActivityStatement(agentId: string, repo: string): Statement {
   return {
-    sql: `insert into writer_heartbeat (agent_id, repo)
+    sql: `insert into memory.writer_heartbeat (agent_id, repo)
           values ($1, $2)
           on conflict (agent_id) do update set last_activity_at = now(), repo = excluded.repo`,
     values: [agentId, repo],
@@ -482,10 +496,10 @@ export function heartbeatActivityStatement(agentId: string, repo: string): State
 /** "A writer committed." The only stamp that moves `last_flush_at`, which is what makes the pair readable. */
 export function heartbeatFlushStatement(agentId: string, repo: string): Statement {
   return {
-    sql: `insert into writer_heartbeat (agent_id, repo)
+    sql: `insert into memory.writer_heartbeat (agent_id, repo)
           values ($1, $2)
           on conflict (agent_id) do update set last_activity_at = now(), last_flush_at = now(),
-            flushes = writer_heartbeat.flushes + 1, spool_rows = 0, spool_since = null`,
+            flushes = memory.writer_heartbeat.flushes + 1, spool_rows = 0, spool_since = null`,
     values: [agentId, repo],
   };
 }
@@ -534,13 +548,13 @@ export function describeStoreError(message: string): string {
 
 export function heartbeatFailureStatement(agentId: string, repo: string, error: string, spoolRows: number): Statement {
   return {
-    sql: `insert into writer_heartbeat (agent_id, repo, last_error, spool_rows)
+    sql: `insert into memory.writer_heartbeat (agent_id, repo, last_error, spool_rows)
           values ($1, $2, $3, $4)
-          on conflict (agent_id) do update set last_activity_at = now(), failures = writer_heartbeat.failures + 1,
+          on conflict (agent_id) do update set last_activity_at = now(), failures = memory.writer_heartbeat.failures + 1,
             last_error = excluded.last_error, last_error_at = now(), spool_rows = excluded.spool_rows,
             spool_since = case
-              when excluded.spool_rows <= 0 then writer_heartbeat.spool_since
-              when writer_heartbeat.spool_rows > 0 then writer_heartbeat.spool_since
+              when excluded.spool_rows <= 0 then memory.writer_heartbeat.spool_since
+              when memory.writer_heartbeat.spool_rows > 0 then memory.writer_heartbeat.spool_since
               else now()
             end`,
     // Classified inside the statement rather than at the call site: this is the storage boundary, and a caller
@@ -570,7 +584,7 @@ export const HEARTBEAT_SWEEP_FAILURE_WINDOW = "48 hours";
 export function heartbeatPageAlertStatement(): Statement {
   return {
     sql: `select agent_id, repo, last_activity_at, last_flush_at, failures, spool_rows, last_error
-          from writer_heartbeat
+          from memory.writer_heartbeat
           where (last_flush_at is null and last_activity_at < now() - interval '${HEARTBEAT_ALERT_WINDOW}')
              or (last_flush_at is not null and last_activity_at - last_flush_at > interval '${HEARTBEAT_ALERT_WINDOW}')
           order by last_activity_at desc`,
@@ -588,7 +602,7 @@ export function heartbeatPageAlertStatement(): Statement {
 export function heartbeatAdvisoryAlertStatement(): Statement {
   return {
     sql: `select agent_id, repo, failures, last_error, last_error_at, spool_rows
-          from writer_heartbeat
+          from memory.writer_heartbeat
           where (failures > 0 and last_error_at > now() - interval '24 hours')
              or (spool_rows > 0 and last_activity_at > now() - interval '2 hours')
           order by last_error_at desc nulls last`,
@@ -651,7 +665,7 @@ export function heartbeatSweepStatement(): Statement {
               last_error_at,
               last_activity_at,
               last_flush_at
-            from writer_heartbeat
+            from memory.writer_heartbeat
             where ${page}
                or (failures > 0 and last_error_at > now() - interval '${HEARTBEAT_SWEEP_FAILURE_WINDOW}')
                or (spool_rows > 0)
@@ -664,17 +678,17 @@ export function heartbeatSweepStatement(): Statement {
 export function heartbeatReadStatement(agentId: string): Statement {
   return {
     sql: `select last_activity_at, last_flush_at, flushes, failures, spool_rows, last_error, last_error_at
-          from writer_heartbeat where agent_id = $1`,
+          from memory.writer_heartbeat where agent_id = $1`,
     values: [agentId],
   };
 }
 
 export function sessionStatement(options: { sessionId: string; agentId: string; cwd: string; repo: string; firstAt: string; lastAt: string }): Statement {
   return {
-    sql: `insert into session (id, agent_id, repo, cwd, source, started_at, last_activity_at)
+    sql: `insert into memory.session (id, agent_id, repo, cwd, source, started_at, last_activity_at)
           values ($1, $2, $3, $4, 'pi-extension', $5, $6)
           on conflict (id) do update
-            set last_activity_at = greatest (session.last_activity_at, excluded.last_activity_at),
+            set last_activity_at = greatest (memory.session.last_activity_at, excluded.last_activity_at),
                 repo = excluded.repo,
                 cwd = excluded.cwd`,
     values: [options.sessionId, options.agentId, options.repo, options.cwd, options.firstAt, options.lastAt],
@@ -723,7 +737,7 @@ export function keywordSearch(query: string, agentId: string, options: { limit?:
     sql: `select m.id, m.agent_id, m.session_id, m.trigger, m.summary, m.subjects, m.feel, m.created_at,
                  ${rank} as rank,
                  case when m.agent_id = $2 then 1.0 else 0.65 end as weight
-          from memory m
+          from memory.memory m
           where ${filters.join(" and ")}
           order by (${rank} + case when m.agent_id = $2 then 1.0 else 0.65 end) desc, m.created_at desc
           limit $3`,
@@ -760,8 +774,8 @@ export function identityPairStatement(): Statement {
        b.flushes as arriving_flushes,
        round(extract(epoch from (now() - a.last_activity_at)) / 60.0, 1) as stalled_minutes,
        round(extract(epoch from (b.first_seen_at - a.last_activity_at)) / 60.0, 1) as minutes_from_stall_to_arrival
-     from writer_heartbeat a
-     join writer_heartbeat b on b.repo = a.repo and b.agent_id <> a.agent_id
+     from memory.writer_heartbeat a
+     join memory.writer_heartbeat b on b.repo = a.repo and b.agent_id <> a.agent_id
      where a.repo is not null
        and a.last_activity_at < now() - interval '2 hours'
        and b.last_activity_at > now() - interval '2 hours'
@@ -822,7 +836,7 @@ export function storeShapeCountsStatement(): Statement {
 /** How many memories this agent id actually has in the store. One cheap indexed count, asked only when a search
 returned nothing that belonged to it. */
 export function ownRowCountStatement(agentId: string): Statement {
-  return { sql: `select count(*)::int as own from memory where agent_id = $1`, values: [agentId] };
+  return { sql: `select count(*)::int as own from memory.memory where agent_id = $1`, values: [agentId] };
 }
 
 /**
@@ -838,18 +852,26 @@ export function ownRowCountStatement(agentId: string): Statement {
    Whole store by default, so a fleet-level reader sees the aggregate; scoped by an `agentLike` pattern when the
    question is about one checkout. Deliberately a count and not a severity: adding a heartbeat condition for this
    would collide with the frozen-severity contract below for no benefit, since nothing here pages.
+
+   A RATIO is reported beside the counts because a count alone cannot tell a small cold store from a degrading one -
+   the same reason the heartbeat is read as `failures` / `flushes` / `minutes_without_commit` rather than as one
+   column. `without_vector_percent` makes a *rise* the reported fact, per agent id as well as fleet-wide, which is
+   what home-ops asked for on their side of the reporting. `nullif(count(*), 0)` carries that: an empty store would
+   otherwise divide by zero, and a monitoring statement that errors precisely when the store is empty is worse than one
+   that reports no denominator. `null` means "no denominator yet", which is a different fact from "0 percent".
  */
 export function vectorCoverageStatement(options: { agentLike?: string } = {}): Statement {
   const scope = options.agentLike ? ` where agent_id like $1` : "";
   return {
-    // `from memory` before the scope, which is the order SQL actually has. The first version of this put the scope
+    // `from memory.memory` before the scope, which is the order SQL actually has. The first version of this put the scope
     // first because the helper reads like a filter being added to a sentence, and the live suite rejected it with
     // `syntax error at or near "from"` - a good demonstration that a unit test asserting the same shape as the bug
     // agrees with the bug instead of catching it.
     sql: `select count(*)::int as memories,
        count(*) filter (where embedding is null)::int as without_vector,
-       count(*) filter (where embedding is null and created_at > now() - interval '24 hours')::int as without_vector_24h
-     from memory${scope}`,
+       count(*) filter (where embedding is null and created_at > now() - interval '24 hours')::int as without_vector_24h,
+       round(100.0 * count(*) filter (where embedding is null) / nullif(count(*), 0), 1) as without_vector_percent
+     from memory.memory${scope}`,
     values: options.agentLike ? [options.agentLike] : [],
   };
 }
@@ -882,7 +904,7 @@ export function ownCoverageNote(options: { agentId: string; ownInStore: number; 
 
 /** The lean view of an agent's head: which subjects it actually has memories about, most recent first. */
 export function subjectsStatement(agentId: string, limit = 12): Statement {
-  return { sql: `select subject, memories, most_recent from subject_index where agent_id = $1 order by most_recent desc limit $2`, values: [agentId, limit] };
+  return { sql: `select subject, memories, most_recent from memory.subject_index where agent_id = $1 order by most_recent desc limit $2`, values: [agentId, limit] };
 }
 
 /** How a memory row is written, with the span of events it summarizes resolved in SQL rather than guessed here. */
@@ -1069,12 +1091,12 @@ export function dreamStatement(options: {
   return {
     sql: `with span as (
             select min(id) as first_id, max(id) as last_id
-            from event
+            from memory.event
             where session_id = $1
-              and seq > coalesce((select dream_seq from session where id = $1), 0)
+              and seq > coalesce((select dream_seq from memory.session where id = $1), 0)
               and coalesce(meta ->> 'dream_turn', 'false') <> 'true'
           )
-          insert into memory (agent_id, session_id, trigger, span_first_event, span_last_event, summary, subjects, feel, detail, embedding, embedding_model, embedding_dim)
+          insert into memory.memory (agent_id, session_id, trigger, span_first_event, span_last_event, summary, subjects, feel, detail, embedding, embedding_model, embedding_dim)
           select $2, $1, $3, span.first_id, span.last_id, $4, $5, $6, $7::jsonb, $8::vector, $9, $10
           from span`,
     // The cast on the vector is what makes a parameter a pgvector value rather than a string Postgres has to guess
@@ -1105,15 +1127,15 @@ export function dreamStatement(options: {
 export function dreamSpanStatement(sessionId: string): Statement {
   return {
     sql: `select coalesce(max(seq), 0) as last_seq, count(*) filter (where coalesce(meta ->> 'dream_turn', 'false') <> 'true') as work_events
-          from event
-          where session_id = $1 and seq > coalesce((select dream_seq from session where id = $1), 0)`,
+          from memory.event
+          where session_id = $1 and seq > coalesce((select dream_seq from memory.session where id = $1), 0)`,
     values: [sessionId],
   };
 }
 
 export function dreamCursorStatement(sessionId: string): Statement {
   return {
-    sql: `update session set dream_seq = (select coalesce(max(seq), dream_seq) from event where session_id = $1) where id = $1`,
+    sql: `update memory.session set dream_seq = (select coalesce(max(seq), dream_seq) from memory.event where session_id = $1) where id = $1`,
     values: [sessionId],
   };
 }
@@ -1260,7 +1282,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
         const statement = eventStatement(rowSession, agent, [row]);
         await client.query(statement.sql, statement.values);
       }
-      await client.query(`update session set event_count = (select count(*) from event where session_id = $1) where id = $1`, [sessionId]);
+      await client.query(`update memory.session set event_count = (select count(*) from memory.event where session_id = $1) where id = $1`, [sessionId]);
       await client.query("commit");
       written += all.length;
       lastError = "";
@@ -1581,7 +1603,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
         await client.query(dream.sql, dream.values);
         const cursor = dreamCursorStatement(sessionId);
         await client.query(cursor.sql, cursor.values);
-        await client.query("refresh materialized view subject_index");
+        await client.query("refresh materialized view memory.subject_index");
         dreamStartedAt = 0;
         // The gate is in units of work, so this has to be recorded in the same unit. `seen.size` counts every row
         // this process has walked, including the dream's own residue, and a gate that compares work against
@@ -1628,10 +1650,10 @@ export default function memoryExtension(api: ExtensionAPI): void {
         try {
           client = await db.connect();
           const counts = await client.query(
-            `select (select count(*) from session where agent_id = $1) as sessions,
-                    (select count(*) from event where agent_id = $1) as events,
-                    (select count(*) from memory where agent_id = $1) as memories,
-                    (select count(*) from memory where agent_id = $1 and embedding is null) as unembedded`,
+            `select (select count(*) from memory.session where agent_id = $1) as sessions,
+                    (select count(*) from memory.event where agent_id = $1) as events,
+                    (select count(*) from memory.memory where agent_id = $1) as memories,
+                    (select count(*) from memory.memory where agent_id = $1 and embedding is null) as unembedded`,
             [agent],
           );
           const row = counts.rows[0] ?? {};

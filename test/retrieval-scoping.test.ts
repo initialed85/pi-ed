@@ -68,18 +68,18 @@ function literal(vector: number[]): string {
 
 async function plant(agentId: string, summary: string, vector: number[] | null): Promise<void> {
   await query(
-    `insert into agent (id, name, notes) values ($1, $1, '{"probe": true}'::jsonb)
+    `insert into memory.agent (id, name, notes) values ($1, $1, '{"probe": true}'::jsonb)
      on conflict (id) do update set notes = excluded.notes`,
     [agentId],
   );
   await query(
-    `insert into session (id, agent_id, source, started_at, last_activity_at)
+    `insert into memory.session (id, agent_id, source, started_at, last_activity_at)
      values ($2, $1, 'probe', now(), now())
      on conflict (id) do update set last_activity_at = now()`,
     [agentId, `${agentId}-session`],
   );
   await query(
-    `insert into memory (agent_id, session_id, trigger, summary, subjects, feel, embedding, embedding_model, embedding_dim)
+    `insert into memory.memory (agent_id, session_id, trigger, summary, subjects, feel, embedding, embedding_model, embedding_dim)
      values ($1, $2, 'manual', $3, array['scoping', 'probe'], 'deliberate', $4::vector, 'fabricated-for-test', $5::int)`,
     [agentId, `${agentId}-session`, summary, vector === null ? null : literal(vector), vector === null ? null : DIMENSIONS],
   );
@@ -113,9 +113,9 @@ suite("retrieval scope, against the store", () => {
     if (!client) return;
     // The same discipline as the heartbeat probes: whatever a test invents, the test removes, and everything it
     // invents carries a name that makes a leftover findable in one query.
-    await query(`delete from memory where agent_id like $1`, [`${PROBE}%`]);
-    await query(`delete from session where agent_id like $1`, [`${PROBE}%`]);
-    await query(`delete from agent where id like $1`, [`${PROBE}%`]);
+    await query(`delete from memory.memory where agent_id like $1`, [`${PROBE}%`]);
+    await query(`delete from memory.session where agent_id like $1`, [`${PROBE}%`]);
+    await query(`delete from memory.agent where id like $1`, [`${PROBE}%`]);
   }
 
   it("shows what an identity change does to a store that is not broken in any way", async () => {
@@ -183,6 +183,23 @@ suite("retrieval scope, against the store", () => {
     // The rest of this file's probes all carry vectors, so the scoped store shows exactly one vectorless row and a
     // reader can tell "one checkout is failing" from "embeddings are off here".
     expect(Number(after.without_vector)).toBe(1);
+
+    // The RATIO beside the count, because 1 vectorless row out of 3 memories and 1 out of 300 are different findings
+    // and a sweep that carries only the count cannot tell them apart. The probes here all have vectors, so the ratio
+    // starts at zero and the planted row is the thing that moves it.
+    expect(Number(before.without_vector_percent)).toBe(0);
+    expect(Number(after.without_vector_percent)).toBe(
+      Math.round((1000 * Number(after.without_vector)) / Number(after.memories)) / 10,
+    );
+    expect(Number(after.without_vector_percent)).toBeGreaterThan(Number(before.without_vector_percent));
+
+    // The denominator case, which is the one a monitoring statement usually gets wrong: a pattern matching nothing has
+    // to report "no denominator", not divide by zero and not report 0 percent, because 0 percent is what a healthy
+    // store looks like and an error is what makes someone stop reading the query.
+    const none = mod.vectorCoverageStatement!({ agentLike: `${PROBE}-no-such-agent%` });
+    const noneRow = (await query(none.sql, none.values)).rows[0] ?? {};
+    expect(Number(noneRow.memories)).toBe(0);
+    expect(noneRow.without_vector_percent).toBeNull();
   });
 
   it("tells the agent which kind of absence it is looking at", async () => {

@@ -124,6 +124,15 @@ const includeDdl = flags["includeDdl"] === true;
 const MERGE_PRONE = /^select( distinct)? (\$\d+|\d+|'[^']*'|"[^"]*"|[a-z_]+\(\))(( as [a-z_0-9]+)?(, ?|$))+$/i;
 const mergeProne = (text) => MERGE_PRONE.test(String(text).replace(/\s+/g, " ").trim());
 
+// The opposite failure, measured in `test/statistics-view.test.ts`: a statement whose text never changes can still
+// split into two rows with two counters. `queryid` is computed from the *analysed* tree, where `select *` has already
+// been expanded into concrete columns, so adding a column to the table gives identical text a new queryid and starts
+// its counter again from 1. A rename - schema-qualifying a statement, for instance - does the same thing deliberately.
+// Both are invisible in a delta: the new row reads like a statement that just got cheap, and the old one reads like it
+// went quiet. What survives both is the mean, not the call count.
+const SPLIT_PRONE = /\bselect\s+\*/i;
+const splitProne = (text) => SPLIT_PRONE.test(String(text).replace(/\s+/g, " ").trim());
+
 const rows = [];
 for (const [queryid, row] of after.byId) {
   const was = before.byId.get(queryid);
@@ -139,8 +148,8 @@ for (const [queryid, row] of after.byId) {
   // `refresh materialized view subject_index` is deliberately NOT excluded: it recurs on every writer run and it is
   // the priciest thing this store does on purpose, which is the number the 250 ms threshold is argued from.
   if (isSelf(full)) continue;
-  if (!includeDdl && /^(create|alter|drop|comment|grant|begin|commit|with a as|insert into agent)/i.test(text)) continue;
-  rows.push({ queryid, calls, totalMs, perCall: totalMs / calls, rowsOut, text, merged: mergeProne(full) || mergeProne(text) });
+  if (!includeDdl && /^(create|alter|drop|comment|grant|begin|commit|with a as|insert into memory.agent)/i.test(text)) continue;
+  rows.push({ queryid, calls, totalMs, perCall: totalMs / calls, rowsOut, text, merged: mergeProne(full) || mergeProne(text), split: splitProne(text) });
 }
 
 rows.sort((a, b) => b.totalMs - a.totalMs);
@@ -149,15 +158,18 @@ console.log(`\nduring the run (${rows.length} distinct statements, deltas not to
 for (const row of rows.slice(0, top)) {
   console.log(
     `  ${row.totalMs.toFixed(2)} ms total | ${row.perCall.toFixed(2)} ms per call | ${row.calls} call(s) | ` +
-      `${row.rowsOut} row(s) | queryid ${row.queryid} | ${row.text}${row.merged ? "  [merge-prone shape: this text is one variant, the counter is shared]" : ""}`,
+      `${row.rowsOut} row(s) | queryid ${row.queryid} | ${row.text}` +
+      (row.merged ? "  [merge-prone shape: this text is one variant, the counter is shared]" : "") +
+      (row.split ? "  [split-prone shape: a column added to the table, or a rename, gives this identical text a new queryid and a counter starting at 1]" : ""),
   );
 }
 if (!rows.length) console.log("  nothing attributable to the run");
 
 // The other direction of the same warning: a row can also *disappear*. home-ops saw a 9-call row and a 2-call row
-// absent on a later read with no crash anywhere, `max = 5000` and only 41 rows present. So the diff below is a lower
-// bound whenever the view shrank without anybody resetting it, and saying so is cheaper than a reader assuming the
-// run got cheaper.
+// absent on a later read with no crash anywhere, `max = 5000` and only 41 rows present. And a row can stop being
+// written without vanishing: after a rename or a column added to a `select *`, the old queryid sits there with its
+// accumulated calls while a second row carries the traffic. So the diff below is a lower bound whenever the view shrank
+// without anybody resetting it, and a row whose `calls` has stopped growing is not evidence the statement got cheaper.
 if (after.byId.size < before.byId.size && String(before.statsReset) === String(after.statsReset)) {
   console.log(`note: ${before.byId.size - after.byId.size} tracked statement(s) disappeared with no reset. The view evicts; a missing "before" row makes this run's delta a lower bound, not a measurement.`);
 }

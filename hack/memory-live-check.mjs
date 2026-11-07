@@ -164,7 +164,7 @@ try {
   await new Promise((resolve) => setTimeout(resolve, 3000));
   const after = await counts(agent);
   const memory = await db.query(
-    `select summary, feel, subjects, span_first_event, span_last_event, embedding_model, embedding_dim, (embedding is not null) as has_vector, left(detail::text, 60) as detail from memory where agent_id = $1 order by created_at desc limit 1`,
+    `select summary, feel, subjects, span_first_event, span_last_event, embedding_model, embedding_dim, (embedding is not null) as has_vector, left(detail::text, 60) as detail from memory.memory where agent_id = $1 order by created_at desc limit 1`,
     [agent],
   );
   const spoolRemain = await readFile(path.join(scratch, "spool.jsonl"), "utf8").then((text) => text.split("\n").filter((line) => line.trim()).length).catch(() => 0);
@@ -173,8 +173,8 @@ try {
   // The watermark is the part of this check that exists to outlive the rows it describes. A flush that rolls back
   // leaves the tables empty and the store looking healthy; only this row can say the writer was refused.
   const beat = await db.query(
-    `select flushes, failures, spool_rows, last_error, last_activity_at, last_flush_at from writer_heartbeat
-     where agent_id = (select id from agent where name = $1)`,
+    `select flushes, failures, spool_rows, last_error, last_activity_at, last_flush_at from memory.writer_heartbeat
+     where agent_id = (select id from memory.agent where name = $1)`,
     [agent],
   );
   const h = beat.rows[0];
@@ -197,10 +197,10 @@ try {
   const vector = embed?.data?.[0]?.embedding;
   if (!Array.isArray(vector) || vector.length !== 768) throw new Error("embedder did not return a 768-dimension vector for the planted memory");
   const planted = await db.query(
-    `with a as (insert into agent (id, name, notes) values ($1, $1, '{"probe": true}'::jsonb) on conflict (id) do update set notes = excluded.notes returning id),
-          s as (insert into session (id, agent_id, source, started_at, last_activity_at) select $2, a.id, 'probe', now(), now() from a
+    `with a as (insert into memory.agent (id, name, notes) values ($1, $1, '{"probe": true}'::jsonb) on conflict (id) do update set notes = excluded.notes returning id),
+          s as (insert into memory.session (id, agent_id, source, started_at, last_activity_at) select $2, a.id, 'probe', now(), now() from a
                 on conflict (id) do update set last_activity_at = now() returning id)
-     insert into memory (agent_id, session_id, trigger, summary, subjects, feel, embedding, embedding_model, embedding_dim)
+     insert into memory.memory (agent_id, session_id, trigger, summary, subjects, feel, embedding, embedding_model, embedding_dim)
      select a.id, s.id, 'manual', $3, array['bluehammer', 'drill'], 'wry', $4::vector, 'bge-base-en-v1.5', 768
      from a, s
      returning id`,
@@ -263,7 +263,7 @@ try {
   console.log(`newest memory: ${JSON.stringify(memory.rows[0] ?? null)}`);
   console.log(`spool remaining: ${spoolRemain}`);
 
-  const kinds = await db.query(`select kind, count(*)::int as n from event where agent_id = $1 group by kind order by kind`, [agent]);
+  const kinds = await db.query(`select kind, count(*)::int as n from memory.event where agent_id = $1 group by kind order by kind`, [agent]);
   console.log(`recorded kinds: ${kinds.rows.map((row) => `${row.kind}=${row.n}`).join(" ")}`);
 
   const problems = [];
@@ -332,17 +332,17 @@ async function cleanProbeRows() {
   for (const table of ["memory", "event", "session", "writer_heartbeat", "agent"]) {
     const result =
       table === "agent"
-        ? await db.query(`delete from agent where name = any($1::text[])`, [[agent, teammateAgent]])
-        : await db.query(`delete from ${table} where agent_id in (select id from agent where name = any($1::text[]))`, [[agent, teammateAgent]]);
+        ? await db.query(`delete from memory.agent where name = any($1::text[])`, [[agent, teammateAgent]])
+        : await db.query(`delete from ${table} where agent_id in (select id from memory.agent where name = any($1::text[]))`, [[agent, teammateAgent]]);
     deleted[table] = result.rowCount;
   }
-  const left = await db.query(`select (select count(*) from agent) as agents, (select count(*) from event) as events, (select count(*) from memory) as memories, (select count(*) from writer_heartbeat) as heartbeats`, []);
+  const left = await db.query(`select (select count(*) from memory.agent) as agents, (select count(*) from memory.event) as events, (select count(*) from memory.memory) as memories, (select count(*) from memory.writer_heartbeat) as heartbeats`, []);
   console.log(`cleaned up: ${JSON.stringify(deleted)}; store now holds ${JSON.stringify(left.rows[0] ?? {})}`);
   await db.query("refresh materialized view subject_index");
 }
 
 async function counts(agentId) {
-  const events = await db.query(`select count(*)::int as n from event where agent_id = $1`, [agentId]);
-  const memories = await db.query(`select count(*)::int as n from memory where agent_id = $1`, [agentId]);
+  const events = await db.query(`select count(*)::int as n from memory.event where agent_id = $1`, [agentId]);
+  const memories = await db.query(`select count(*)::int as n from memory.memory where agent_id = $1`, [agentId]);
   return { events: events.rows[0].n, memories: memories.rows[0].n };
 }
