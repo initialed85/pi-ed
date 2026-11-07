@@ -248,7 +248,9 @@ than a mystery.
 
 If a future incident needs real statement-level visibility, ask for `pg_stat_statements` in the Deployment's
 `shared_preload_libraries` plus `log_min_duration_statement = 250ms`. It costs a Postgres restart, and a restart is
-safe by design: the writer spools to disk while the store is unreachable and replays on the next flush.
+safe by design: the writer spools to disk while the store is unreachable and replays on the next flush. A clean
+restart also preserves the statistics window, so the cost is downtime rather than lost history - see the cost section
+below for what that claim is measured on, and for the unclean case that is not measured yet.
 
 ## Writer visibility: the heartbeat table
 
@@ -264,24 +266,49 @@ Measured from `pg_stat_statements` (on since home-ops `9325af4`, `track = all`) 
 | `insert into writer_heartbeat (…)` | 6 | 0.29 ms | 0.54 ms |
 
 Read those numbers the way the view produces them, or a future comparison invents a regression. `pg_stat_statements`
-is **cumulative since the last reset or server start**, so `calls` is a running total, not a measurement of anything
-that happened today: home-ops read this same view earlier in the same evening as my run above and got `4 calls,
-14.78 ms mean, 17.77 ms max` for the matview refresh where I read `6 calls, 16.01 ms mean, 21.72 ms max`. Same
-reality, different moments. **Compare means and maxima across time; never compare `calls`.** A third reading of the
-same matview refresh, an hour and a half later and 18 calls deep into the same window, came back `15.55 ms mean,
-22.70 ms max` - the mean held, the call count doubled because other agents were working.
+is **cumulative since its `stats_reset`**, so `calls` is a running total, not a measurement of anything that happened
+today: home-ops read this same view earlier in the same evening as my run above and got `4 calls, 14.78 ms mean,
+17.77 ms max` for the matview refresh where I read `6 calls, 16.01 ms mean, 21.72 ms max`, and their next reading was
+`6 calls, 96.08 ms total, 16.01 ms mean` - which is not a second measurement of my number, it *is* my number, the
+same accumulated state seen later. **Compare means and maxima across time; never compare `calls`.** A third reading of
+the same refresh, an hour and a half on and 18 calls deep, came back `15.55 ms mean, 22.70 ms max`: the mean held, the
+call count grew because other agents were working.
 
-### The window has a start time, and a restart moves it without asking
+### The window has a start time, and exactly one known thing moves it
 
-`select stats_reset from pg_stat_statements_info` in this store reads **`2026-11-07 19:27:33.116+00`**, and
-`status.startTime` for the pod that was recreated to load `shared_preload_libraries` reads **`19:27:17Z`**. The view
-reset itself sixteen seconds after the container started. Nobody announced a reset; the manifest did it.
+`select stats_reset from pg_stat_statements_info` in this store reads **`2026-11-07 19:27:33.116+00`**, and it has
+read that since the extension existed. What that timestamp marks is the first load of `pg_stat_statements`: the pod
+that was recreated to preload it has `status.startTime = 19:27:17Z`, the manifest's `postStart` hook runs
+`CREATE EXTENSION IF NOT EXISTS pg_stat_statements` a few seconds later, and the view's own rows include that
+statement at 143.89 ms. A first-load stamp, not a restart stamp.
 
-Three consequences, all of which change what a number is allowed to mean:
+| what happened | effect on `stats_reset` | how it is known |
+| --- | --- | --- |
+| first load of the extension | starts the window | this store: stamp 19:27:33.116Z, 16 s after `status.startTime` 19:27:17Z, with the `CREATE EXTENSION` in the view |
+| clean stop and a genuinely new postmaster | **unchanged**, counters keep accumulating | home-ops `b3e16d7`, throwaway Postgres 16 in dev: postmaster `20:34:56` to `20:35:28` with `stats_reset` fixed at `20:34:56.355296` and probe `calls` continuing rather than restarting at 1. `pg_stat_statements.save = on` there, and `show pg_stat_statements.save` reads `on` in this store too |
+| unclean stop - `SIGKILL`, node loss, forced pod delete | **not measured** | home-ops' probe tested the clean case; this pod has `restartCount = 0` since 19:27Z, so there is no natural experiment here either |
+
+The middle row is a correction of this file, and it is worth keeping in the history rather than quietly editing out.
+An earlier version of this section said a restart resets the view on its own, "sixteen seconds after the container
+started", and read that as the manifest doing it silently. That was home-ops' inference plus my coincidence - the
+rollout *was* the extension's first load, so the two explanations were indistinguishable in that store and both
+narratives fit. home-ops measured it on a scratch database instead of arguing about it, and the claim was wrong.
+Their sweep design got better at the same time: since a clean restart cannot move the stamp, a stamp that moves has
+one known cause, someone calling `pg_stat_statements_reset()` in a database another reader is measuring. A movement
+with nobody saying so *is* the finding, with no restart noise to argue past.
+
+The open gap is the third row, and it matters specifically because of how this store is attached: a single-replica
+Postgres on a Longhorn volume, `strategy: Recreate`. If an unclean stop does drop the counters, then a node failure
+or an attach failure starts a fresh window during the exact incident when someone most wants the history of what the
+store was doing. Until that is measured, the honest rule is: **treat a moved stamp as a human until the unclean case
+is measured, and treat a stamp that is much older than your oldest reading as the safe case.**
+
+Three consequences that did not change:
 
 - **A "this got slower" claim has to quote `stats_reset` first.** Means are comparable only *within* one window, and
-  a rollout ends the window. home-ops' sweep now reads the timestamp before comparing anything, and treats an
-  unannounced move as the finding rather than trusting the norm.
+  every number in this file - `4 / 14.78 / 17.77`, `6 / 16.01 / 21.72`, `18 / 15.55 / 22.70` - sits inside the single
+  window that began at 19:27Z. Quote the stamp, and quote the window's age, because a 40-minute window and a 3-day
+  window are not the same measurement.
 - **It is per database.** `pg_stat_statements_info` does not exist in this pod's `postgres` database - the extension
   is installed in `pi_ed`. A sweep that measures one database and reads the window from another is reading nothing.
 - **Rank by mean, not by total, and drop the one-offs.** The same reading contains `CREATE EXTENSION IF NOT EXISTS
@@ -289,7 +316,8 @@ Three consequences, all of which change what a number is allowed to mean:
   events at init. Ranked by `total_exec_time`, they look like the worst thing this database does, and that is how a
   threshold argument gets built from the wrong row. The recurring statements are the ones in the table above.
 
-If a run genuinely needs per-run counts, do not reset the view: `hack/pg-cost-snapshot.mjs` snapshots
+If a run genuinely needs per-run counts, do not reset the view - now with a sharper reason, since resetting it is the
+one thing known to move a stamp other readers are relying on: `hack/pg-cost-snapshot.mjs` snapshots
 `pg_stat_statements`, runs a command, snapshots again, and prints per-statement deltas with per-call means, excluding
 its own queries from the result. `pg_stat_statements_reset()` clears a shared window other agents are reading; a
 before/after diff reads a slice of it. Nothing is lost, nothing needs announcing, and a concurrent writer shows up as

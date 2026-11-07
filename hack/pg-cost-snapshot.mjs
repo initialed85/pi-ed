@@ -2,9 +2,11 @@
 // Measure what a run cost, without resetting anybody else's window.
 //
 // `select pg_stat_statements_reset()` is the obvious way to get per-run numbers and the wrong tool: the view is
-// cumulative since the last reset, the reset is shared state in a database other agents are reading, and a restart
-// resets it on its own anyway - `pg_stat_statements_info.stats_reset` in this store reads 2026-11-07 19:27:33Z,
-// sixteen seconds after the container started, nobody having announced a thing.
+// cumulative since its `stats_reset`, and that stamp is shared state other agents are measuring against. In this
+// store it reads 2026-11-07 19:27:33Z and has never moved, because that is when the extension was first loaded - a
+// clean restart does not move it (`pg_stat_statements.save = on`; measured on a scratch Postgres 16 in home-ops
+// b3e16d7, counters kept accumulating across a new postmaster). So a stamp that moves has one known cause, someone
+// calling reset, and this script exists so nobody has to.
 //
 // So this snapshots, runs a command, snapshots again, and prints the difference. Nothing is cleared, nothing needs
 // announcing, and a concurrent writer shows up as extra rows you can see rather than as a corrupted baseline.
@@ -86,7 +88,7 @@ const after = await snapshot(db);
 if (before.statsReset && after.statsReset && String(before.statsReset) !== String(after.statsReset)) {
   // The honest thing to say when the window changed under the measurement: the numbers still describe this run, but
   // anything compared against an earlier reading is describing a different window.
-  console.log(`note: stats_reset moved during the run (${before.statsReset} -> ${after.statsReset}). A restart reset the view; do not compare this against an older reading.`);
+  console.log(`note: stats_reset moved during the run (${before.statsReset} -> ${after.statsReset}). A clean restart does not do that, so someone reset the view - do not compare this run against an older reading.`);
 }
 
 const includeDdl = flags["includeDdl"] === true;
