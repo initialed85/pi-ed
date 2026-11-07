@@ -94,8 +94,11 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
 
     const row = (await query(`select * from writer_heartbeat where agent_id = 'heartbeat-probe-live'`)).rows[0];
     expect(Number(row.failures)).toBe(1);
+    // Classified, then verbatim: the reader gets a kind, the diagnosis gets the original text.
+    expect(String(row.last_error)).toContain("sql:");
     expect(String(row.last_error)).toContain("array_concat");
     expect(Number(row.spool_rows)).toBe(12);
+    expect(row.spool_since).not.toBeNull();
     // The column that means "committed" is the one column a refusal must not touch.
     expect(row.last_flush_at).toBeNull();
 
@@ -112,6 +115,8 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
     expect(Number(row.flushes)).toBe(1);
     expect(row.last_flush_at).not.toBeNull();
     expect(Number(row.spool_rows)).toBe(0);
+    // The backlog clock stops with the backlog. The next stranding measures from then, not from this event.
+    expect(row.spool_since).toBeNull();
 
     // The failure stays on the record - it happened - but a stale stranded-rows alert is gone: spool_rows is the
     // backlog, and the backlog is now on disk only in the sense that it is in the store.
@@ -160,6 +165,24 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
     expect(firstPage).toBeLessThan(lastNote);
   });
 
+  it("keeps the age of a backlog when the failure repeats", async () => {
+    const { heartbeatFailureStatement } = await loadModule();
+    // Same probe, second refusal, four days after the first one started stranding rows.
+    await query(`update writer_heartbeat set spool_since = now() - interval '4 days', spool_rows = 12 where agent_id = 'heartbeat-probe-live'`);
+    const first = (await query(`select spool_since from writer_heartbeat where agent_id = 'heartbeat-probe-live'`)).rows[0];
+    const failure = heartbeatFailureStatement!("heartbeat-probe-live", "pi-ed", "dns: getaddrinfo ENOTFOUND memory.pi-ed.svc.cluster.local", 20);
+    await query(failure.sql, failure.values);
+
+    const after = (await query(`select * from writer_heartbeat where agent_id = 'heartbeat-probe-live'`)).rows[0];
+    expect(Number(after.spool_rows)).toBe(20);
+    expect(Number(after.failures)).toBeGreaterThanOrEqual(2);
+    expect(String(after.last_error)).toContain("dns:");
+    // The clock did not move: the backlog is four days old, not a fresh discovery.
+    expect(String(after.spool_since)).toBe(String(first.spool_since));
+    const ageMinutes = (Date.now() - new Date(String(after.spool_since)).getTime()) / 60_000;
+    expect(ageMinutes).toBeGreaterThan(5_700);
+  });
+
   it("lets an old refusal age out of the alert set but not out of the sweep", async () => {
     const { heartbeatAdvisoryAlertStatement, heartbeatPageAlertStatement, heartbeatSweepStatement } = await loadModule();
     await query(`insert into writer_heartbeat (agent_id, repo, last_activity_at, last_flush_at, flushes, failures, last_error, last_error_at)
@@ -180,9 +203,9 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
   it("keeps a spool that has been sitting for days on the sweep, where the alert set drops it", async () => {
     const { heartbeatAdvisoryAlertStatement, heartbeatPageAlertStatement, heartbeatSweepStatement } = await loadModule();
     // The laptop closed case: a writer spooled 7 rows three days ago, committed nothing since, and never came back.
-    await query(`insert into writer_heartbeat (agent_id, repo, last_activity_at, last_flush_at, flushes, failures, spool_rows, last_error, last_error_at)
+    await query(`insert into writer_heartbeat (agent_id, repo, last_activity_at, last_flush_at, flushes, failures, spool_rows, spool_since, last_error, last_error_at)
                  values ('heartbeat-probe-stranded', 'pi-ed', now() - interval '3 days', now() - interval '4 days', 9, 1, 7,
-                          'connection to server failed', now() - interval '3 days')`);
+                          now() - interval '3 days', 'refused: connection to server failed', now() - interval '3 days')`);
 
     // The advisory half of the alert set misses it on both counts: the refusal is outside 24 h, and the stranded rows
     // are outside the 2 h activity guard. That is the combination a daily sweep exists to catch, which is why the
@@ -202,6 +225,9 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
     const found = swept.find((row) => String(row.agent_id) === "heartbeat-probe-stranded");
     expect(found?.severity).toBe("page");
     expect(Number(found?.spool_rows)).toBe(7);
+    // The age of the condition comes out of the store rather than out of a report that has to remember seeing it
+    // before: `spool_days` is measured from `spool_since`, which the writer started three days ago here.
+    expect(Number(found?.spool_days)).toBeGreaterThanOrEqual(2.9);
     // Measured against the last commit: activity ran a full day ahead of it.
     expect(Number(found?.minutes_without_commit)).toBeGreaterThanOrEqual(1439);
   });

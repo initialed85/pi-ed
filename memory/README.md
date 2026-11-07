@@ -293,7 +293,8 @@ watermark too. Activity without a commit is the signal, and it only appears when
 which is exactly the `array_concat` shape: every flush rolled back, every row went to the spool, and the only trace
 was `xact_rollback` climbing while the tables stayed empty.
 
-`schema/003_writer_heartbeat.sql` - the table itself; `heartbeatPageAlertStatement` and
+`schema/003_writer_heartbeat.sql` - the table itself, including `spool_since` (created with the table for a fresh
+store, and carried onto an existing one by `alter table ... add column if not exists`); `heartbeatPageAlertStatement` and
 `heartbeatAdvisoryAlertStatement` in `extensions/memory.ts` - the two queries, exported from the writer so the
 documentation and the alerts cannot drift apart; `test/writer-heartbeat.test.ts` - the proof, which runs only against
 a store (`PI_LIVE_DSN=... npx vitest run test/writer-heartbeat.test.ts`) and fabricates each shape: stale without a
@@ -328,6 +329,7 @@ select * from (
       when last_flush_at is null then round(extract(epoch from (now() - last_activity_at)) / 60.0, 1)
       else round(extract(epoch from (last_activity_at - last_flush_at)) / 60.0, 1)
     end as minutes_without_commit,
+    spool_since, round(extract(epoch from (now() - spool_since)) / 86400.0, 1) as spool_days,
     flushes, failures, spool_rows, last_error, last_error_at, last_activity_at, last_flush_at
   from writer_heartbeat
   where (last_flush_at is null and last_activity_at < now() - interval '2 hours')
@@ -359,6 +361,21 @@ The real-time pair keeps its narrow windows because a real-time evaluator has no
 is the 24 h / 2 h version, and `test/writer-heartbeat.test.ts` proves both readings on the same fabricated rows - a
 refusal 30 hours old is outside the alert set and inside the sweep, and a writer that stranded 7 rows three days ago
 is missed by both alert queries and caught by the sweep.
+
+### The age of a finding is in the store, not in the report
+
+`spool_since` records when a stranded backlog began, and only a transition from "no backlog" starts it: a failure
+that repeats does not reset the clock, and `heartbeatFlushStatement` sets both `spool_rows = 0` and `spool_since =
+null`, so the next stranding measures from then rather than inheriting an old measurement. The sweep returns
+`spool_days` alongside it.
+
+That column exists because home-ops' report design needs an age and the heartbeat previously could only give the age
+of the *last* failure. A finding that reappears every morning as a fresh discovery trains a reader to skim past it -
+their own precedent for what that looks like is `cert-manager-startupapicheck`, `Failed` in dev for 105 days,
+contributing a permanent series nobody reads any more. "Still open, 4 days" is only honest if something measured the
+4 days. The dedup key is `agent_id` with `severity`, and the age anchors are different per finding: `last_error_at`
+for a refusal, `spool_since` for a backlog. The live suite proves the non-resetting directly, by backdating a
+backlog four days, running another refusal against it, and asserting the timestamp did not move.
 
 One consequence of the page query that a test nearly made me get wrong, so it is written down: **a page row can be
 late without being wrong.** A healthy writer's asymmetry is a few seconds, because it flushes on a debounce measured

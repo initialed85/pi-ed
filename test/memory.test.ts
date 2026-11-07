@@ -223,9 +223,15 @@ describe("the writer's heartbeat", () => {
     expect(failure.sql).toContain("failures = writer_heartbeat.failures + 1");
     expect(failure.sql).toContain("last_error = excluded.last_error");
     expect(failure.sql).toContain("spool_rows = excluded.spool_rows");
+    // The backlog clock starts only on a transition into a backlog, and a committed batch clears it. A reader asking
+    // "how long has this been broken" needs the age of the condition, not of the last failure to arrive.
+    expect(failure.sql).toContain("spool_since = case");
+    expect(failure.sql).toContain("when writer_heartbeat.spool_rows > 0 then writer_heartbeat.spool_since");
+    expect(flush.sql).toContain("spool_rows = 0, spool_since = null");
     // A refused batch does not move the commit watermark, and it must not pretend to.
     expect(failure.sql).not.toContain("last_flush_at = now()");
-    expect(failure.values).toEqual(["pi-ed:pi-ed", "pi-ed", 'syntax error at or near "array_concat"', 12]);
+    // The kind is part of what gets stored, not something a reader has to infer from Postgres's phrasing.
+    expect(failure.values).toEqual(["pi-ed:pi-ed", "pi-ed", 'sql: syntax error at or near "array_concat"', 12]);
     expect(heartbeatReadStatement!("a1").values).toEqual(["a1"]);
   });
 

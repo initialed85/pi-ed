@@ -485,12 +485,21 @@ export function heartbeatFlushStatement(agentId: string, repo: string): Statemen
     sql: `insert into writer_heartbeat (agent_id, repo)
           values ($1, $2)
           on conflict (agent_id) do update set last_activity_at = now(), last_flush_at = now(),
-            flushes = writer_heartbeat.flushes + 1, spool_rows = 0`,
+            flushes = writer_heartbeat.flushes + 1, spool_rows = 0, spool_since = null`,
     values: [agentId, repo],
   };
 }
 
-/** "A writer was refused." Written after the batch rolled back, in its own transaction, with the backlog it left on disk. */
+/**
+ * "A writer was refused." Written after the batch rolled back, in its own transaction, with the backlog it left on
+ * disk.
+ *
+ * `spool_since` starts a clock and never restarts one: the first failure that strands rows records when the backlog
+ * began, and every later failure keeps that time. A reader asking "how long has this been broken" needs the age of
+ * the *condition*, and a column that resets on each new failure can only ever report one day. `heartbeatFlushStatement`
+ * is the other half - a committed batch sets the backlog to zero and the clock to null, so the next stranding starts a
+ * fresh, honest measurement rather than inheriting an old one.
+ */
 /**
  * Which kind of failure a store error is, in one word, prefixed onto `last_error`.
  *
@@ -528,8 +537,16 @@ export function heartbeatFailureStatement(agentId: string, repo: string, error: 
     sql: `insert into writer_heartbeat (agent_id, repo, last_error, spool_rows)
           values ($1, $2, $3, $4)
           on conflict (agent_id) do update set last_activity_at = now(), failures = writer_heartbeat.failures + 1,
-            last_error = excluded.last_error, last_error_at = now(), spool_rows = excluded.spool_rows`,
-    values: [agentId, repo, error, spoolRows],
+            last_error = excluded.last_error, last_error_at = now(), spool_rows = excluded.spool_rows,
+            spool_since = case
+              when excluded.spool_rows <= 0 then writer_heartbeat.spool_since
+              when writer_heartbeat.spool_rows > 0 then writer_heartbeat.spool_since
+              else now()
+            end`,
+    // Classified inside the statement rather than at the call site: this is the storage boundary, and a caller
+    // should not be able to write an unclassified failure into a table whose whole job is to be read by someone else.
+    // `describeStoreError` is idempotent, so a pre-classified message is left alone.
+    values: [agentId, repo, describeStoreError(error), spoolRows],
   };
 }
 
@@ -628,6 +645,8 @@ export function heartbeatSweepStatement(): Statement {
               flushes,
               failures,
               spool_rows,
+              spool_since,
+              round(extract(epoch from (now() - spool_since)) / 86400.0, 1) as spool_days,
               last_error,
               last_error_at,
               last_activity_at,

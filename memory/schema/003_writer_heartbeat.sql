@@ -28,9 +28,18 @@ create table if not exists writer_heartbeat (
   failures integer not null default 0,
   /** Rows sitting on local disk at the last report: how deep the backlog behind a broken store has grown. */
   spool_rows integer not null default 0,
+  /** When that backlog began. Only a transition from "no backlog" starts it, so a repeating failure does not reset
+      the clock and a report can state how long something has been open instead of rediscovering it daily. Null when
+      there is no backlog. Added after this table first shipped - see the alter below, which is what carries an
+      existing store forward. */
+  spool_since timestamptz,
   last_error text,
   last_error_at timestamptz
 );
+
+-- Additive and idempotent, in the same shape as everything else here: no restart, harmless on a store that already
+-- has the column, and required on one that was created before it existed.
+alter table writer_heartbeat add column if not exists spool_since timestamptz;
 
 comment on table writer_heartbeat is 'watermarks from pi-ed''s memory writer - activity vs committed, per agent';
 
