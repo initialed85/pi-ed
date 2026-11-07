@@ -71,6 +71,23 @@ That pair is the weighting doing its job rather than the index doing its: the te
 (0.556 against 0.435) and still came back second, because 0.435 × 1.0 beats 0.556 × 0.65. It is measured by
 `hack/memory-live-check.mjs`, which plants a second agent's memory through the same embedder for exactly this check.
 
+### How far 0.65 actually goes
+
+The crossover falls straight out of the arithmetic: a teammate row outranks your own when its similarity exceeds
+`own / 0.65`, i.e. about **1.54x closer**. A second measurement from `2026-11-08` shows the boundary from the other
+side - own 0.597 (a dream row that mentions the subject) against teammate 0.851 (verbatim the subject), damped to
+0.553, own still ahead by 0.044 where the threshold was 0.918. A run the same day that passed the planted row's *own*
+vector as the query - a mistake in the check, since it makes that row a perfect match by construction - produced the
+reverse order, 0.650 against 0.506 at a ratio of 1.98. Both regimes are real, so the rule is written down rather than
+assumed: **damping is not a veto.** A teammate memory that is much nearer the question will speak over your own
+memory that merely mentions the same thing, and anyone tuning 0.65 is deciding how big that gap has to be before that
+is allowed. These are the numbers to argue against.
+
+The check now asserts the mechanism rather than the ranking - every row it gets back must satisfy
+`score / similarity == the weight the store applied` - and prints the order it observed. Demanding the order would
+make a store check depend on which of two sentences happens to be nearer the question, which is a fact about phrasing
+and not about retrieval.
+
 ## The Pi side
 
 `extensions/memory.ts` is the writer and the reader. It records turns as `event` rows on `turn_end` and when a run
