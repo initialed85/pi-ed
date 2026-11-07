@@ -212,6 +212,29 @@ safe by design: the writer spools to disk while the store is unreachable and rep
 
 ## Writer visibility: the heartbeat table
 
+### What things actually cost here
+
+Measured from `pg_stat_statements` (on since home-ops `9325af4`, `track = all`) after a full live-check run:
+
+| statement | calls | mean | max |
+| --- | --- | --- | --- |
+| `insert into event (…)` | 53 | 0.28 ms | 7.69 ms |
+| `refresh materialized view subject_index` | 6 | 16.01 ms | 21.72 ms |
+| `select * from memory_search($1, $2::vector, …)` | 5 | 4.34 ms | 17.11 ms |
+| `insert into writer_heartbeat (…)` | 6 | 0.29 ms | 0.54 ms |
+
+The matview refresh is the most expensive routine thing this store does, and it costs twenty milliseconds. Two
+consequences worth recording so nobody re-derives them:
+
+- **`log_min_duration_statement = 250ms` logs nothing normal, on purpose.** It is a tripwire for a statement that has
+  gone pathological, not a way to see ordinary cost - `pg_stat_statements` is where ordinary cost lives, without
+  writing statement text into logs the fleet scrapes. Statement text here is agent-authored content, so logging at
+  10 ms to catch a 16 ms refresh trades a store's reasoning for a number that is already available in the view.
+- **Event inserts are one row per statement (53 calls, 53 rows) and stay that way.** Batching them into one statement
+  per flush would save roughly fifteen milliseconds in a whole run - real, and not worth losing the ability to name
+  which statement a failed transaction failed on. If a future session ever does batch them, it should say which
+  number made it worth it.
+
 `74b2818` made failures *quieter* on purpose - a rejected batch rolls back, the rows go to the local spool, the dream
 says so to the agent, and the store is pruned clean afterwards. Nothing cluster-visible remains. `writer_heartbeat`
 (`schema/003_writer_heartbeat.sql`) is the fix for that: the writer stamps the store on its way out, in its own
