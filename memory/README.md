@@ -489,6 +489,40 @@ by the writer - and it is why the page query looks for asymmetry between two col
 `pi-ed-postgres` exporter is scraped by vmagent on top of this is a separate decision for Ed, not something to settle
 by inference from the heartbeat.
 
+### Which side failed, read from the row alone
+
+`last_error` starts with a kind on purpose, and the kinds are not symmetric: some of them name my writer, some name
+whoever is doing the reading, and one is genuinely ambiguous. home-ops' sweep reads these rows, so the mapping is part
+of the contract rather than an implementation detail.
+
+| prefix | whose side it names | what it means in practice |
+| --- | --- | --- |
+| `dns:` | the reporting side | the name does not resolve where the writer is running. In-cluster this is almost always a writer that used the Deployment name `pi-ed-postgres` instead of the Service `memory` |
+| `refused:` | the reporting side, usually | nothing listening at that address yet: wrong port, wrong host, or a flush that started before the Service had endpoints. A harness racing a restart produces this legitimately |
+| `timeout:` | undecided | an impatient harness *or* a store accepting connections and not answering. Resolve it with the counters below, not with the prefix |
+| `slots:` | the store | the connection limit is reached, which is a capacity fact about the database |
+| `auth:` | the reporting side | role, password or `sslmode`. Configuration drift, not outage |
+| `sql:` | pi-ed's writer | a bad statement or schema drift. Never the network, never the harness. A new `sql:` shape is a bug report against this repo, and it is the one kind that should page the store's owner rather than anyone reading a dashboard |
+
+The counters settle what the prefix cannot. `failures` climbing while `flushes` keeps climbing and
+`minutes_without_commit` stays small is a writer that retried and got through - transient, harness-shaped, worth
+noticing and not worth paging. `failures` climbing while `flushes` sits still is the actual failure shape, and it is
+the one the page condition asks for.
+
+That structure is also the answer to a question home-ops raised: can an impatient harness manufacture a `page` row by
+killing a flush mid-flight? Not through the page query. The condition is *sustained activity without a commit*, so one
+interrupted flush cannot satisfy it - it can appear at most as an advisory row, which is where a single refused batch
+belongs anyway. The live suite holds that boundary rather than asserting it in prose: "reports a refused batch without
+claiming it committed", "gives a daily sweep one result set, page rows first" (which asserts the fabricated refusal
+comes back `note`), and "keeps a writer that arrived and never committed visible for hours" for the page shape.
+
+The caution attached to widening a budget - mine in test timeouts, home-ops' in scrape windows - is that a generous
+budget removes the manufactured alarm *and* the detector that was hiding inside it. My fix kept a deadline, but the
+deadline states the property rather than the fastest observed case: a spooled row must reach disk within N seconds,
+and the failure text names the precondition that went missing. If a scrape budget widens to survive a cold model, the
+check needs a second discriminator for cold-versus-gone - readiness, or the latency of the first success - or warm and
+dead become the same reading, and the check reports silence instead of a finding.
+
 ## Backups, and the window not to roll in
 
 Two copies exist and they are not equally trustworthy. The nightly `pg_dump` CronJob - alpine, no kubectl, mounts the
