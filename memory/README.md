@@ -294,11 +294,40 @@ select * from (
   from writer_heartbeat
   where (last_flush_at is null and last_activity_at < now() - interval '2 hours')
      or (last_flush_at is not null and last_activity_at - last_flush_at > interval '2 hours')
-     or (failures > 0 and last_error_at > now() - interval '24 hours')
-     or (spool_rows > 0 and last_activity_at > now() - interval '2 hours')
+     or (failures > 0 and last_error_at > now() - interval '48 hours')
+     or (spool_rows > 0)
 ) as flagged
 order by (severity = 'page') desc, last_activity_at desc nulls last;
 ```
+
+### Windows that match how often someone actually looks
+
+The sweep variant's advisory half is **wider** than `heartbeatAdvisoryAlertStatement`, deliberately, because of a rule
+that applies whenever one system reports on another's database:
+
+> a report window has to be comfortably wider than the interval at which it is read, or the condition stops
+> describing what happened and starts describing when you happened to look.
+
+home-ops' sweep runs once a day at 01:30 Perth. A 24 h failure window read once a day can only see a refusal that is
+still inside its own window when the sweep fires, so a refusal 25 hours old is invisible forever - window and cadence
+cancel each other out. The sweep therefore looks back 48 h, two sweep intervals, which is the smallest margin that
+makes the gap impossible. `spool_rows` loses its recency guard entirely, for the same reason aimed the other way:
+"spooled within the last two hours" is effectively dead on a daily cadence and hides the case a daily reader most
+wants - a spool sitting there for days because a laptop closed and nothing replayed it. `spool_rows` returns to zero
+by exactly one route (a successful replay by the writer that wrote it), so a nonzero value is a finding at any age,
+and the age is already in the output as `last_activity_at` rather than being used to filter it away.
+
+The real-time pair keeps its narrow windows because a real-time evaluator has nothing to widen: `heartbeatAdvisoryAlertStatement`
+is the 24 h / 2 h version, and `test/writer-heartbeat.test.ts` proves both readings on the same fabricated rows - a
+refusal 30 hours old is outside the alert set and inside the sweep, and a writer that stranded 7 rows three days ago
+is missed by both alert queries and caught by the sweep.
+
+One consequence of the page query that a test nearly made me get wrong, so it is written down: **a page row can be
+late without being wrong.** A healthy writer's asymmetry is a few seconds, because it flushes on a debounce measured
+in seconds, so a one-day gap between last commit and last turn cannot come from a session that ended cleanly - it can
+only come from turns that failed to commit. A writer that failed, kept taking turns for a day, and then had its
+machine close three days ago still pages, and the reader distinguishes "happening now" from "nobody has fixed this"
+by `last_activity_at`, which is printed in every row.
 
 The severity column is the point of this variant: a daily sweep should not depend on which query the operator
 remembered to run. It also exists because a sweep has to read an *empty* result honestly - **zero rows means no

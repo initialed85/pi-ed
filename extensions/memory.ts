@@ -505,6 +505,12 @@ export function heartbeatFailureStatement(agentId: string, repo: string, error: 
 export const HEARTBEAT_ALERT_WINDOW = "2 hours";
 
 /**
+ * How far back a once-a-day sweep looks for a refusal. Twice the sweep interval, so that the gap between two sweeps
+ * cannot swallow one: see the note on `heartbeatSweepStatement`.
+ */
+export const HEARTBEAT_SWEEP_FAILURE_WINDOW = "48 hours";
+
+/**
  * The query that should page someone: a writer that is working and not committing.
  *
  * Two shapes, both unreadable from the data tables. A writer that arrived and never committed anything (`last_flush_at`
@@ -549,8 +555,24 @@ export function heartbeatAdvisoryAlertStatement(): Statement {
  * with a severity column rather than two queries it has to remember to run, and it wants the number a human reads
  * ("how long has this writer been working without committing") rather than an interval to eyeball.
  *
- * The conditions are the same two, verbatim, so a real alert engine can be built on the page half later without
- * this statement changing.
+ * The page half is the same condition verbatim, so a real alert engine can be built on it later without this
+ * statement changing. The advisory half is deliberately *wider* than `heartbeatAdvisoryAlertStatement`, and the
+ * reason is a rule worth keeping in mind whenever someone reports on someone else's database:
+ *
+ *   a report window has to be comfortably wider than the interval at which it is read, or the condition stops
+ *   describing what happened and starts describing when you happened to look.
+ *
+ * home-ops' sweep runs once a day. A 24 h failure window read once a day can only see a refusal that happens to
+ * still be inside its own window when the sweep fires, so a refusal 25 hours old is invisible forever - the window
+ * and the cadence cancel each other out. 48 h is two sweep intervals, which is the smallest margin that makes the
+ * gap impossible.
+ *
+ * `spool_rows` loses its recency guard entirely, for the same reason pointed the other way. On a daily cadence
+ * "spooled within the last two hours" is effectively dead, and it hides exactly the case a daily reader most wants:
+ * a spool that has been sitting for days because a laptop closed and nothing ever replayed it. `spool_rows` returns
+ * to zero by one route only - a successful replay by the writer that wrote it - so a nonzero value is a finding at
+ * any age, and the age itself is already in the output as `last_activity_at` rather than being used to filter it
+ * away.
  *
  * `minutes_without_commit` means "how long has this writer gone without committing", measured against the last
  * commit when there is one and against arrival when there is none - the two page shapes have different clocks and
@@ -580,8 +602,8 @@ export function heartbeatSweepStatement(): Statement {
               last_flush_at
             from writer_heartbeat
             where ${page}
-               or (failures > 0 and last_error_at > now() - interval '24 hours')
-               or (spool_rows > 0 and last_activity_at > now() - interval '2 hours')
+               or (failures > 0 and last_error_at > now() - interval '${HEARTBEAT_SWEEP_FAILURE_WINDOW}')
+               or (spool_rows > 0)
           ) as flagged
           order by (severity = 'page') desc, last_activity_at desc nulls last`,
     values: [],
