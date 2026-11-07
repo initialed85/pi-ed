@@ -241,6 +241,50 @@ jq -r 'select(.customType=="auto-resume")
 | Reads | `session_start` reason, its own markers, and the last action in the branch: a model turn and its `stopReason`, a tool result, or a prompt nobody answered |
 
 
+### `memory.ts` — what an agent remembers tomorrow
+
+Nothing Pi does today survives a machine being rebuilt. This puts the session itself in Postgres: every turn
+recorded raw, and a smaller set of things the agent decided were worth remembering, in `pi_ed` on home-dev
+(`memory/schema/001_init.sql` explains why those are two tables and not one).
+
+Recording is ordinary and asynchronous: turns land on `turn_end` and when a run settles, on a debounce, through a
+pool that never makes a turn wait for a database. If the store refuses, the rows go to a spool file and ride in with
+the next successful flush. Nothing in the extension blocks, and nothing is lost twice — Pi's own session files are
+still the raw record.
+
+Dreaming is the interesting half, and it is not code summarising the agent. After ten idle minutes, ten minutes after
+a session arrives from history, or immediately before the harness compacts the context away, the extension posts one
+hidden message and the agent writes its own memory with `memory_dream`: two to four sentences about the stretch, three
+to six loose subjects, and one honest line about how it felt. `feel` is its own column because the point is to watch
+it change without parsing prose. A dream only runs when there is an unsummarized stretch (`event_count > dream_seq`),
+so a session that is merely open is not a session worth thinking about, and an interrupted run never dreams — that
+was somebody hitting Escape on purpose.
+
+Retrieval is `memory_search`: full text over summary and feel today, pgvector when the embedder is up, with this
+agent's memories at 1.0 and teammates' at 0.65 — visible, labelled, and never able to outrank something this agent
+lived through. Each hit carries the score the query actually ordered by, because a live run of the check noticed the
+agent could describe the order of a recall but not its confidence.
+
+Two safety notes, both learned rather than designed in. Text is redacted on the way in (DSNs, bearer tokens,
+`AKIA…`, `ghp_…`, Slack tokens, private-key blocks, `password = "…"`, plus anything your `.pi/memory.json` lists in
+`neverStore`), and the row records which rules fired. And a dream is refused when the events it would summarise did
+not reach the store: a memory whose raw stretch is missing is a claim nothing can check later, and the agent should
+be told that in words rather than handed a foreign key error.
+
+With no DSN configured the extension registers nothing at all — no tools, no commands, no lifecycle handlers — so it
+is safe to leave in the package before the store exists.
+
+| | |
+| --- | --- |
+| Commands | `/memory` (what this agent has, and what is buffered) |
+| Tools | `memory_search` (query, limit, since_days, own_only) · `memory_dream` (summary, subjects, feel) |
+| Config | `.pi/memory.json` then `~/.pi/agent/memory.json`: `dsn` · `agent` · `dreams` · `idleDreamMinutes` · `resumeDreamMinutes` · `flushMs` · `maxTextChars` · `skip` · `neverStore` |
+| Env | `PI_MEMORY_DSN` (wins over both files) · `PI_MEMORY_DISABLED` · `PI_MEMORY_CONFIG` · `PI_MEMORY_SPOOL` |
+| Writes | `event` (raw turns: user / assistant / tool_call / tool_result / marker / system), `session`, `agent` on the way in; `memory` and `subject_index` when a dream lands |
+| Reads | the session branch, the session id, `session.dream_seq`, and `agent.name` for cross-agent attribution |
+| Live check | `hack/memory-live-check.mjs` — a real Pi session against the real store; needs the DSN, spends model tokens, and deletes what it wrote |
+
+
 ### `searxng.ts` — web search through my own SearXNG
 
 Registers a tool named `web_search`, which **replaces** Pi's built-in DuckDuckGo search (registering a
@@ -386,6 +430,14 @@ against a stubbed `fetch`, `test/autopilot.test.ts` holds the hop-limit surface 
 the lease that a sibling session already holds and the peer election that a lower session id wins, and
 `test/packaging.test.ts` asserts each extension's whole registration
 surface, so a file that quietly registers nothing cannot pass.
+
+`test/memory.test.ts` is the one suite with a deliberate hole: it never talks to a live Postgres. Every write-path
+test runs against a DSN pointed at a closed port, because the behaviour that has to be correct is the one where the
+database is unreachable, and the SQL is asserted as statements — parameter counts, the conflict key, the span over
+unsummarized events — rather than as rows. What the suite cannot check is whether the SQL parses, so
+`hack/memory-live-check.mjs` does: it drives a real Pi session against the real store, reads a memory back across
+sessions, waits for a dream, prints the recorded kinds and the span it anchored to, and then deletes its own rows so
+a test never leaves a fake memory an agent might retrieve.
 
 `npm install` pulls `@earendil-works/*` at 1.5.0 for the typecheck. When Pi updates, bump those versions
 and re-run; the tests are pinned to the API surface they were written against.

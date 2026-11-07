@@ -2,7 +2,7 @@
   "name": "pi-ed",
   "version": "0.1.0",
   "private": true,
-  "description": "Ed's Pi extensions: autopilot, loop guard, compaction summary guard, SearXNG web search, wall-clock schedules, queue-reload, session commands, session markers and hashtags",
+  "description": "Ed's Pi extensions: autopilot, loop guard, compaction summary guard, SearXNG web search, wall-clock schedules, auto-resume, agent memory, queue-reload, session commands, session markers and hashtags",
   "keywords": [
     "pi-package",
     "pi",
@@ -37,6 +37,7 @@
     "@earendil-works/pi-coding-agent": "1.5.0",
     "@earendil-works/pi-tui": "1.5.0",
     "@types/node": "^22.10.0",
+    "@types/pg": "^8.23.1",
     "typebox": "1.3.27",
     "typescript": "^5.7.0",
     "vitest": "^5.1.0"
@@ -45,5 +46,8 @@
     "type": "git",
     "url": "git+https://github.com/initialed85/pi-ed.git"
   },
-  "homepage": "https://github.com/initialed85/pi-ed#readme"
+  "homepage": "https://github.com/initialed85/pi-ed#readme",
+  "dependencies": {
+    "pg": "^8.23.1"
+  }
 }

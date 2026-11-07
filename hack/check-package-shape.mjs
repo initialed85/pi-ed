@@ -28,6 +28,7 @@ const EXPECTED_EXTENSIONS = [
   "autopilot.ts",
   "compaction-summary-guard.ts",
   "loop-guard.ts",
+  "memory.ts",
   "queue-reload.ts",
   "schedule.ts",
   "searxng.ts",
@@ -72,6 +73,14 @@ const dependencies = Object.keys(pkg.dependencies ?? {});
 const peers = Object.keys(pkg.peerDependencies ?? {});
 const bundled = HOST_PACKAGES.filter((name) => dependencies.includes(name));
 if (bundled.length) fail(`host packages must not be in dependencies: ${bundled.join(", ")}`);
+// `pg` is the one third-party runtime dependency in this repository, and it is allowed because it is not a package
+// Pi hands to an extension: memory.ts needs a Postgres client, and a hand-rolled wire protocol with SCRAM auth is a
+// worse answer than a mature driver. Pinned here so the next dependency added to `dependencies` is a decision rather
+// than an accident - the rule that matters is "nothing that Pi already provides", and this is the exception list that
+// proves the rule was still being applied.
+const ALLOWED_DEPENDENCIES = ["pg"];
+const unexpected = dependencies.filter((name) => !ALLOWED_DEPENDENCIES.includes(name));
+if (unexpected.length) fail(`dependencies grew beyond the allowed list ${ALLOWED_DEPENDENCIES.join(", ")}: ${unexpected.join(", ")}`);
 const missingPeers = HOST_PACKAGES.filter((name) => !peers.includes(name));
 if (missingPeers.length) fail(`host packages not declared as peerDependencies: ${missingPeers.join(", ")}`);
 

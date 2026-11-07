@@ -64,6 +64,19 @@ const EXPECTED: Record<string, Surface> = {
     messageRenderers: [],
     entryRenderers: [],
   },
+  "memory.ts": {
+    // It has to see a session arrive, see each turn finish, see the agent go idle, see the harness about to throw
+    // context away, and see the process stop. Those are the write points and the dream triggers, and none of them can
+    // be inferred from the others. agent_start is here to cancel a pending dream rather than to record anything.
+    events: ["session_start", "turn_end", "agent_start", "agent_settled", "session_before_compact", "session_shutdown"],
+    tools: ["memory_search", "memory_dream"],
+    commands: ["memory"],
+    flags: [],
+    // The dream instruction is a message the model reads. Nothing here is an entry renderer: the raw history lives in
+    // Postgres, not in the session file, so there is no custom entry to draw.
+    messageRenderers: ["memory:dream"],
+    entryRenderers: [],
+  },
   "queue-reload.ts": {
     events: [],
     tools: [],
@@ -145,6 +158,15 @@ const EXPECTED: Record<string, Surface> = {
 
 const FILES = Object.keys(EXPECTED);
 
+/**
+ * Some extensions are inert unless they are configured, and "inert" is the behaviour worth pinning - test/memory.test.ts
+ * asserts it. The packaging contract is about what an extension registers when it *is* configured, so those files are
+ * loaded with a placeholder that configures them. No credentials here: this DSN points at a closed port.
+ */
+const LOAD_ENV: Record<string, Record<string, string>> = {
+  "memory.ts": { PI_MEMORY_DSN: "postgres://packaging:packaging@127.0.0.1:1/packaging" },
+};
+
 function loadModuleEnv(): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = { ...process.env };
   // A developer's own herdr session sets these; the extensions here must not read them.
@@ -156,6 +178,7 @@ function loadModuleEnv(): Record<string, string | undefined> {
 
 async function load(name: string): Promise<FakePi> {
   const previousEnv = loadModuleEnv();
+  Object.assign(previousEnv, LOAD_ENV[name] ?? {});
   const restore = { ...process.env };
   process.env = previousEnv as NodeJS.ProcessEnv;
   vi.resetModules();
