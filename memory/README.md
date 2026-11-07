@@ -184,6 +184,36 @@ An embedder that is down does not stop a dream. The memory is written without a 
 `embed_error` with the reason and how long the attempt took, and `memory_search` says in the result line that vector
 recall was unavailable. A memory findable only by keywords is a degraded memory, not a lost one.
 
+What "down" costs in time is now measured rather than guessed, and the numbers are home-ops' (`481085a`) on an
+embeddings pod five hours old with `restarts = 0` - warm by every definition: `GET /health` answered in **0.081 s**
+(0.052 s of that was DNS) while `POST /embedding` with **one short string** took **2.15 s**. Health answers about 26
+times faster than the work a caller actually cares about, so a budget calibrated against a health endpoint is calibrated
+against the wrong thing, and warm-and-slow is a normal reading of a healthy service. Warm trivial embedding here is
+about 2 s; the cold path is minutes (home-ops finding 12); anything between those two is a statement about *load*, not
+about liveness.
+
+`embedTimeoutMs` is **30 s**, and that is a deliberate trade rather than a measurement of the service: roughly fifteen
+times a warm call, and far short of a cold one. The choice follows from the writer's first rule - never block a turn on
+a model - so a cold embedder is reported as a failed embed and the memory is written vectorless. Two consequences worth
+naming, because neither is visible in the row:
+
+- **nothing backfills a missing vector.** The row is findable by keywords forever and by meaning never, so a run of
+  dreams written during an embedder outage remembers that period permanently at keyword quality; and
+- **the number that shows it is a count, not a severity.** `vectorCoverageStatement()` is exported for exactly this:
+
+```sql
+select count(*)::int as memories,
+       count(*) filter (where embedding is null)::int as without_vector,
+       count(*) filter (where embedding is null and created_at > now() - interval '24 hours')::int as without_vector_24h
+from memory;   -- optionally: where agent_id like '<pattern>'
+```
+
+`without_vector` rising while the embedder is up is a failing embedder; `without_vector` equal to `memories` means
+embeddings are switched off in that checkout. This is my side of home-ops' cold-versus-gone problem, and it is
+deliberately *not* a `writer_heartbeat` row: an embedder failure is not a store failure, the heartbeat table is the
+store's pulse, and a reader of recall quality should read a count it can interpret rather than a new severity in a
+table whose severities are frozen - see the contract at the end of the heartbeat section.
+
 ## What never gets stored
 
 `redact()` runs over every piece of text before it becomes a row: DSNs with credentials, `Authorization: Bearer`,
@@ -654,6 +684,13 @@ The counters settle what the prefix cannot. `failures` climbing while `flushes` 
 noticing and not worth paging. `failures` climbing while `flushes` sits still is the actual failure shape, and it is
 the one the page condition asks for.
 
+**The severities and the kinds are frozen, and that is a contract rather than a preference.** home-ops' report
+deduplicates on (`agent_id`, severity), with `last_error_at` as the age anchor for a refusal and `spool_since` for a
+backlog. A new *condition* therefore arrives as a new named severity or kind - which is what keeps a new finding from
+being swallowed by an already-open one. Renaming the meaning of an existing severity is the failure mode the contract
+exists to prevent: two different findings would silently merge into one open row in somebody else's report, and nothing
+in this repository would ever show it. Anyone adding a heartbeat condition reads this paragraph before writing SQL.
+
 That structure is also the answer to a question home-ops raised: can an impatient harness manufacture a `page` row by
 killing a flush mid-flight? Not through the page query. The condition is *sustained activity without a commit*, so one
 interrupted flush cannot satisfy it - it can appear at most as an advisory row, which is where a single refused batch
@@ -667,6 +704,15 @@ deadline states the property rather than the fastest observed case: a spooled ro
 and the failure text names the precondition that went missing. If a scrape budget widens to survive a cold model, the
 check needs a second discriminator for cold-versus-gone - readiness, or the latency of the first success - or warm and
 dead become the same reading, and the check reports silence instead of a finding.
+
+home-ops went and found that second discriminator in their own stack, and the obvious candidate was the trap: on that
+warm embeddings pod, `/health` took 0.081 s and the work a caller actually cares about took 2.15 s. A health endpoint
+is not a proxy for latency, and a 26× gap is why. What their sweep reports for a cold-model target is now the triple -
+pod readiness, the latency of the first real-work success after a restart, and the budget itself - with the honest
+limit stated in the report rather than discovered later: the first-success term is only meaningful where a restart is
+observable (`restartCount` plus container start time), so for a pod that has never restarted there is warm-versus-slow
+and not cold-versus-gone, and the report names which of the two it is claiming. Naming which claim a check is making is
+the general form of this rule, and it is the same discipline as a heartbeat row that cannot manufacture a page.
 
 ## Backups, and the window not to roll in
 

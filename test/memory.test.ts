@@ -738,6 +738,25 @@ describe("the extension", () => {
     expect(describeStoreError!("")).toBe("error: unknown failure");
   });
 
+  it("counts how much of the store is findable by meaning rather than by wording", async () => {
+    const { vectorCoverageStatement } = await loadModule();
+    // Whole store by default, because the fleet-level question is "is recall quality dropping", and one checkout's
+    // answer to it is not comparable to another's.
+    // Assertions read the SQL on one line, because the statement is written across several for readability and a test
+    // that depends on the line breaks would fail for formatting reasons.
+    const flatten = (sql: string) => sql.replace(/\s+/g, " ").trim();
+    const whole = vectorCoverageStatement!();
+    expect(whole.values).toEqual([]);
+    expect(flatten(whole.sql)).toContain("count(*) filter (where embedding is null)");
+    expect(flatten(whole.sql)).toContain("without_vector_24h");
+    expect(flatten(whole.sql)).not.toContain("agent_id like");
+    // Scoped when the question is about one checkout, and the scope lands before `from memory` rather than after it,
+    // which is the kind of mistake a string-concatenated SQL helper makes.
+    const scoped = vectorCoverageStatement!({ agentLike: "pi-ed" });
+    expect(scoped.values).toEqual(["pi-ed"]);
+    expect(flatten(scoped.sql)).toContain("from memory where agent_id like $1");
+  });
+
   it("says which kind of absence a retrieval result is", async () => {
     const { ownCoverageNote, ownRowCountStatement } = await loadModule();
     // The agent has memories and none of them came back. A quality question, answered without letting the teammate

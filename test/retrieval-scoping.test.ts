@@ -66,7 +66,7 @@ function literal(vector: number[]): string {
   return `[${vector.join(",")}]`;
 }
 
-async function plant(agentId: string, summary: string, vector: number[]): Promise<void> {
+async function plant(agentId: string, summary: string, vector: number[] | null): Promise<void> {
   await query(
     `insert into agent (id, name, notes) values ($1, $1, '{"probe": true}'::jsonb)
      on conflict (id) do update set notes = excluded.notes`,
@@ -81,7 +81,7 @@ async function plant(agentId: string, summary: string, vector: number[]): Promis
   await query(
     `insert into memory (agent_id, session_id, trigger, summary, subjects, feel, embedding, embedding_model, embedding_dim)
      values ($1, $2, 'manual', $3, array['scoping', 'probe'], 'deliberate', $4::vector, 'fabricated-for-test', $5::int)`,
-    [agentId, `${agentId}-session`, summary, literal(vector), DIMENSIONS],
+    [agentId, `${agentId}-session`, summary, vector === null ? null : literal(vector), vector === null ? null : DIMENSIONS],
   );
 }
 
@@ -160,6 +160,29 @@ suite("retrieval scope, against the store", () => {
     // The store is healthy and the agent has a memory. Both facts are true and neither is visible in the row that
     // came back, which is why the tool asks for the count rather than trusting the ranking.
     expect(await ownCount(ownAgent)).toBe(1);
+  });
+
+  it("makes a memory written without a vector visible as a number", async () => {
+    const mod = await import(source);
+    const scoped = () => {
+      const statement = mod.vectorCoverageStatement!({ agentLike: `${PROBE}%` });
+      return query(statement.sql, statement.values).then((result) => result.rows[0] ?? {});
+    };
+    const before = await scoped();
+    // null on purpose: `embedding` is nullable in 001_init.sql, which is what a failed embedder leaves behind, and an
+    // empty vector literal would be a malformed-vector error instead of the shape being tested.
+    await plant(`${PROBE}-unembedded`, "the scoping probe gamma memory, written while the embedder was unavailable", null);
+    const after = await scoped();
+
+    // A dream written during an embedder outage is not corruption and is not backfilled either: the row is findable
+    // by text forever after and by meaning never. The only way that is visible is a count, which is why the exported
+    // statement exists and why it is a count rather than a heartbeat severity.
+    expect(Number(after.memories) - Number(before.memories)).toBe(1);
+    expect(Number(after.without_vector) - Number(before.without_vector)).toBe(1);
+    expect(Number(after.without_vector_24h)).toBe(1);
+    // The rest of this file's probes all carry vectors, so the scoped store shows exactly one vectorless row and a
+    // reader can tell "one checkout is failing" from "embeddings are off here".
+    expect(Number(after.without_vector)).toBe(1);
   });
 
   it("tells the agent which kind of absence it is looking at", async () => {

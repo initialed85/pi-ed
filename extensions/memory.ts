@@ -738,6 +738,35 @@ export function ownRowCountStatement(agentId: string): Statement {
 }
 
 /**
+ * How much of this store can be found by meaning rather than by words.
+
+   A memory written while the embedder was cold, down, or switched off has no vector and keeps none: nothing backfills
+   it later. Those rows are still findable by the text path, so this is not corruption - it is recall quality quietly
+   dropping to keyword matching, and it is invisible in every other signal this table has, because a text-only memory
+   searches exactly as well as one with a vector *until the query stops matching the wording*. That is the my-side
+   version of home-ops' cold-versus-gone problem, and it is a number a sweep can read rather than a thing someone has
+   to notice.
+
+   Whole store by default, so a fleet-level reader sees the aggregate; scoped by an `agentLike` pattern when the
+   question is about one checkout. Deliberately a count and not a severity: adding a heartbeat condition for this
+   would collide with the frozen-severity contract below for no benefit, since nothing here pages.
+ */
+export function vectorCoverageStatement(options: { agentLike?: string } = {}): Statement {
+  const scope = options.agentLike ? ` where agent_id like $1` : "";
+  return {
+    // `from memory` before the scope, which is the order SQL actually has. The first version of this put the scope
+    // first because the helper reads like a filter being added to a sentence, and the live suite rejected it with
+    // `syntax error at or near "from"` - a good demonstration that a unit test asserting the same shape as the bug
+    // agrees with the bug instead of catching it.
+    sql: `select count(*)::int as memories,
+       count(*) filter (where embedding is null)::int as without_vector,
+       count(*) filter (where embedding is null and created_at > now() - interval '24 hours')::int as without_vector_24h
+     from memory${scope}`,
+    values: options.agentLike ? [options.agentLike] : [],
+  };
+}
+
+/**
  * "Nothing matched" and "this agent has nothing" are different claims, and only one of them can be answered by the
  * rows a search returned.
  *
