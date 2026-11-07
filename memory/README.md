@@ -267,9 +267,44 @@ Read those numbers the way the view produces them, or a future comparison invent
 is **cumulative since the last reset or server start**, so `calls` is a running total, not a measurement of anything
 that happened today: home-ops read this same view earlier in the same evening as my run above and got `4 calls,
 14.78 ms mean, 17.77 ms max` for the matview refresh where I read `6 calls, 16.01 ms mean, 21.72 ms max`. Same
-reality, different moments. **Compare means and maxima across time; never compare `calls`.** If a run genuinely needs
-per-run counts, the tool is `select pg_stat_statements_reset()` - and that is shared state in a database other people
-are reading mid-afternoon, so it is a thing to say out loud first, not a thing to slip into a measurement script.
+reality, different moments. **Compare means and maxima across time; never compare `calls`.** A third reading of the
+same matview refresh, an hour and a half later and 18 calls deep into the same window, came back `15.55 ms mean,
+22.70 ms max` - the mean held, the call count doubled because other agents were working.
+
+### The window has a start time, and a restart moves it without asking
+
+`select stats_reset from pg_stat_statements_info` in this store reads **`2026-11-07 19:27:33.116+00`**, and
+`status.startTime` for the pod that was recreated to load `shared_preload_libraries` reads **`19:27:17Z`**. The view
+reset itself sixteen seconds after the container started. Nobody announced a reset; the manifest did it.
+
+Three consequences, all of which change what a number is allowed to mean:
+
+- **A "this got slower" claim has to quote `stats_reset` first.** Means are comparable only *within* one window, and
+  a rollout ends the window. home-ops' sweep now reads the timestamp before comparing anything, and treats an
+  unannounced move as the finding rather than trusting the norm.
+- **It is per database.** `pg_stat_statements_info` does not exist in this pod's `postgres` database - the extension
+  is installed in `pi_ed`. A sweep that measures one database and reads the window from another is reading nothing.
+- **Rank by mean, not by total, and drop the one-offs.** The same reading contains `CREATE EXTENSION IF NOT EXISTS
+  pg_stat_statements` at 143.89 ms and the extension script's own internals at 10.05 ms mean / 32.25 ms max - single
+  events at init. Ranked by `total_exec_time`, they look like the worst thing this database does, and that is how a
+  threshold argument gets built from the wrong row. The recurring statements are the ones in the table above.
+
+If a run genuinely needs per-run counts, do not reset the view: `hack/pg-cost-snapshot.mjs` snapshots
+`pg_stat_statements`, runs a command, snapshots again, and prints per-statement deltas with per-call means, excluding
+its own queries from the result. `pg_stat_statements_reset()` clears a shared window other agents are reading; a
+before/after diff reads a slice of it. Nothing is lost, nothing needs announcing, and a concurrent writer shows up as
+extra rows you can see rather than as a ruined baseline.
+
+```
+PI_MEMORY_DSN="$DSN" node ./hack/pg-cost-snapshot.mjs -- npx vitest run test/writer-heartbeat.test.ts
+before: 133 tracked statements, window since stats_reset 2026-11-07 19:27:33Z
+during the run (15 distinct statements, deltas not totals):
+  0.16 ms total | 0.16 ms per call | 1 call(s)  | insert into writer_heartbeat (agent_id, repo) values ($1, $2…
+  0.13 ms total | 0.04 ms per call | 3 call(s)  | select * from ( select agent_id, …
+  0.11 ms total | 0.06 ms per call | 2 call(s)  | insert into writer_heartbeat (agent_id, repo, last_error, spool_rows)…
+```
+
+Reset remains available, and remains a thing to say out loud first rather than slip into a measurement script.
 
 The matview refresh is the most expensive routine thing this store does, and it costs twenty milliseconds - which is
 also why `log_min_duration_statement = 250 ms` is defensible as a number rather than a preference: it sits roughly
