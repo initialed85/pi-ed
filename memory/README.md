@@ -680,7 +680,16 @@ So nothing detaches this volume between 17:55Z and 18:10Z. No `kubectl rollout r
 scale to zero, no cordon that evicts it. A manifest change that alters the pod template - `shared_preload_libraries`
 for `pg_stat_statements`, an image bump - belongs at some other hour, because Argo rolls the pod whenever the sync
 wave lands and a pod rolled at 18:00Z is a volume detached exactly when the backup job enumerates it. A rollout
-outside that window is safe for the writer too: the pool fails, spools to disk, and replays on the next flush.
+outside that window is safe for the writer too: the pool fails, spools to disk, and replays on the next flush, and -
+now measured - it is safe for the statistics window as well, clean or crash.
+
+One qualifier on "safe", from the same set of measurements. A rollout *is* a pod boundary, and `Recreate` plus a
+`nodeSelector` of only `kubernetes.io/arch: amd64` means the replacement is free to land on another node. That is the
+reachable route to the stuck-attachment failure above, which is worse than a slow rollout: the pod sits in
+`ContainerCreating` with `MountVolume.MountDevice … exit status 32` and the database is not down, it is *unattachable*.
+So roll `pi-ed-postgres` deliberately - at an hour outside the backup window, and watched - rather than letting a sync
+wave land it at an arbitrary minute; if it does stall, the first read is the volume's `volumeattachments.longhorn.io`
+ticket and the Longhorn CSI plugin's own logs, and the fix from there is Ed's call.
 
 Assert presence and mtime when checking a backup, never size. A few hundred bytes is the correct output of a healthy
 store the live check has just cleaned out; a `Complete` CronJob with no new file is the failure mode.
