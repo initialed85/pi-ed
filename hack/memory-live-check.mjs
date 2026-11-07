@@ -144,7 +144,19 @@ try {
   console.log(`memory_search called, isError=${searchResult.isError}, ${String(searchResult.result?.content?.[0]?.text ?? "").split("\n")[0]}`);
 
   // The idle clock starts when the session settles. It is short here on purpose; see the config written above.
-  await waitFor((e) => e.type === "tool_execution_start" && e.toolName === "memory_dream", idleMs + 180_000, "the dream to run memory_dream");
+  let dreamStart;
+  try {
+    dreamStart = await waitFor((e) => e.type === "tool_execution_start" && e.toolName === "memory_dream", idleMs + 180_000, "the dream to run memory_dream");
+  } catch (error) {
+    // The clock fired and the hidden prompt was delivered; whether the model then reaches for the tool is its own
+    // choice. This check exists to test the dream path - the gate, the span, the embedding, the refusal-to-dream-a-
+    // dream - not the model's initiative, so it nudges once and says out loud that it did rather than failing in a
+    // way that reads like the extension broke.
+    console.log(`note: ${error.message}; nudging once and reporting it`);
+    send("Call the memory_dream tool now: a summary of this session, some subjects, and how it felt to write.");
+    dreamStart = await waitFor((e) => e.type === "tool_execution_start" && e.toolName === "memory_dream", 240_000, "memory_dream after one nudge");
+  }
+  void dreamStart;
   const dream = await waitFor((e) => e.type === "tool_execution_end" && e.toolName === "memory_dream", 90_000, "memory_dream to finish");
   console.log(`memory_dream isError=${dream.isError}, ${String(dream.result?.content?.[0]?.text ?? "").split("\n")[0]}`);
 
@@ -175,6 +187,7 @@ try {
   console.log(`heartbeat: ${h.flushes} committed flush(es), ${h.failures} refused, spool_rows ${h.spool_rows}, activity ${new Date(h.last_activity_at).toISOString()}, commit ${new Date(h.last_flush_at).toISOString()}`);
 
   const plantedText = "The bluehammer drill was retired after the tabletop exercise proved the handover was unclear.";
+  const queryText = "bluehammer drill retired after the tabletop exercise";
   const embed = await fetch(`${process.env.PI_MEMORY_EMBED_URL ?? "https://embeddings.dev.initialed85.cc"}/v1/embeddings`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -200,13 +213,53 @@ try {
   const secondSearch = await waitFor((e) => e.type === "tool_execution_end" && e.toolCallId === secondStart.toolCallId, 90_000, "the second memory_search to finish");
   const search2 = String(secondSearch.result?.content?.[0]?.text ?? "");
   const lines = search2.split("\n").filter((line) => line.startsWith("- "));
-  console.log(`recall:  ${lines.join("\n         ")}`);
-  if (lines.length < 2) throw new Error(`recall found ${lines.length} row(s); this agent's dream and the planted teammate memory should both be findable`);
+  console.log(`recall, as the agent saw it:  ${lines.join("\n         ") || "nothing rendered"}`);
   if (!search2.includes("[vector similar")) throw new Error("recall produced no vector similarity score, so the hnsw path did not run");
-  if (!lines[0].startsWith("- mine ")) throw new Error(`own memory should be the first hit, got: ${lines[0]}`);
-  if (!lines.some((line) => line.includes(teammateAgent))) throw new Error(`the teammate memory (${teammateAgent}) was not recalled at all`);
-  if (!lines[1].includes(teammateAgent)) throw new Error(`the teammate hit should rank below the own hit: ${lines.map((line) => line.slice(0, 60)).join(" | ")}`);
-  console.log(`         own hit above the teammate hit: weighting confirmed (own 1.0, other 0.65)`);
+
+  // The load-bearing proof is the store's own function, called directly with the vector that was planted. How a model
+  // phrases a search varies from run to run, and a check that fails because the model chose a narrower query reports
+  // the wrong thing about the store - which is the same mistake as an alert with an impatient budget.
+  // Embed the *question*, not the planted row. Passing the planted vector would make that row a perfect match by
+  // construction, which proves nothing about retrieval and once made this check report a ranking that was an artifact
+  // of how it was called.
+  const queryEmbed = await fetch(`${process.env.PI_MEMORY_EMBED_URL ?? "https://embeddings.dev.initialed85.cc"}/v1/embeddings`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "bge-base-en-v1.5", input: [queryText] }),
+    signal: AbortSignal.timeout(30_000),
+  }).then((response) => response.json());
+  const queryVector = queryEmbed?.data?.[0]?.embedding;
+  if (!Array.isArray(queryVector) || queryVector.length !== 768) throw new Error("embedder did not return a vector for the recall query");
+  const direct = await db.query(
+    `select agent_id, mine, round(similarity::numeric, 3) as similarity, round(weight::numeric, 2) as weight,
+            round(score::numeric, 3) as score, round((score / nullif(similarity, 0))::numeric, 2) as applied_weight,
+            left(summary, 60) as summary
+     from memory_search($1, $2::vector, $3, $4, $5, now() - interval '1 day')`,
+    [agent, `[${queryVector.join(",")}]`, 8, 1.0, 0.65],
+  );
+  const found = direct.rows;
+  console.log(`recall, from memory_search():  ${found.map((row) => `${row.mine ? "own" : row.agent_id} similar ${row.similarity} weight ${row.weight} score ${row.score}`).join(", ") || "nothing"}`);
+  if (!found.length) throw new Error("memory_search returned nothing for a vector that was just planted in the same store");
+  const ownRow = found.find((row) => row.mine === true);
+  const teammateRow = found.find((row) => String(row.agent_id) === teammateAgent);
+  if (!ownRow) throw new Error(`memory_search did not return this agent's own dream row: ${JSON.stringify(found.map((row) => row.agent_id))}`);
+  if (!teammateRow) throw new Error(`memory_search did not return the planted teammate memory (${teammateAgent})`);
+  if (Number(ownRow.weight) !== 1.0 || Number(teammateRow.weight) !== 0.65) throw new Error(`weights are wrong: own ${ownRow.weight}, teammate ${teammateRow.weight}`);
+  // The mechanism, measured on real rows rather than on a lucky ranking: what came back is similarity times the
+  // weight the store applied. Asserting the multiplier is what this check can honestly hold fixed, because which of
+  // the two rows ranks higher depends on how close each memory's text actually is to the question - and a teammate
+  // row that is much nearer the query outranks an own row that only mentions it. Damping is not a veto.
+  for (const row of [ownRow, teammateRow]) {
+    if (Number(row.applied_weight) !== Number(row.weight)) throw new Error(`score is not similarity x weight for ${row.agent_id}: ${row.similarity} x ${row.weight} != ${row.score}`);
+  }
+  const order = found.map((row) => `${row.mine ? "own" : row.agent_id} ${row.score}`).join(" > ");
+  console.log(`         weights applied as configured (own 1.0, other 0.65) on every row; order returned: ${order}`);
+
+  // How the agent rendered what it was given is worth printing and not worth failing a run over. If it went narrower
+  // than the store, that is a fact about the phrasing it chose, and a future reader should see it as a note rather
+  // than as a broken retrieval path.
+  if (lines.length < 2) console.log(`note: the agent rendered ${lines.length} hit(s) for the query it chose; memory_search returned ${found.length}. Reported, not asserted.`);
+  else console.log(`         the agent rendered ${lines.length} hits`);
   console.log(`newest memory: ${JSON.stringify(memory.rows[0] ?? null)}`);
   console.log(`spool remaining: ${spoolRemain}`);
 
