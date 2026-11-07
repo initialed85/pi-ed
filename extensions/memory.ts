@@ -731,6 +731,94 @@ export function keywordSearch(query: string, agentId: string, options: { limit?:
   };
 }
 
+/**
+ * The identity-drift pair, named from the store instead of inferred from two complementary timelines.
+ *
+ * home-ops' hazard is in their report rather than in mine: a drift event arrives as a brand-new `agent_id` while the
+ * old one stops growing, and their dedup key is (`agent_id`, severity), so a naive reading prints "a new agent
+ * appeared" when the truth is "this agent moved". Misleading by construction.
+ *
+ * What the store has to work with is `repo`, which travels on every heartbeat row. A checkout that changed identity
+ * leaves two ids carrying the *same* repo, one that stopped moving and one that started. Requiring the arrival to
+ * postdate the stall is what separates that from two agents sharing a checkout, which is ordinary and happens here.
+ *
+ * It is a candidate pair and the name says so. Two things keep it a candidate: the store cannot know whether the two
+ * ids are one agent or two - that is membership knowledge, and home-ops' sweep carries the fleet list externally -
+ * and `first_seen_at` is exact only for rows created after that column existed, which is why the query refuses to
+ * reason from a row whose `first_seen_at` postdates its own `last_activity_at`.
+ */
+export function identityPairStatement(): Statement {
+  return {
+    sql: `select a.repo,
+       a.agent_id as stalled_id,
+       b.agent_id as arriving_id,
+       a.last_activity_at as stalled_last_activity_at,
+       a.last_flush_at as stalled_last_flush_at,
+       a.flushes as stalled_flushes,
+       b.first_seen_at as arriving_first_seen_at,
+       b.last_activity_at as arriving_last_activity_at,
+       b.flushes as arriving_flushes,
+       round(extract(epoch from (now() - a.last_activity_at)) / 60.0, 1) as stalled_minutes,
+       round(extract(epoch from (b.first_seen_at - a.last_activity_at)) / 60.0, 1) as minutes_from_stall_to_arrival
+     from writer_heartbeat a
+     join writer_heartbeat b on b.repo = a.repo and b.agent_id <> a.agent_id
+     where a.repo is not null
+       and a.last_activity_at < now() - interval '2 hours'
+       and b.last_activity_at > now() - interval '2 hours'
+       and b.first_seen_at > a.last_activity_at
+       and a.first_seen_at <= a.last_activity_at
+     order by b.first_seen_at desc`,
+    values: [],
+  };
+}
+
+/**
+ * "Am I reading the right database at all?" - the sanity triple, exported so the answer lives in one place.
+ *
+ * This exists because an empty store and a misread store print identically. home-ops ran the drift timeline against
+ * this store and got `(0 rows)`, which was the true reading of a store the live suite had just cleaned out - and the
+ * only reason that was knowable is that `current_database()`, `rolconfig`, and what `memory` and `public.memory`
+ * resolve to were read alongside it. Without them, `0` is a health statement about a database somebody may not be
+ * looking at.
+ *
+ * `memory_resolves_to` is the quiet one: unqualified names resolve through `search_path`, so a store with the role's
+ * `search_path` reset answers a `select * from memory` out of `public` and looks populated while being the wrong
+ * table. Asking `to_regclass` with no schema qualification is how that shows up as a value rather than a guess.
+ */
+export function storeReadingSanityStatement(): Statement {
+  return {
+    sql: `select current_database() as database,
+       current_user as role,
+       (select setting from pg_settings where name = 'search_path') as session_search_path,
+       (select rolconfig from pg_roles where rolname = current_user) as role_config,
+       exists (select 1 from information_schema.schemata where schema_name = 'memory') as memory_schema_present,
+       to_regclass('memory') as unqualified_memory_resolves_to,
+       to_regclass('memory.memory') as memory_schema_table,
+       to_regclass('public.memory') as public_memory_table,
+       to_regclass('memory.writer_heartbeat') as heartbeat_table`,
+    values: [],
+  };
+}
+
+/**
+ * The counts, in a statement that is *allowed* to fail.
+ *
+ * Deliberately separate from the sanity reading above, and the separation is the point. A statement that counts
+ * `memory.memory` cannot be written to tolerate the table being absent - Postgres resolves the relation name while
+ * parsing, before any branch could skip it - so a count against the wrong database is an error rather than a zero.
+ * That is the good direction: `syntax`-class failure naming a missing relation is a reader in the wrong place, while a
+ * `0` is only ever a fact about a place the reader has already proven they are standing in. Run this one *after* the
+ * sanity row says the schema and the tables are there.
+ */
+export function storeShapeCountsStatement(): Statement {
+  return {
+    sql: `select count(*)::int as memories,
+       count(*) filter (where embedding is null)::int as memories_without_vector
+     from memory.memory`,
+    values: [],
+  };
+}
+
 /** How many memories this agent id actually has in the store. One cheap indexed count, asked only when a search
 returned nothing that belonged to it. */
 export function ownRowCountStatement(agentId: string): Statement {

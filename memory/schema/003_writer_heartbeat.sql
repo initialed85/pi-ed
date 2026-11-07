@@ -20,6 +20,11 @@ begin;
 create table if not exists writer_heartbeat (
   agent_id text primary key,
   repo text,
+  /** When this table first heard of the id, which for any row written after this column existed *is* when the writer
+      first arrived - heartbeat rows are created by the first stamp. Rows that existed before the column carry the
+      migration time instead, and that difference is why the drift query below reports a candidate pair rather than a
+      verdict. */
+  first_seen_at timestamptz not null default now(),
   /** Bumped when a session opens and whenever a flush is attempted, successfully or not. */
   last_activity_at timestamptz not null default now(),
   /** Bumped only when a batch of rows actually committed. Null until this agent has written anything. */
@@ -40,6 +45,11 @@ create table if not exists writer_heartbeat (
 -- Additive and idempotent, in the same shape as everything else here: no restart, harmless on a store that already
 -- has the column, and required on one that was created before it existed.
 alter table writer_heartbeat add column if not exists spool_since timestamptz;
+-- The same additive shape for `first_seen_at`. A not-null column with a default fills existing rows with the moment of
+-- the migration, which is a fact about the migration and not about the agent; the column's comment says so, and the
+-- drift query is written so that a stale row's `first_seen_at` being later than its `last_activity_at` is a sign the
+-- row predates the column rather than a finding.
+alter table writer_heartbeat add column if not exists first_seen_at timestamptz not null default now();
 
 comment on table writer_heartbeat is 'watermarks from pi-ed''s memory writer - activity vs committed, per agent';
 

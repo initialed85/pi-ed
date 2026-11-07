@@ -231,4 +231,101 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
     // Measured against the last commit: activity ran a full day ahead of it.
     expect(Number(found?.minutes_without_commit)).toBeGreaterThanOrEqual(1439);
   });
+
+  it("names an identity-drift pair from the store instead of leaving it as an inference", async () => {
+    const mod = await loadModule();
+    const identityPairStatement = mod.identityPairStatement;
+    const upsert = `on conflict (agent_id) do update set repo = excluded.repo, first_seen_at = excluded.first_seen_at,
+                    last_activity_at = excluded.last_activity_at, last_flush_at = excluded.last_flush_at,
+                    flushes = excluded.flushes`;
+
+    // A checkout that changed identity leaves two ids carrying the *same* repo - `repo` travels on every heartbeat
+    // row - one that stopped moving and one that started after it. home-ops' dedup key is (agent_id, severity), so
+    // the store's job is to name the pair, because a report keyed on agent ids alone can only ever say "a new agent
+    // appeared".
+    await query(
+      `insert into writer_heartbeat (agent_id, repo, first_seen_at, last_activity_at, last_flush_at, flushes)
+       values ('heartbeat-probe-old', 'probe-repo', now() - interval '5 days', now() - interval '3 days',
+               now() - interval '3 days', 7),
+              ('heartbeat-probe-new', 'probe-repo', now() - interval '1 hour', now(), now(), 2)`,
+    ).catch(async () => {
+      // Two rows in one statement, so the upsert variant is applied per row if either id already exists.
+      for (const [id, repo, seen, moved] of [
+        ["heartbeat-probe-old", "probe-repo", "5 days", "3 days"],
+        ["heartbeat-probe-new", "probe-repo", "1 hour", "0 days"],
+      ]) {
+        await query(
+          `insert into writer_heartbeat (agent_id, repo, first_seen_at, last_activity_at, last_flush_at, flushes)
+           values ($1, $2, now() - interval '${seen}', now() - interval '${moved}', now() - interval '${moved}', 2)
+           ${upsert}`,
+          [id, repo],
+        );
+      }
+    });
+
+    const rows = (await query(identityPairStatement!().sql)).rows;
+    const pair = rows.find((row) => String(row.stalled_id) === "heartbeat-probe-old" && String(row.arriving_id) === "heartbeat-probe-new");
+    expect(pair, "both ids are on one repo and the arrival postdates the stall, so this pair has to be named").toBeTruthy();
+    expect(Number(pair!.stalled_minutes)).toBeGreaterThan(2 * 24 * 60);
+    expect(Number(pair!.minutes_from_stall_to_arrival)).toBeGreaterThan(4000);
+    expect(Number(pair!.stalled_flushes)).toBe(7);
+    expect(Number(pair!.arriving_flushes)).toBe(2);
+
+    // The two shapes that must *not* read as drift, fabricated next to the one that must.
+    //
+    // A flatmate: another agent working the same checkout, active now and arrived before the stalled id went quiet.
+    // Two agents sharing a repository is ordinary here, and the arrival-postdates-the-stall rule is what separates it
+    // from an agent that moved.
+    await query(
+      `insert into writer_heartbeat (agent_id, repo, first_seen_at, last_activity_at, last_flush_at, flushes)
+       values ('heartbeat-probe-flatmate', 'probe-repo', now() - interval '4 days', now() - interval '30 minutes',
+               now() - interval '30 minutes', 3) ${upsert}`,
+    );
+    // A row that predates the `first_seen_at` column: its `first_seen_at` is the migration time, which is later than
+    // its own last activity. Pairing from that would be pairing about an ALTER TABLE.
+    await query(
+      `insert into writer_heartbeat (agent_id, repo, first_seen_at, last_activity_at, flushes)
+       values ('heartbeat-probe-ancient', 'probe-repo', now(), now() - interval '10 days', 4) ${upsert}`,
+    );
+
+    const after = (await query(identityPairStatement!().sql)).rows.filter((row) => String(row.repo) === "probe-repo");
+    expect(after.some((row) => String(row.arriving_id) === "heartbeat-probe-flatmate"), "an agent that overlaps the stalled one's window is a flatmate, not a successor").toBe(false);
+    expect(after.some((row) => String(row.stalled_id) === "heartbeat-probe-ancient"), "a row whose first_seen_at postdates its own last_activity_at predates the column and is not evidence").toBe(false);
+    // Four ids on one repo, and exactly one named pair. Which of them is *one agent* is membership knowledge the
+    // store does not have, and home-ops' sweep carries that list externally - this query's job ends at the candidate.
+    expect(after.map((row) => `${String(row.stalled_id)}>${String(row.arriving_id)}`)).toEqual(["heartbeat-probe-old>heartbeat-probe-new"]);
+  });
+
+  it("proves a reading comes from the right database before any count in it is believed", async () => {
+    const mod = await loadModule();
+    const sanity = (await query(mod.storeReadingSanityStatement!().sql)).rows[0];
+    expect(String(sanity.database)).toBe("pi_ed");
+    expect(sanity.memory_schema_present).toBe(true);
+    expect(String(sanity.memory_schema_table)).toBe("memory");
+    // A table named `memory` in `public` would mean the writer's unqualified names resolve somewhere other than the
+    // schema the migrations created, which is the silent version of this whole check.
+    expect(sanity.public_memory_table).toBeNull();
+    const roleConfig = (sanity.role_config ?? []) as string[];
+    expect(roleConfig.some((entry) => entry.includes("search_path")), "the role's search_path is what the writer's unqualified names depend on; an empty rolconfig is config drift, not a pass").toBe(true);
+
+    // The negative case run for real, on the other database in the same pod, which has no `memory` schema. This is
+    // what a sweep pointed at the wrong place looks like, and it looks like *this*, not like an empty result.
+    const pg = (await import("pg")) as unknown as { Client: new (options: { connectionString: string }) => Client };
+    const wrongDsn = new URL(liveDsn);
+    wrongDsn.pathname = "/postgres";
+    const other = new pg.Client({ connectionString: wrongDsn.toString() });
+    await other.connect();
+    try {
+      const wrong = (await other.query(mod.storeReadingSanityStatement!().sql)).rows[0];
+      expect(String(wrong.database)).toBe("postgres");
+      expect(wrong.memory_schema_present).toBe(false);
+      expect(wrong.memory_schema_table).toBeNull();
+      expect(wrong.unqualified_memory_resolves_to).toBeNull();
+      // And the counting statement fails loudly there rather than returning zero, which is the direction that keeps a
+      // `0` meaning what a reader thinks it means.
+      await expect(other.query(mod.storeShapeCountsStatement!().sql)).rejects.toThrow(/does not exist/);
+    } finally {
+      await other.end();
+    }
+  });
 });

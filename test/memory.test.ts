@@ -738,6 +738,37 @@ describe("the extension", () => {
     expect(describeStoreError!("")).toBe("error: unknown failure");
   });
 
+  it("exports the drift pair and the reading sanity check as statements, not as prose", async () => {
+    const { identityPairStatement, storeReadingSanityStatement, storeShapeCountsStatement } = await loadModule();
+    const flat = (sql: string) => sql.replace(/\s+/g, " ").trim();
+
+    // The pair query's whole meaning is in three comparisons, so they are asserted by name: same repo, the arrival
+    // postdates the stall, and a row whose `first_seen_at` postdates its own `last_activity_at` is not evidence about
+    // anything (it predates the column).
+    const pair = identityPairStatement!();
+    expect(pair.values).toEqual([]);
+    expect(flat(pair.sql)).toContain("b.repo = a.repo and b.agent_id <> a.agent_id");
+    expect(flat(pair.sql)).toContain("b.first_seen_at > a.last_activity_at");
+    expect(flat(pair.sql)).toContain("a.first_seen_at <= a.last_activity_at");
+    expect(flat(pair.sql)).toContain("as stalled_id");
+    expect(flat(pair.sql)).toContain("as arriving_id");
+
+    // The sanity reading must not touch the tables it is checking the presence of, or it cannot answer "am I in the
+    // right database" in a database that has none of them.
+    const sanity = storeReadingSanityStatement!();
+    expect(sanity.values).toEqual([]);
+    expect(flat(sanity.sql)).toContain("to_regclass('memory.memory')");
+    expect(flat(sanity.sql)).toContain("to_regclass('public.memory')");
+    expect(flat(sanity.sql)).toContain("from pg_roles where rolname = current_user");
+    expect(flat(sanity.sql)).not.toContain("from memory.memory");
+
+    // ... and the counts live in a statement that is allowed to fail, because a missing relation failing loudly is a
+    // reader standing in the wrong place, which is a better outcome than a plausible zero.
+    const counts = storeShapeCountsStatement!();
+    expect(flat(counts.sql)).toContain("from memory.memory");
+    expect(counts.sql).toContain("memories_without_vector");
+  });
+
   it("counts how much of the store is findable by meaning rather than by wording", async () => {
     const { vectorCoverageStatement } = await loadModule();
     // Whole store by default, because the fleet-level question is "is recall quality dropping", and one checkout's

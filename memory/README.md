@@ -136,6 +136,73 @@ has nothing), window starvation (own row orthogonal to the query, six nearer tea
 come back and whose they are labelled does not depend on a model, and a test that needs the embedder fails for a
 reason unrelated to retrieval scope.
 
+### Naming the drift pair from the store
+
+`writer_heartbeat` gained `first_seen_at` (`timestamptz not null default now()`, added the same idempotent way as
+`spool_since`) because `repo` travels on every heartbeat row and that is enough to name a drift pair without anybody
+inferring it from two complementary timelines. home-ops' hazard is in their report rather than in mine: drift arrives
+as a brand-new `agent_id` while the old one stops growing, and their dedup key is (`agent_id`, severity), so a report
+keyed on agent ids alone can only ever say "a new agent appeared" when the truth is "this agent moved".
+
+`identityPairStatement()` reports the pair, with the arrival required to postdate the stall:
+
+```sql
+select a.repo, a.agent_id as stalled_id, b.agent_id as arriving_id,
+       a.last_activity_at as stalled_last_activity_at, a.flushes as stalled_flushes,
+       b.first_seen_at as arriving_first_seen_at, b.last_activity_at as arriving_last_activity_at,
+       round(extract(epoch from (now() - a.last_activity_at)) / 60.0, 1) as stalled_minutes,
+       round(extract(epoch from (b.first_seen_at - a.last_activity_at)) / 60.0, 1) as minutes_from_stall_to_arrival
+from writer_heartbeat a
+join writer_heartbeat b on b.repo = a.repo and b.agent_id <> a.agent_id
+where a.repo is not null
+  and a.last_activity_at < now() - interval '2 hours'
+  and b.last_activity_at > now() - interval '2 hours'
+  and b.first_seen_at > a.last_activity_at
+  and a.first_seen_at <= a.last_activity_at;
+```
+
+Measured against fabricated rows - four probe ids on one repo, and exactly one pair comes back, at `stalled_minutes
+4320` and `minutes_from_stall_to_arrival 4260`. The three ids it must *not* report are in the live suite as fabricated
+shapes: a **flatmate** (another agent active in the same checkout, arrived before the stalled one went quiet - two
+agents sharing a repository is ordinary here, and the arrival-postdates-the-stall rule is the whole separation), an
+**ancient** row whose `first_seen_at` postdates its own `last_activity_at` (it predates the column, so pairing from it
+would be pairing about an `ALTER TABLE`), and ids on different repos.
+
+It stays a **candidate** pair, and that limit is load-bearing: whether the two ids are one agent or two is membership
+knowledge, not store knowledge. The fleet list - which checkouts and sessions exist - lives on home-ops' side, and an
+id in the store that is not on that list is reported as retired-unknown rather than as drift. Expecting an agent to be
+active is a fact about the fleet, and this query never pretends to hold it.
+
+### Why a `0` needs its surroundings before anyone reads it
+
+The drift timeline run against an empty store prints `(0 rows)`, which is a true reading of a store the live suite has
+just cleaned out and a false reading of a sweep pointed at the wrong database - and the two are indistinguishable from
+the timeline alone. `storeReadingSanityStatement()` is exported so that the surroundings live in this repository, next
+to the `search_path` warning they belong to:
+
+```sql
+select current_database() as database, current_user as role,
+       (select setting from pg_settings where name = 'search_path') as session_search_path,
+       (select rolconfig from pg_roles where rolname = current_user) as role_config,
+       exists (select 1 from information_schema.schemata where schema_name = 'memory') as memory_schema_present,
+       to_regclass('memory') as unqualified_memory_resolves_to,
+       to_regclass('memory.memory') as memory_schema_table,
+       to_regclass('public.memory') as public_memory_table,
+       to_regclass('memory.writer_heartbeat') as heartbeat_table;
+```
+
+In this store: `database pi_ed`, `role pi_ed`, `role_config {search_path=memory, public}`, `memory_schema_present t`,
+`memory_schema_table memory`, `public_memory_table NULL`, `heartbeat_table writer_heartbeat`. Against the other
+database in the same pod (`postgres`), the same statement answers `memory_schema_present f` with both regclass columns
+NULL - so a misconfigured sweep has a shape, and it is not "empty result". The live suite runs that negative case
+rather than describing it.
+
+It deliberately contains no counts. A statement that counts `memory.memory` cannot tolerate the table being absent -
+Postgres resolves relation names while parsing, before any `case` could skip the branch - so counts live in
+`storeShapeCountsStatement()`, which is *allowed* to fail, and failing with `relation ... does not exist` is the good
+direction: an error naming a missing relation is a reader standing in the wrong place, whereas a `0` is only a fact
+about a place the reader has already proven they are in. Run the sanity row first, then the counts.
+
 ## The Pi side
 
 `extensions/memory.ts` is the writer and the reader. It records turns as `event` rows on `turn_end` and when a run
