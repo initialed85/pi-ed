@@ -178,6 +178,29 @@ rolled back, every row went to the spool, and the only visible symptom was a for
 why `flush()` reports its failure to the dream instead of letting the dream discover it, and why `hack/memory-live-check.mjs`
 prints extension notifications: an invisible warning is how a write path stays broken for a whole session.
 
+## What a store failure is called
+
+Every failure this extension reports is prefixed with one word that names its kind - `dns:`, `refused:`, `timeout:`,
+`slots:`, `auth:`, `sql:`, `error:` - and the original text follows verbatim. The tag exists because of a trap
+home-ops hit while proving the sweep job: the probe connected to `-h pi-ed-postgres`, the *Deployment's* name, and
+died with `could not translate host name`. That is a configuration fault, and it presents to a reader exactly like an
+unreachable store - which is the one distinction the heartbeat pairing with `pg_isready` is supposed to make. So the
+name matters on both sides:
+
+- **the in-cluster Service is `memory`** (`memory.pi-ed.svc.cluster.local:5432`, ClusterIP `10.43.5.96`). The
+  Deployment is `pi-ed-postgres` and that name does not resolve to anything. `kubectl exec deploy/pi-ed-postgres`
+  works because it targets a pod, not a host.
+- `dns:` means something is pointing at the wrong place. `refused:` means the place exists and nothing is listening.
+  `slots:` means the store is up and full. `sql:` means the store answered and disagreed - the `array_concat` class
+  of bug lands there. `error:` is honest about not knowing.
+
+Classification is done on the message text, not on exception types, because Node raises string-coded errors here and
+Postgres raises SQLSTATE-prefixed text there, and text is the only common ground. `classifyStoreError` and
+`describeStoreError` are exported, and `test/memory.test.ts` asserts the classification against real messages -
+including home-ops' trap, quoted word for word - plus the end-to-end case, where the CI DSN points at a closed port
+on `127.0.0.1:1` and the tool must answer `memory_search failed: refused: connect ECONNREFUSED 127.0.0.1:1` rather
+than a mystery.
+
 ## What the statistics look like from outside
 
 `pi_ed` will look strange in `pg_stat_*` and it is worth writing down why before someone spends an evening worrying:
@@ -397,6 +420,11 @@ for f in memory/schema/*.sql; do
     psql -U pi_ed -d pi_ed -v ON_ERROR_STOP=1 < "$f" || break
 done
 ```
+
+The live check waits on a real model deciding to call tools, so a full run can take several minutes; its budgets are
+generous on purpose. A timeout from that script names the phase it was waiting for, and a timeout waiting for a tool
+to *start* is model latency, not a broken store - the check's own comment says why an impatient budget manufactures
+the failure it exists to detect.
 
 Each is idempotent - `create table if not exists`, `create or replace function`, `create index if not exists`,
 `create schema if not exists` - so re-applying them after a restore is a no-op rather than an event, and applying

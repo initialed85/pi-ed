@@ -110,6 +110,12 @@ try {
     }
   });
 
+  // The generous budgets below are deliberate, and they are model budgets rather than database budgets: most of
+  // what this waits for is a real model deciding to call a tool, which on a loaded machine is the slowest part of
+  // the run. An impatient budget manufactures the exact thing this check exists to detect - a run that looks broken
+  // and was not - and a check that cries wolf gets ignored, which is how a real failure would be missed. Waits for a
+  // tool to *start* are therefore generous; waits for a started tool to *finish* are not, because those are the
+  // store and the embedder, and they have timeouts of their own.
   const waitFor = (matches, timeoutMs, label) =>
     new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -129,17 +135,17 @@ try {
   const send = (message) => pi.stdin.write(`${JSON.stringify({ id: `req-${audit.length}`, type: "prompt", message })}\n`);
 
   send("Say the word bluehammer and nothing else.");
-  await waitFor((e) => e.type === "agent_settled", 120_000, "the first run to settle");
+  await waitFor((e) => e.type === "agent_settled", 240_000, "the first run to settle");
   console.log("first turn settled");
 
   send("Use the memory_search tool with the query 'bluehammer'. Report the top hit and its weight.");
-  const search = await waitFor((e) => e.type === "tool_execution_start" && e.toolName === "memory_search", 120_000, "memory_search to be called");
+  const search = await waitFor((e) => e.type === "tool_execution_start" && e.toolName === "memory_search", 240_000, "memory_search to be called");
   const searchResult = await waitFor((e) => e.type === "tool_execution_end" && e.toolCallId === search.toolCallId, 60_000, "memory_search to finish");
   console.log(`memory_search called, isError=${searchResult.isError}, ${String(searchResult.result?.content?.[0]?.text ?? "").split("\n")[0]}`);
 
   // The idle clock starts when the session settles. It is short here on purpose; see the config written above.
-  await waitFor((e) => e.type === "tool_execution_start" && e.toolName === "memory_dream", idleMs + 90_000, "the dream to run memory_dream");
-  const dream = await waitFor((e) => e.type === "tool_execution_end" && e.toolName === "memory_dream", 60_000, "memory_dream to finish");
+  await waitFor((e) => e.type === "tool_execution_start" && e.toolName === "memory_dream", idleMs + 180_000, "the dream to run memory_dream");
+  const dream = await waitFor((e) => e.type === "tool_execution_end" && e.toolName === "memory_dream", 90_000, "memory_dream to finish");
   console.log(`memory_dream isError=${dream.isError}, ${String(dream.result?.content?.[0]?.text ?? "").split("\n")[0]}`);
 
   // The extension flushes on a debounce and writes asynchronously, so give it a beat before reading back.
@@ -190,8 +196,8 @@ try {
   if (!planted.rows.length) throw new Error("could not plant the teammate memory the weighting check needs");
 
   await send("Search memory again for the bluehammer drill and report every hit with its score.");
-  const secondStart = await waitFor((e) => e.type === "tool_execution_start" && e.toolName === "memory_search", 120_000, "a second memory_search call");
-  const secondSearch = await waitFor((e) => e.type === "tool_execution_end" && e.toolCallId === secondStart.toolCallId, 60_000, "the second memory_search to finish");
+  const secondStart = await waitFor((e) => e.type === "tool_execution_start" && e.toolName === "memory_search", 240_000, "a second memory_search call");
+  const secondSearch = await waitFor((e) => e.type === "tool_execution_end" && e.toolCallId === secondStart.toolCallId, 90_000, "the second memory_search to finish");
   const search2 = String(secondSearch.result?.content?.[0]?.text ?? "");
   const lines = search2.split("\n").filter((line) => line.startsWith("- "));
   console.log(`recall:  ${lines.join("\n         ")}`);

@@ -694,6 +694,27 @@ describe("the extension", () => {
     expect(text).toContain("memory_search failed");
     expect(text).not.toContain("no memories match");
     expect(result.details).toHaveProperty("error");
+    // The dead DSN is a closed port on localhost, so the honest answer names the kind of failure. A reader - or a
+    // sweep pairing this with `pg_isready` - should not have to guess whether the store is down or the address is wrong.
+    expect(text).toMatch(/memory_search failed: (refused|dns|timeout|slots|auth|sql|error): /);
+  });
+
+  it("names the kind of store failure, because a probe bug must not look like an outage", async () => {
+    const { classifyStoreError, describeStoreError } = await loadModule();
+    // Home-ops' measured trap, verbatim: a sweep job that connected to the Deployment's name instead of the Service
+    // (`memory`, not `pi-ed-postgres`). This is a configuration fault, and it presents as an unreachable store.
+    expect(classifyStoreError!(`could not translate host name "pi-ed-postgres" to address: Name or service not known`)).toBe("dns");
+    expect(classifyStoreError!("getaddrinfo ENOTFOUND memory.pi-ed.svc.cluster.local")).toBe("dns");
+    expect(classifyStoreError!("connect ECONNREFUSED 10.43.5.96:5434")).toBe("refused");
+    expect(classifyStoreError!("QueryFailedError: query timeout expired")).toBe("timeout");
+    expect(classifyStoreError!("FATAL: remaining connection slots are reserved for non-replication superuser connections")).toBe("slots");
+    expect(classifyStoreError!(`FATAL: password authentication failed for user "pi_ed"`)).toBe("auth");
+    expect(classifyStoreError!(`syntax error at or near "array_concat"`)).toBe("sql");
+    expect(classifyStoreError!("something unprecedented happened")).toBe("error");
+    // Stored as classified-then-verbatim: the tag helps a reader, and the original text is what a diagnosis needs.
+    expect(describeStoreError!(`syntax error at or near "array_concat"`)).toBe(`sql: syntax error at or near "array_concat"`);
+    expect(describeStoreError!("refused: connect ECONNREFUSED 127.0.0.1:1")).toBe("refused: connect ECONNREFUSED 127.0.0.1:1");
+    expect(describeStoreError!("")).toBe("error: unknown failure");
   });
 
   it("refuses to write a dream with no summary", async () => {

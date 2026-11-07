@@ -491,6 +491,38 @@ export function heartbeatFlushStatement(agentId: string, repo: string): Statemen
 }
 
 /** "A writer was refused." Written after the batch rolled back, in its own transaction, with the backlog it left on disk. */
+/**
+ * Which kind of failure a store error is, in one word, prefixed onto `last_error`.
+ *
+ * The reason this exists is a trap home-ops hit while proving the sweep job: a probe that connected to
+ * `-h pi-ed-postgres` - the Deployment's name, not the Service - died with `could not translate host name`, which is
+ * the exact shape of "the store is unreachable". A reader trying to tell a broken probe from a broken database has
+ * only the error text, and raw Postgres and libpq text does not make that distinction obvious. A prefix makes it a
+ * one-word read: `dns:` means something is pointing at the wrong place, `refused:` means the place exists and nothing
+ * is listening, `sql:` means the store answered and disagreed.
+ *
+ * It is a classification of the *message*, not of a caught exception type: Node raises plain errors with string
+ * codes here, and Postgres raises SQLSTATE-prefixed text there, so matching text is the honest common ground.
+ */
+export function classifyStoreError(message: string): string {
+  const text = message.toLowerCase();
+  if (/enotfound|eai_again|getaddrinfo|could not translate host name|name or service not known/.test(text)) return "dns";
+  if (/econnrefused|connection refused/.test(text)) return "refused";
+  if (/etimedout|econnreset|query timeout|timed out|timeout expired/.test(text)) return "timeout";
+  if (/too many connections|too many clients|53300|remaining connection slots/.test(text)) return "slots";
+  if (/password authentication failed|pg_hba|no pg_hba.conf entry|role .* does not exist/.test(text)) return "auth";
+  if (/syntax error at or near|does not exist|violates|invalid|cannot cast|division by zero|array_cat|array_concat/.test(text)) return "sql";
+  return "error";
+}
+
+/** `last_error` as it should be stored: classified, then verbatim. */
+export function describeStoreError(message: string): string {
+  const text = message.trim() || "unknown failure";
+  return text.startsWith("dns:") || text.startsWith("refused:") || text.startsWith("timeout:") || text.startsWith("slots:") || text.startsWith("auth:") || text.startsWith("sql:") || text.startsWith("error:")
+    ? text
+    : `${classifyStoreError(text)}: ${text}`;
+}
+
 export function heartbeatFailureStatement(agentId: string, repo: string, error: string, spoolRows: number): Statement {
   return {
     sql: `insert into writer_heartbeat (agent_id, repo, last_error, spool_rows)
@@ -988,7 +1020,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
       pool = new pg.Pool({ connectionString: dsn, max: 2, connectionTimeoutMillis: 4_000, query_timeout: 10_000 }) as unknown as Db;
       connectError = "";
     } catch (error) {
-      connectError = error instanceof Error ? error.message : String(error);
+      connectError = describeStoreError(error instanceof Error ? error.message : String(error));
     }
     return pool;
   }
@@ -1074,7 +1106,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
       await stamp(agent, repo, "flush");
       return undefined;
     } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
+      lastError = describeStoreError(error instanceof Error ? error.message : String(error));
       if (client) {
         try {
           await client.query("rollback");
@@ -1279,7 +1311,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
           details: { count: rows.length, vector: embedded.ok, note: note || undefined },
         };
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = describeStoreError(error instanceof Error ? error.message : String(error));
         return { content: [{ type: "text", text: `memory_search failed: ${message}` }], details: { error: message } };
       } finally {
         client?.release();
@@ -1385,7 +1417,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
           details: { subjects, trigger, embedded: embedded.ok, embed: embedded.ok ? { tokens: embedded.tokens, chunks: embedded.chunks, model: embedded.model } : embedded.error },
         };
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = describeStoreError(error instanceof Error ? error.message : String(error));
         // "not written" rather than the raw Postgres text: a connection refusal and a constraint violation are both
         // true, but only one of them tells the agent what to do next, and the spool hint is what makes the retry safe.
         return { content: [{ type: "text", text: `memory_dream not written: ${message}. Nothing was summarised; the events are in the local spool and this dream can be tried again once the store answers.` }], details: { error: message } };
@@ -1438,7 +1470,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
             : `heartbeat  never stamped - this agent has not reached the store`,
         );
         } catch (error) {
-          lines.push(`store      unreadable: ${error instanceof Error ? error.message : String(error)}`);
+          lines.push(`store      ${describeStoreError(error instanceof Error ? error.message : String(error))}`);
         } finally {
           client?.release();
         }
