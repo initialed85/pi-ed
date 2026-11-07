@@ -23,6 +23,12 @@
 begin;
 
 create schema if not exists memory;
+
+-- The writer in extensions/memory.ts names its tables unqualified, so this line is load-bearing: `insert into event`
+-- means `memory.event` only because this role says so. The failure mode if it changes is not an error - move
+-- `public` first, or let something create a same-named table there, and the writes split silently between two tables
+-- while the store still reports healthy row counts. Keep `memory` first, and qualify every name in the extension
+-- before that ever changes.
 alter role pi_ed set search_path = memory, public;
 
 set local search_path = memory, public;

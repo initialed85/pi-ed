@@ -386,3 +386,17 @@ done
 Each is idempotent - `create table if not exists`, `create or replace function`, `create index if not exists`,
 `create schema if not exists` - so re-applying them after a restore is a no-op rather than an event, and applying
 them out of order fails loudly on a missing dependency rather than half-building a schema.
+
+### The one setting the writer depends on
+
+`001_init.sql` carries `alter role pi_ed set search_path = memory, public`, and the writer's table names are
+unqualified, so that line is load-bearing rather than tidy: `insert into event` means `memory.event` only because the
+role says so. The failure mode if it ever changes is not an error - if `public` moves first, or something creates a
+same-named table in `public`, the writes silently split between two tables and the store reports exactly the row
+counts a healthy store would. Two rules follow, and both are worth stating before someone "just reorders" a line:
+keep `memory` first in that role's `search_path`, and if it ever has to move, qualify every name in
+`extensions/memory.ts` first.
+
+home-ops' copy in `MAINTENANCE.md` spells the sweep query `memory.writer_heartbeat`, and that is the right difference
+rather than drift: a report run by someone else should not inherit a setting it does not own, because a sweep that
+reads the wrong schema does not fail, it reports "no writers active".
