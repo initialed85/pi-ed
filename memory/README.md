@@ -199,6 +199,23 @@ If a future incident needs real statement-level visibility, ask for `pg_stat_sta
 `shared_preload_libraries` plus `log_min_duration_statement = 250ms`. It costs a Postgres restart, and a restart is
 safe by design: the writer spools to disk while the store is unreachable and replays on the next flush.
 
+## Backups, and the window not to roll in
+
+Two copies exist and they are not equally trustworthy. The nightly `pg_dump` CronJob - alpine, no kubectl, mounts the
+NFS share directly and writes `pi-ed-dump-<utc>.sql` to romulus - is the copy worth restoring from. The Longhorn
+`backup-daily` group in dev also carries `pvc-4b1dccc5`, and that is the copy to hope is never needed: Longhorn
+silently skips a volume that is *detached* when the job fires - labelled, selected, reported as handled,
+`lastBackupAt: none`. Not hypothetical; it happened to `woodpecker-pgdump` on 2026-11-07.
+
+So nothing detaches this volume between 17:55Z and 18:10Z. No `kubectl rollout restart deploy/pi-ed-postgres`, no
+scale to zero, no cordon that evicts it. A manifest change that alters the pod template - `shared_preload_libraries`
+for `pg_stat_statements`, an image bump - belongs at some other hour, because Argo rolls the pod whenever the sync
+wave lands and a pod rolled at 18:00Z is a volume detached exactly when the backup job enumerates it. A rollout
+outside that window is safe for the writer too: the pool fails, spools to disk, and replays on the next flush.
+
+Assert presence and mtime when checking a backup, never size. A few hundred bytes is the correct output of a healthy
+store the live check has just cleaned out; a `Complete` CronJob with no new file is the failure mode.
+
 ## Apply
 
 ```sh
