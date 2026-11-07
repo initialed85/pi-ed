@@ -260,10 +260,18 @@ it change without parsing prose. A dream only runs when there is an unsummarized
 so a session that is merely open is not a session worth thinking about, and an interrupted run never dreams — that
 was somebody hitting Escape on purpose.
 
-Retrieval is `memory_search`: full text over summary and feel today, pgvector when the embedder is up, with this
-agent's memories at 1.0 and teammates' at 0.65 — visible, labelled, and never able to outrank something this agent
-lived through. Each hit carries the score the query actually ordered by, because a live run of the check noticed the
-agent could describe the order of a recall but not its confidence.
+Retrieval is `memory_search`, and it runs two paths rather than choosing between them: the query is embedded and
+handed to pgvector's hnsw index, and full text over summary and feel runs underneath as the net - a memory written
+while the embedder was down has no vector and is still a memory. This agent's memories come back at 1.0 and
+teammates' at 0.65 - visible, labelled with the teammate's name, and never able to outrank something this agent lived
+through. Each hit carries the number the query actually ordered by, because a live run of the check noticed the agent
+could describe the order of a recall but not its confidence. What that weighting looks like in practice: a teammate's
+memory that was the *closer* text (similarity 0.556 against 0.435) still came back second.
+
+The vectors come from a service rather than from this extension - `embeddings.dev.initialed85.cc`, `bge-base-en-v1.5`,
+768 dimensions, the OpenAI-compatible `/v1/embeddings` - which matters mostly for what it refuses to do: it sends a
+long summary as several chunks and averages the vectors rather than truncating one, and it treats a response of any
+other dimension as a failure rather than a value to write into a column that promises 768.
 
 Two safety notes, both learned rather than designed in. Text is redacted on the way in (DSNs, bearer tokens,
 `AKIA…`, `ghp_…`, Slack tokens, private-key blocks, `password = "…"`, plus anything your `.pi/memory.json` lists in
@@ -278,11 +286,13 @@ is safe to leave in the package before the store exists.
 | --- | --- |
 | Commands | `/memory` (what this agent has, and what is buffered) |
 | Tools | `memory_search` (query, limit, since_days, own_only) · `memory_dream` (summary, subjects, feel) |
-| Config | `.pi/memory.json` then `~/.pi/agent/memory.json`: `dsn` · `agent` · `dreams` · `idleDreamMinutes` · `resumeDreamMinutes` · `flushMs` · `maxTextChars` · `skip` · `neverStore` |
+| Config | `.pi/memory.json` then `~/.pi/agent/memory.json`: `dsn` · `agent` · `dreams` · `idleDreamMinutes` · `resumeDreamMinutes` · `flushMs` · `maxTextChars` · `skip` · `neverStore` · `embeddings` · `embedUrl` · `embedModel` · `embedMaxChars` · `embedTimeoutMs` · `ownWeight` · `otherWeight` |
 | Env | `PI_MEMORY_DSN` (wins over both files) · `PI_MEMORY_DISABLED` · `PI_MEMORY_CONFIG` · `PI_MEMORY_SPOOL` |
-| Writes | `event` (raw turns: user / assistant / tool_call / tool_result / marker / system), `session`, `agent` on the way in; `memory` and `subject_index` when a dream lands |
+| Store | `memory.pi-ed.svc.cluster.local:5432` in-cluster; `192.168.1.113:5434` from the LAN (LAN-only LoadBalancer); secret in home-ops' `___secret/` |
+| Embedder | `https://embeddings.dev.initialed85.cc` — `bge-base-en-v1.5`, 768-dim, `POST /v1/embeddings` |
+| Writes | `event` (raw turns: user / assistant / tool_call / tool_result / marker / system), `session`, `agent` on the way in; `memory` (with `embedding`, `embedding_model`, `detail`) and `subject_index` when a dream lands |
 | Reads | the session branch, the session id, `session.dream_seq`, and `agent.name` for cross-agent attribution |
-| Live check | `hack/memory-live-check.mjs` — a real Pi session against the real store; needs the DSN, spends model tokens, and deletes what it wrote |
+| Live check | `hack/memory-live-check.mjs` — a real Pi session against the real store; needs the DSN, spends model tokens, and deletes what it wrote, including when it fails halfway |
 
 
 ### `searxng.ts` — web search through my own SearXNG
@@ -436,8 +446,10 @@ test runs against a DSN pointed at a closed port, because the behaviour that has
 database is unreachable, and the SQL is asserted as statements — parameter counts, the conflict key, the span over
 unsummarized events — rather than as rows. What the suite cannot check is whether the SQL parses, so
 `hack/memory-live-check.mjs` does: it drives a real Pi session against the real store, reads a memory back across
-sessions, waits for a dream, prints the recorded kinds and the span it anchored to, and then deletes its own rows so
-a test never leaves a fake memory an agent might retrieve.
+sessions, waits for a dream, searches a second time against a teammate memory it planted through the same embedder,
+prints the recorded kinds, the span the memory anchored to and the vector the dream wrote, and then deletes its own
+rows — including when the run fails halfway, because a fabricated memory left in a shared store is worse than a
+failed check.
 
 `npm install` pulls `@earendil-works/*` at 1.5.0 for the typecheck. When Pi updates, bump those versions
 and re-run; the tests are pinned to the API surface they were written against.

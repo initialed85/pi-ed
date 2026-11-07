@@ -39,6 +39,8 @@ if (!DSN) {
   process.exit(2);
 }
 const agent = arg("agent", "memory-live-check");
+// A second agent, planted with the same embedder, is what proves teammate recall is ranked lower rather than hidden.
+const teammateAgent = `${agent}-teammate`;
 const idleMs = Number(arg("idle-seconds", "20")) * 1000;
 const keep = argv.includes("--keep-rows");
 
@@ -141,11 +143,45 @@ try {
   await new Promise((resolve) => setTimeout(resolve, 3000));
   const after = await counts(agent);
   const memory = await db.query(
-    `select summary, feel, subjects, span_first_event, span_last_event, embedding_model, (embedding is not null) as has_vector, left(detail::text, 60) as detail from memory where agent_id = $1 order by created_at desc limit 1`,
+    `select summary, feel, subjects, span_first_event, span_last_event, embedding_model, embedding_dim, (embedding is not null) as has_vector, left(detail::text, 60) as detail from memory where agent_id = $1 order by created_at desc limit 1`,
     [agent],
   );
   const spoolRemain = await readFile(path.join(scratch, "spool.jsonl"), "utf8").then((text) => text.split("\n").filter((line) => line.trim()).length).catch(() => 0);
   console.log(`rows after: ${JSON.stringify(after)}`);
+
+  const plantedText = "The bluehammer drill was retired after the tabletop exercise proved the handover was unclear.";
+  const embed = await fetch(`${process.env.PI_MEMORY_EMBED_URL ?? "https://embeddings.dev.initialed85.cc"}/v1/embeddings`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "bge-base-en-v1.5", input: [plantedText] }),
+    signal: AbortSignal.timeout(30_000),
+  }).then((response) => response.json());
+  const vector = embed?.data?.[0]?.embedding;
+  if (!Array.isArray(vector) || vector.length !== 768) throw new Error("embedder did not return a 768-dimension vector for the planted memory");
+  const planted = await db.query(
+    `with a as (insert into agent (id, name, notes) values ($1, $1, '{"probe": true}'::jsonb) on conflict (id) do update set notes = excluded.notes returning id),
+          s as (insert into session (id, agent_id, source, started_at, last_activity_at) select $2, a.id, 'probe', now(), now() from a
+                on conflict (id) do update set last_activity_at = now() returning id)
+     insert into memory (agent_id, session_id, trigger, summary, subjects, feel, embedding, embedding_model, embedding_dim)
+     select a.id, s.id, 'manual', $3, array['bluehammer', 'drill'], 'wry', $4::vector, 'bge-base-en-v1.5', 768
+     from a, s
+     returning id`,
+    [teammateAgent, `${teammateAgent}-probe-session`, plantedText, `[${vector.join(",")}]`],
+  );
+  if (!planted.rows.length) throw new Error("could not plant the teammate memory the weighting check needs");
+
+  await send("Search memory again for the bluehammer drill and report every hit with its score.");
+  const secondStart = await waitFor((e) => e.type === "tool_execution_start" && e.toolName === "memory_search", 120_000, "a second memory_search call");
+  const secondSearch = await waitFor((e) => e.type === "tool_execution_end" && e.toolCallId === secondStart.toolCallId, 60_000, "the second memory_search to finish");
+  const search2 = String(secondSearch.result?.content?.[0]?.text ?? "");
+  const lines = search2.split("\n").filter((line) => line.startsWith("- "));
+  console.log(`recall:  ${lines.join("\n         ")}`);
+  if (lines.length < 2) throw new Error(`recall found ${lines.length} row(s); this agent's dream and the planted teammate memory should both be findable`);
+  if (!search2.includes("[vector similar")) throw new Error("recall produced no vector similarity score, so the hnsw path did not run");
+  if (!lines[0].startsWith("- mine ")) throw new Error(`own memory should be the first hit, got: ${lines[0]}`);
+  if (!lines.some((line) => line.includes(teammateAgent))) throw new Error(`the teammate memory (${teammateAgent}) was not recalled at all`);
+  if (!lines[1].includes(teammateAgent)) throw new Error(`the teammate hit should rank below the own hit: ${lines.map((line) => line.slice(0, 60)).join(" | ")}`);
+  console.log(`         own hit above the teammate hit: weighting confirmed (own 1.0, other 0.65)`);
   console.log(`newest memory: ${JSON.stringify(memory.rows[0] ?? null)}`);
   console.log(`spool remaining: ${spoolRemain}`);
 
@@ -158,25 +194,13 @@ try {
   if (spoolRemain > 0) problems.push(`${spoolRemain} row(s) left in the spool, which means a write failed and was buffered rather than written`);
   if (!memory.rows[0]) problems.push("no memory row to inspect");
   else if (!memory.rows[0].span_last_event) problems.push("the memory is not anchored to the events it summarised (span_last_event is null)");
-  // Not a failure, a fact worth printing while the decision is live: the vector column is still empty until the
-  // embedder is wired, and a memory without a vector is only reachable through the keyword path.
-  console.log(`vector written: ${memory.rows[0]?.has_vector ?? false} (empty until the embedder is wired; keyword recall still finds the row)`);
+  // Not a failure, a fact worth printing: a memory whose embedder call failed is still written, and from then on it
+  // is reachable only through the keyword path. Which model answered, and how many tokens it cost, belongs on the row.
+  console.log(`vector written: ${memory.rows[0]?.has_vector ?? false} via ${memory.rows[0]?.embedding_model ?? "no embedder"}; dim ${memory.rows[0]?.embedding_dim ?? "-"}`);
   if (searchResult.isError) problems.push("memory_search reported an error");
 
-  if (!keep) {
-    // One statement with several DELETE CTEs would let Postgres check the foreign keys in an order this script does
-    // not control; deleting in dependency order one statement at a time does.
-    const deleted = {};
-    for (const table of ["memory", "event", "session", "agent"]) {
-      const where = table === "agent" ? "id" : "agent_id";
-      const result = await db.query(`delete from ${table} where ${where} = $1`, [agent]);
-      deleted[table] = result.rowCount;
-    }
-    console.log(`cleaned up: ${JSON.stringify(deleted)}`);
-    await db.query("refresh materialized view subject_index");
-  } else {
-    console.log(`--keep-rows: left the "${agent}" rows in the store`);
-  }
+  if (!keep) await cleanProbeRows();
+  else console.log(`--keep-rows: left the "${agent}" rows in the store`);
 
   if (problems.length) {
     console.error(`FAILED:\n- ${problems.join("\n- ")}`);
@@ -187,6 +211,15 @@ try {
   console.log("PASS: turns recorded, read path answered, dream wrote a memory with a subject line and a feel.");
 } catch (error) {
   console.error(`FAILED: ${error?.message ?? error}`);
+  // A probe that dies halfway must not leave its rows behind: a fabricated memory in a shared store is worse than a
+  // failed check, and every run before this rule existed left another dozen events in there.
+  if (!keep) {
+    try {
+      await cleanProbeRows();
+    } catch (cleanupError) {
+      console.error(`cleanup after failure also failed: ${cleanupError?.message ?? cleanupError}`);
+    }
+  }
   process.exit(1);
 } finally {
   if (pi && !pi.killed) pi.kill("SIGTERM");
@@ -195,6 +228,22 @@ try {
   } catch {
     /* the connection may already be gone */
   }
+}
+
+async function cleanProbeRows() {
+  // Deleting in dependency order one statement at a time: a single statement with several DELETE CTEs would let
+  // Postgres check the foreign keys in an order this script does not control.
+  const deleted = {};
+  for (const table of ["memory", "event", "session", "agent"]) {
+    const result =
+      table === "agent"
+        ? await db.query(`delete from agent where name = any($1::text[])`, [[agent, teammateAgent]])
+        : await db.query(`delete from ${table} where agent_id in (select id from agent where name = any($1::text[]))`, [[agent, teammateAgent]]);
+    deleted[table] = result.rowCount;
+  }
+  const left = await db.query(`select (select count(*) from agent) as agents, (select count(*) from event) as events, (select count(*) from memory) as memories`, []);
+  console.log(`cleaned up: ${JSON.stringify(deleted)}; store now holds ${JSON.stringify(left.rows[0] ?? {})}`);
+  await db.query("refresh materialized view subject_index");
 }
 
 async function counts(agentId) {

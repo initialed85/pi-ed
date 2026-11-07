@@ -75,6 +75,18 @@ interface Config {
   /** Minutes of idleness, and minutes after a resume, before a dream runs. */
   idleDreamMinutes?: number;
   resumeDreamMinutes?: number;
+  /** Turn the vectors off without turning dreaming off: memories land unembedded and only the keyword path finds them. */
+  embeddings?: boolean;
+  /** An OpenAI-compatible embeddings service. Same shape as the other home-dev model services, so the config - not
+   *  this file - is what knows which model is answering. */
+  embedUrl?: string;
+  embedModel?: string;
+  /** Characters per embedder request. The service's window is 512 tokens; see the embeddings section. */
+  embedMaxChars?: number;
+  embedTimeoutMs?: number;
+  /** Retrieval weights: this agent's memories, and everybody else's. */
+  ownWeight?: number;
+  otherWeight?: number;
 }
 
 const DEFAULTS = {
@@ -83,7 +95,17 @@ const DEFAULTS = {
   maxTextChars: 12_000,
   idleDreamMinutes: 10,
   resumeDreamMinutes: 10,
-} satisfies Partial<Config>;
+  embeddings: true,
+  embedUrl: "https://embeddings.dev.initialed85.cc",
+  embedModel: "bge-base-en-v1.5",
+  embedMaxChars: 1_400,
+  // Generous, because the first call after an idle period pays for a DNS lookup in a cluster-shaped resolv.conf
+  // (five search domains, ndots 5) as well as the model, and a dream that gives up at 15 seconds is a dream that
+  // silently produces unembedded memories.
+  embedTimeoutMs: 30_000,
+  ownWeight: 1,
+  otherWeight: 0.65,
+} satisfies Required<Pick<Config, "dreams" | "flushMs" | "maxTextChars" | "idleDreamMinutes" | "resumeDreamMinutes" | "embeddings" | "embedUrl" | "embedModel" | "embedMaxChars" | "embedTimeoutMs" | "ownWeight" | "otherWeight">>;
 
 function readConfigFile(path: string): Partial<Config> {
   if (!existsSync(path)) return {};
@@ -438,12 +460,16 @@ export function sessionStatement(options: { sessionId: string; agentId: string; 
  * tell a half-remembered thing from a certain one. `score` is the text rank plus the identity weight (1.0 own, 0.65
  * teammate), which is what the query ordered by, so what the agent reads is what the store actually did.
  */
-export function formatMemoryHit(row: Record<string, unknown>, agentId: string): string {
-  const mine = row.agent_id === agentId;
+export function formatMemoryHit(row: Record<string, unknown>, agentId: string, path: RetrievalPath = "text"): string {
+  const mine = typeof row.mine === "boolean" ? row.mine : row.agent_id === agentId;
   const subjects = Array.isArray(row.subjects) ? (row.subjects as string[]).join(", ") : "";
   const feel = row.feel ? ` — felt: ${String(row.feel)}` : "";
-  const score = (Number(row.rank) || 0) + (Number(row.weight) || 0);
-  return `- ${mine ? "mine" : String(row.agent_id)} ${String(row.created_at ?? "").slice(0, 16)} [score ${score.toFixed(3)}] [${subjects}] ${String(row.summary ?? "")}${feel}`;
+  const similarity = Number(row.similarity);
+  const score = Number.isFinite(Number(row.score))
+    ? Number(row.score)
+    : (Number(row.rank) || 0) + (Number(row.weight) || 0);
+  const measure = Number.isFinite(similarity) ? `similar ${similarity.toFixed(3)}` : `score ${score.toFixed(3)}`;
+  return `- ${mine ? "mine" : String(row.agent_id)} ${String(row.created_at ?? "").slice(0, 16)} [${path} ${measure}] [${subjects}] ${String(row.summary ?? "")}${feel}`;
 }
 
 export function keywordSearch(query: string, agentId: string, options: { limit?: number; sinceDays?: number; ownOnly?: boolean } = {}): Statement {
@@ -473,7 +499,186 @@ export function subjectsStatement(agentId: string, limit = 12): Statement {
 }
 
 /** How a memory row is written, with the span of events it summarizes resolved in SQL rather than guessed here. */
-export function dreamStatement(options: { sessionId: string; agentId: string; trigger: Trigger; summary: string; subjects: string[]; feel?: string }): Statement {
+/* ------------------------------------------------------------------ embeddings
+
+A vector is not something this extension computes. `embeddings.dev.initialed85.cc` is a home-dev service running
+BAAI/bge-base-en-v1.5 (GGUF F16, 768 dimensions, CLS pooling, L2-normalised output) on a GPU slice, deployed by
+home-ops in the same shape as the image classifier and the sentiment analyzer. The client is deliberately the
+OpenAI-compatible one so that changing model, quantisation or server is a config line and not a code change - and so a
+teammate's agent can use the same service with no shared code.
+
+Three facts from the deployment shape this client:
+
+- The window is the model's, not the server's. bge-base was trained at 512 tokens and llama.cpp answers HTTP 500
+  above it ("input (646 tokens) is too large to process"). Truncating a summary would silently change what its vector
+  means, so long text is split and the vectors averaged, which is both what a long summary actually asks for and
+  stable enough to compare against a shorter one later.
+- The dimension is part of the store's promise. `memory.embedding` is `vector (768)` with a check on
+  `embedding_dim`, so a service that answers some other length is a failure to be reported, not a value to write and
+  quietly make old and new rows incomparable.
+- `usage.prompt_tokens` comes back free and is stored on the memory row, because "how much of the model did this
+  dream cost" is the kind of number that only exists if somebody writes it down when it is available.
+
+Documents and queries are embedded the same way, with no instruction prefix. That is what makes the distance in
+`memory_search` mean something: a prefixed query against unprefixed documents is a comparison between two different
+sentences about the text. */
+
+export const EMBEDDING_DIMENSIONS = 768;
+
+/** The text a memory's vector stands for: what happened, what it was about, and how it felt. */
+export function memoryText(summary: string, subjects: string[] = [], feel?: string): string {
+  const parts = [summary.trim()];
+  if (subjects.length) parts.push(`subjects: ${subjects.join(", ")}`);
+  if (feel?.trim()) parts.push(`feel: ${feel.trim()}`);
+  return parts.filter(Boolean).join("\n");
+}
+
+/**
+ * Split for the embedder without breaking a word or a sentence in half.
+ *
+ * Sentence boundaries first, because a chunk that starts mid-sentence embeds worse than a slightly uneven chunk. If a
+ * single sentence is longer than the window, it falls back to word boundaries rather than a character slice.
+ */
+export function chunkForEmbedding(text: string, maxChars = DEFAULTS.embedMaxChars): string[] {
+  const limit = Math.max(64, Math.floor(maxChars));
+  const sentences = text.replace(/\s+/g, " ").trim().split(/(?<=[.!?])\s+/);
+  const chunks: string[] = [];
+  let current = "";
+  for (const sentence of sentences) {
+    if (!sentence) continue;
+    if (sentence.length > limit) {
+      if (current) {
+        chunks.push(current);
+        current = "";
+      }
+      let piece = "";
+      for (const word of sentence.split(/\s+/)) {
+        // A single token longer than the window is sliced. Words are normally the unit of meaning, but the
+        // alternative is a request the embedder is guaranteed to reject, and a hard slice still embeds as the text
+        // it is - which is what a runaway base64 blob or a machine-generated path actually is.
+        if (word.length > limit) {
+          if (piece) {
+            chunks.push(piece);
+            piece = "";
+          }
+          for (let start = 0; start < word.length; start += limit) chunks.push(word.slice(start, start + limit));
+          continue;
+        }
+        if (piece && `${piece} ${word}`.length > limit) {
+          chunks.push(piece);
+          piece = word;
+        } else {
+          piece = piece ? `${piece} ${word}` : word;
+        }
+      }
+      if (piece) chunks.push(piece);
+      continue;
+    }
+    if (current && `${current} ${sentence}`.length > limit) {
+      chunks.push(current);
+      current = sentence;
+    } else {
+      current = current ? `${current} ${sentence}` : sentence;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks.length ? chunks : [text.trim() || " "];
+}
+
+/** Average unit vectors and put the length back to one, so a four-chunk memory is comparable to a one-chunk one. */
+export function meanNormalised(vectors: number[][]): number[] | undefined {
+  if (!vectors.length) return undefined;
+  const dimensions = vectors[0]?.length ?? 0;
+  if (!dimensions) return undefined;
+  const total = new Array<number>(dimensions).fill(0);
+  for (const vector of vectors) {
+    if (vector.length !== dimensions) return undefined;
+    for (let index = 0; index < dimensions; index += 1) {
+      const value = Number(vector[index]);
+      if (!Number.isFinite(value)) return undefined;
+      total[index] += value;
+    }
+  }
+  const norm = Math.sqrt(total.reduce((sum, value) => sum + value * value, 0));
+  if (!Number.isFinite(norm) || norm === 0) return undefined;
+  return total.map((value) => value / norm);
+}
+
+export type RetrievalPath = "vector" | "text";
+
+/** A discriminated union rather than two optional fields: `embedded.ok` has to be the thing TypeScript branches on,
+ *  or every later use of `.vector` and `.error` is an assertion waiting to be wrong. */
+export type EmbedResult = { ok: true; vector: number[]; tokens: number; chunks: number; model: string } | { ok: false; error: string };
+
+/** One call, all chunks in it. `input` is an array because that is the OpenAI-compatible way to ask for several. */
+export async function embedText(text: string, cfg: Config, fetchImpl: typeof fetch = fetch): Promise<EmbedResult> {
+  const model = cfg.embedModel ?? DEFAULTS.embedModel;
+  const startedAt = Date.now();
+  const elapsed = (): string => `after ${Date.now() - startedAt}ms`;
+  if (cfg.embeddings === false) return { ok: false, error: "embeddings are switched off in this repository's memory config" };
+  const url = (cfg.embedUrl ?? DEFAULTS.embedUrl).replace(/\/+$/, "");
+  const chunks = chunkForEmbedding(text, cfg.embedMaxChars ?? DEFAULTS.embedMaxChars);
+  try {
+    const response = await fetchImpl(`${url}/v1/embeddings`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      // Exactly the body the deployment was verified against. An extra field here is a 400 from a server that does
+      // not know it, and 400 looks identical to a client bug from the agent's side.
+      body: JSON.stringify({ model, input: chunks }),
+      signal: AbortSignal.timeout(cfg.embedTimeoutMs ?? DEFAULTS.embedTimeoutMs),
+    });
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      return { ok: false, error: `embedder ${url} answered ${response.status} ${elapsed()}${detail ? `: ${detail.slice(0, 160)}` : ""}` };
+    }
+    const payload = (await response.json()) as { data?: { embedding?: number[] }[]; usage?: { prompt_tokens?: number } };
+    const vectors = (payload?.data ?? []).map((item) => item?.embedding ?? []);
+    if (vectors.length !== chunks.length) return { ok: false, error: `embedder returned ${vectors.length} vector(s) for ${chunks.length} chunk(s)` };
+    for (const vector of vectors) {
+      if (vector.length !== EMBEDDING_DIMENSIONS) {
+        return { ok: false, error: `embedder returned ${vector.length} dimensions; this store's column is ${EMBEDDING_DIMENSIONS}` };
+      }
+    }
+    const vector = meanNormalised(vectors);
+    if (!vector) return { ok: false, error: "embedder returned no usable numbers" };
+    return { ok: true, vector, tokens: Number(payload?.usage?.prompt_tokens ?? 0), chunks: chunks.length, model };
+  } catch (error) {
+    return { ok: false, error: `embedder ${url} unreachable ${elapsed()}: ${error instanceof Error ? error.message : String(error)}${error instanceof Error && error.cause ? ` (${String((error as { cause?: unknown }).cause)})` : ""}` };
+  }
+}
+
+/**
+ * The schema's own retrieval function.
+ *
+ * hnsw orders by distance alone, so `memory_search` in 001_init.sql takes the nearest neighbours first and applies
+ * the own/teammate weighting afterwards over that small candidate set. `own_only` is filtered here rather than in
+ * SQL for the same reason: the filter belongs after the index, and a candidate set this small makes that cheap.
+ */
+export function vectorSearch(agentId: string, vector: number[], options: { limit?: number; sinceDays?: number; ownWeight?: number; otherWeight?: number } = {}): Statement {
+  const limit = Math.min(50, Math.max(1, Math.floor(options.limit ?? 8)));
+  const sinceDays = Math.max(1, Math.floor(options.sinceDays ?? 365));
+  return {
+    sql: `select * from memory_search($1, $2::vector, $3, $4, $5, now() - make_interval(days => $6::int))`,
+    values: [agentId, `[${vector.join(",")}]`, limit, options.ownWeight ?? cfgWeights(options).own, options.otherWeight ?? cfgWeights(options).other, sinceDays],
+  };
+}
+
+function cfgWeights(options: { ownWeight?: number; otherWeight?: number }): { own: number; other: number } {
+  return { own: options.ownWeight ?? DEFAULTS.ownWeight, other: options.otherWeight ?? DEFAULTS.otherWeight };
+}
+
+export function dreamStatement(options: {
+  sessionId: string;
+  agentId: string;
+  trigger: Trigger;
+  summary: string;
+  subjects: string[];
+  feel?: string;
+  vector?: number[];
+  model?: string;
+  detail?: Record<string, unknown>;
+}): Statement {
+  const vector = options.vector ? `[${options.vector.join(",")}]` : null;
   return {
     sql: `with span as (
             select min(id) as first_id, max(id) as last_id
@@ -481,10 +686,24 @@ export function dreamStatement(options: { sessionId: string; agentId: string; tr
             where session_id = $1
               and seq > coalesce((select dream_seq from session where id = $1), 0)
           )
-          insert into memory (agent_id, session_id, trigger, span_first_event, span_last_event, summary, subjects, feel, detail)
-          select $2, $1, $3, span.first_id, span.last_id, $4, $5, $6, jsonb_build_object('written_by', 'memory_dream')
+          insert into memory (agent_id, session_id, trigger, span_first_event, span_last_event, summary, subjects, feel, detail, embedding, embedding_model, embedding_dim)
+          select $2, $1, $3, span.first_id, span.last_id, $4, $5, $6, $7::jsonb, $8::vector, $9, $10
           from span`,
-    values: [options.sessionId, options.agentId, options.trigger, options.summary, options.subjects, options.feel ?? null],
+    // The cast on the vector is what makes a parameter a pgvector value rather than a string Postgres has to guess
+    // about, and `embedding_model`/`embedding_dim` travel with it: when the embedder changes, old rows keep saying
+    // which model produced them instead of silently becoming wrong.
+    values: [
+      options.sessionId,
+      options.agentId,
+      options.trigger,
+      options.summary,
+      options.subjects,
+      options.feel ?? null,
+      JSON.stringify(options.detail ?? { written_by: "memory_dream" }),
+      vector,
+      vector ? (options.model ?? null) : null,
+      vector ? EMBEDDING_DIMENSIONS : null,
+    ],
   };
 }
 
@@ -541,6 +760,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
   let lastError = "";
   let lastFlushAt = 0;
   let written = 0;
+  let lastEmbed: { at: number; tokens?: number; chunks?: number; model?: string; error?: string } | undefined;
   let queued: Row[] = [];
   const seen = new Set<string>();
   let flushTimer: NodeJS.Timeout | undefined;
@@ -750,15 +970,46 @@ export default function memoryExtension(api: ExtensionAPI): void {
         return { content: [{ type: "text", text: `memory_search unavailable: ${reason}. Any memory this agent produced is in the local spool.` }], details: { error: reason } };
       }
       const agent = agentIdentity(ctx, cfg);
-      const statement = keywordSearch(String(params.query ?? ""), agent, { limit: params.limit, sinceDays: params.since_days, ownOnly: params.own_only });
+      const limit = Math.min(50, Math.max(1, Math.floor(params.limit ?? 8)));
+      const query = String(params.query ?? "");
+      // Vector recall is the primary path and text recall is the safety net under it: an unembedded memory - one
+      // written while the embedder was down - is still a memory, and a query that misses semantically but matches a
+      // word should still find it. Both are run rather than chosen between, and the ids are deduplicated so a hit
+      // that both paths found is reported once, by the path that scored it best.
+      const embedded = await embedText(query, cfg);
+      const rows: Record<string, unknown>[] = [];
+      const seenIds = new Set<string>();
+      let note = "";
       let client: Awaited<ReturnType<Db["connect"]>> | undefined;
       try {
         client = await db.connect();
-        const result = await client.query(statement.sql, statement.values);
-        const rows = result.rows;
-        const lines = rows.map((row) => formatMemoryHit(row, agent));
-        const text = rows.length ? lines.join("\n") : `no memories match "${params.query}" for ${agent}`;
-        return { content: [{ type: "text", text }], details: { count: rows.length } };
+        if (embedded.ok) {
+          const statement = vectorSearch(agent, embedded.vector, { limit, sinceDays: params.since_days, ownWeight: cfg.ownWeight, otherWeight: cfg.otherWeight });
+          const result = await client.query(statement.sql, statement.values);
+          for (const row of result.rows) {
+            if (params.own_only && row.mine !== true) continue;
+            if (seenIds.has(String(row.id))) continue;
+            seenIds.add(String(row.id));
+            rows.push(row);
+          }
+        } else {
+          note = ` (vector recall unavailable: ${embedded.error})`;
+        }
+        if (rows.length < limit) {
+          const textStatement = keywordSearch(query, agent, { limit: limit - rows.length, sinceDays: params.since_days, ownOnly: params.own_only });
+          const result = await client.query(textStatement.sql, textStatement.values);
+          for (const row of result.rows) {
+            if (seenIds.has(String(row.id))) continue;
+            seenIds.add(String(row.id));
+            rows.push(row);
+          }
+        }
+        const lines = rows.map((row) => formatMemoryHit(row, agent, Number.isFinite(Number(row.similarity)) ? "vector" : "text"));
+        const text = rows.length ? lines.join("\n") : `no memories match "${query}" for ${agent}${note}`;
+        return {
+          content: [{ type: "text", text }],
+          details: { count: rows.length, vector: embedded.ok, note: note || undefined },
+        };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         return { content: [{ type: "text", text: `memory_search failed: ${message}` }], details: { error: message } };
@@ -775,7 +1026,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
     promptSnippet: "Write one memory for the stretch just worked on",
     parameters: Type.Object({
       summary: Type.String({ description: "Two to four sentences about what happened and what matters later" }),
-      subjects: Type.Array(Type.String(), { description: "Three to six loose generic labels; the index a future self scans" }),
+      subjects: Type.Union([Type.Array(Type.String()), Type.String()], { description: "Three to six loose generic labels; the index a future self scans. A single comma-separated string is accepted too" }),
       feel: Type.String({ description: "One honest line about how the stretch felt" }),
     }),
     annotations: { readOnlyHint: false, idempotentHint: false },
@@ -788,7 +1039,12 @@ export default function memoryExtension(api: ExtensionAPI): void {
       }
       const summary = String(params.summary ?? "").trim();
       if (!summary) return { content: [{ type: "text", text: "memory_dream needs a summary" }], details: { error: "missing summary" } };
-      const subjects = (params.subjects ?? []).map((subject) => String(subject).trim().toLowerCase()).filter(Boolean).slice(0, 8);
+      // One string rather than an array is the most common way a model misses this parameter, and the difference
+      // between a dream written and a dream refused should not be a comma.
+      const subjects = (Array.isArray(params.subjects) ? params.subjects : String(params.subjects ?? "").split(","))
+        .map((subject) => String(subject).trim().toLowerCase())
+        .filter(Boolean)
+        .slice(0, 8);
       const feel = String(params.feel ?? "").trim() || undefined;
       const sessionId = sessionIdOf(ctx);
       const agent = agentIdentity(ctx, cfg);
@@ -802,8 +1058,29 @@ export default function memoryExtension(api: ExtensionAPI): void {
         if (flushFailure) {
           return { content: [{ type: "text", text: `memory_dream not written: the events it would summarise are not in the store (${flushFailure}). The summary is worth keeping; say it in the reply and try again once the store is reachable.` }], details: { error: flushFailure } };
         }
+        // The vector is written when the embedder answers and omitted when it does not. A memory without a vector is
+        // still findable by keywords and still says in its own `detail` why it has no vector, which is better than a
+        // dream that fails outright because one optional service was having a bad afternoon.
+        const embedded = await embedText(memoryText(summary, subjects, feel), cfg);
+        lastEmbed = embedded.ok
+          ? { at: Date.now(), tokens: embedded.tokens, chunks: embedded.chunks, model: embedded.model }
+          : { at: Date.now(), error: embedded.error };
+        const detail: Record<string, unknown> = embedded.ok
+          ? { written_by: "memory_dream", embed_model: embedded.model, embed_chunks: embedded.chunks, embed_tokens: embedded.tokens }
+          : { written_by: "memory_dream", embed_error: embedded.error };
+
         client = await db.connect();
-        const dream = dreamStatement({ sessionId, agentId: agent, trigger, summary, subjects, feel });
+        const dream = dreamStatement({
+          sessionId,
+          agentId: agent,
+          trigger,
+          summary,
+          subjects,
+          feel,
+          vector: embedded.ok ? embedded.vector : undefined,
+          model: embedded.ok ? embedded.model : undefined,
+          detail,
+        });
         await client.query(dream.sql, dream.values);
         const cursor = dreamCursorStatement(sessionId);
         await client.query(cursor.sql, cursor.values);
@@ -811,8 +1088,12 @@ export default function memoryExtension(api: ExtensionAPI): void {
         dreamStartedAt = 0;
         dreamed = seen.size;
         triggers.delete(sessionId);
-        if (ctx.hasUI) ctx.ui.notify(`memory: dream written (${subjects.join(", ") || "no subjects"})`, "info");
-        return { content: [{ type: "text", text: `dream recorded for session ${sessionId} (${trigger}); subjects: ${subjects.join(", ") || "none"}` }], details: { subjects, trigger } };
+        const vectorNote = embedded.ok ? `vector from ${embedded.model} (${embedded.tokens} tokens, ${embedded.chunks} chunk(s))` : `no vector (${embedded.error})`;
+        if (ctx.hasUI) ctx.ui.notify(`memory: dream written (${subjects.join(", ") || "no subjects"}, ${vectorNote})`, "info");
+        return {
+          content: [{ type: "text", text: `dream recorded for session ${sessionId} (${trigger}); subjects: ${subjects.join(", ") || "none"}; ${vectorNote}` }],
+          details: { subjects, trigger, embedded: embedded.ok, embed: embedded.ok ? { tokens: embedded.tokens, chunks: embedded.chunks, model: embedded.model } : embedded.error },
+        };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         // "not written" rather than the raw Postgres text: a connection refusal and a constraint violation are both
@@ -864,6 +1145,8 @@ export default function memoryExtension(api: ExtensionAPI): void {
         }
       }
       lines.push(`dreams     ${cfg.dreams ? `idle ${cfg.idleDreamMinutes ?? DEFAULTS.idleDreamMinutes}m, resume ${cfg.resumeDreamMinutes ?? DEFAULTS.resumeDreamMinutes}m, before compaction` : "off"}`);
+      lines.push(`embedder   ${cfg.embeddings === false ? "off (memories will be written without vectors)" : `${cfg.embedUrl ?? DEFAULTS.embedUrl} · ${cfg.embedModel ?? DEFAULTS.embedModel} · ${EMBEDDING_DIMENSIONS}-dim`}`);
+      if (lastEmbed) lines.push(`last embed ${lastEmbed.error ? `failed: ${lastEmbed.error}` : `${lastEmbed.model} ${lastEmbed.tokens} tokens in ${lastEmbed.chunks} chunk(s)`}`);
       // The widget is the output: a command that answers with a wall of text in the transcript is a command that
       // pollutes the session it was run in. Pi's command handlers return nothing.
       if (ctx.hasUI) ctx.ui.setWidget("memory", lines);

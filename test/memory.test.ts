@@ -322,24 +322,158 @@ describe("sql", () => {
     const { formatMemoryHit } = await loadModule();
     const own = formatMemoryHit!({ agent_id: "home-ops", created_at: "2026-11-08T01:00:00.000Z", subjects: ["infra", "memory"], summary: "shipped the store", feel: "pleased", rank: 0.35, weight: 1 }, "home-ops");
     expect(own).toContain("mine ");
-    expect(own).toContain("[score 1.350]");
+    expect(own).toContain("[text score 1.350]");
     expect(own).toContain("[infra, memory]");
     expect(own).toContain("felt: pleased");
     const teammate = formatMemoryHit!({ agent_id: "coral", created_at: "2026-11-08T01:00:00.000Z", subjects: ["dns"], summary: "fixed dns", rank: 0, weight: 0.65 }, "home-ops");
     expect(teammate).toContain("coral ");
     expect(teammate).not.toContain("mine ");
-    expect(teammate).toContain("[score 0.650]");
+    expect(teammate).toContain("[text score 0.650]");
   });
 
   it("spans a dream over the events the last dream did not cover", async () => {
     const { dreamStatement, dreamCursorStatement } = await loadModule();
     const dream = dreamStatement!({ sessionId: "s1", agentId: "a1", trigger: "idle10m", summary: "shipped it", subjects: ["infra"], feel: "pleased" });
     expect(dream.sql).toContain("seq > coalesce((select dream_seq from session where id = $1), 0)");
-    expect(dream.values).toEqual(["s1", "a1", "idle10m", "shipped it", ["infra"], "pleased"]);
+    expect(dream.values).toEqual(["s1", "a1", "idle10m", "shipped it", ["infra"], "pleased", JSON.stringify({ written_by: "memory_dream" }), null, null, null]);
     const cursor = dreamCursorStatement!("s1");
     expect(cursor.sql).toContain("set dream_seq = (select coalesce(max(seq), dream_seq) from event where session_id = $1)");
   });
+
+  it("carries the model and the dimension with the vector, and nothing when there is no vector", async () => {
+    const { dreamStatement } = await loadModule();
+    const vector = new Array(768).fill(0.001);
+    const dream = dreamStatement!({ sessionId: "s1", agentId: "a1", trigger: "manual", summary: "s", subjects: [], vector, model: "bge-base-en-v1.5", detail: { embed_tokens: 7 } });
+    expect(dream.sql).toContain("embedding, embedding_model, embedding_dim");
+    expect(dream.sql).toContain("$8::vector");
+    // A pgvector value arrives as a bracketed literal: a JS array parameter is a Postgres array, and `::vector` on a
+    // string is the difference between a vector column and a table that quietly holds text.
+    expect(dream.values[7]).toBe(`[${vector.join(",")}]`);
+    expect(dream.values[8]).toBe("bge-base-en-v1.5");
+    expect(dream.values[9]).toBe(768);
+    expect(JSON.parse(String(dream.values[6]))).toEqual({ embed_tokens: 7 });
+  });
 });
+
+describe("embeddings", () => {
+  it("embeds the whole memory, not just the summary", async () => {
+    const { memoryText } = await loadModule();
+    expect(memoryText!("shipped the store", ["infra", "memory"], "pleased")).toBe("shipped the store\nsubjects: infra, memory\nfeel: pleased");
+    expect(memoryText!("only the summary")).toBe("only the summary");
+  });
+
+  it("splits at sentences rather than mid-word, because the window is the model's", async () => {
+    const { chunkForEmbedding } = await loadModule();
+    expect(chunkForEmbedding!("one sentence. another sentence.", 80)).toEqual(["one sentence. another sentence."]);
+    const two = chunkForEmbedding!(`${"x".repeat(38)}. ${"y".repeat(38)}.`, 64);
+    expect(two).toEqual([`${"x".repeat(38)}.`, `${"y".repeat(38)}.`]);
+    // A single long sentence falls back to word boundaries rather than slicing a word in half, because a chunk that
+    // starts mid-word embeds as noise.
+    const long = chunkForEmbedding!("word ".repeat(40), 80);
+    expect(long.length).toBeGreaterThan(1);
+    expect(long.every((chunk: string) => chunk.length <= 80)).toBe(true);
+    expect(long.every((chunk: string) => chunk.split(" ").every((word: string) => word === "word"))).toBe(true);
+    expect(chunkForEmbedding!("", 1400)).toEqual([" "]);
+    // A token longer than the window is sliced rather than sent whole: the choice is between a vector over part of a
+    // runaway blob and a request the embedder is guaranteed to answer 500 to.
+    const runaway = chunkForEmbedding!("x".repeat(3000), 1400);
+    expect(runaway.every((chunk: string) => chunk.length <= 1400)).toBe(true);
+    expect(runaway.length).toBe(3);
+    // A configured window this side of usable is clamped rather than honoured: a 1-character window would mean
+    // thousands of requests to a service that costs a GPU slice to answer one.
+    expect(chunkForEmbedding!("word ".repeat(40), 8).length).toBeGreaterThan(1);
+    expect(chunkForEmbedding!("word ".repeat(40), 8).every((chunk: string) => chunk.length <= 64)).toBe(true);
+  });
+
+  it("averages chunks back to a unit vector, and refuses mismatched shapes", async () => {
+    const { meanNormalised } = await loadModule();
+    const averaged = meanNormalised([[1, 0, 0], [0, 1, 0]])!;
+    expect(averaged[0]).toBeCloseTo(Math.SQRT1_2);
+    expect(averaged[2]).toBe(0);
+    expect(Math.sqrt(averaged.reduce((sum: number, v: number) => sum + v * v, 0))).toBeCloseTo(1);
+    expect(meanNormalised([[1, 0], [0, 1, 0]])).toBeUndefined();
+    expect(meanNormalised([[Number.NaN, 1]])).toBeUndefined();
+    expect(meanNormalised([[0, 0]])).toBeUndefined();
+    expect(meanNormalised([])).toBeUndefined();
+  });
+
+  it("asks the embedder the question the deployment was verified against", async () => {
+    const { embedText } = await loadModule();
+    const calls: { url: string; body: any }[] = [];
+    const fetchImpl = (async (url: string, init: any) => {
+      calls.push({ url: String(url), body: JSON.parse(String(init.body)) });
+      return new Response(JSON.stringify({ data: [{ embedding: new Array(768).fill(0.5) }], usage: { prompt_tokens: 7 } }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const result = await embedText!("the pgvector store", { embedUrl: "https://embeddings.example", embedModel: "bge-base-en-v1.5" }, fetchImpl);
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("unreachable");
+    expect(result.tokens).toBe(7);
+    expect(result.model).toBe("bge-base-en-v1.5");
+    expect(calls[0]!.url).toBe("https://embeddings.example/v1/embeddings");
+    // OpenAI-compatible shape: one request, `input` as an array, flat `data[].embedding`. Nothing else in the body -
+    // an unknown field is a 400 that looks to an agent exactly like a client bug.
+    expect(calls[0]!.body).toEqual({ model: "bge-base-en-v1.5", input: ["the pgvector store"] });
+  });
+
+  it("sends a long summary as several chunks in one request and averages the answers", async () => {
+    const { embedText } = await loadModule();
+    let inputs: string[] = [];
+    const fetchImpl = (async (_url: string, init: any) => {
+      inputs = JSON.parse(String(init.body)).input as string[];
+      return new Response(JSON.stringify({ data: inputs.map(() => ({ embedding: [1, 0, 0] })), usage: { prompt_tokens: 40 } }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const result = await embedText!("sentence. ".repeat(60), { embedUrl: "https://e", embedModel: "m", embedMaxChars: 200 }, fetchImpl);
+    // The dimension guard is 768, so this fixture only proves the chunking and the averaging path; the shape guard is
+    // tested on its own below.
+    expect(result.ok).toBe(false);
+    expect(result.ok ? "" : result.error).toContain("3 dimensions");
+    expect(result.ok ? "" : result.error).toContain("column is 768");
+    expect(inputs.length).toBeGreaterThan(1);
+  });
+
+  it("treats a different dimension as a failure rather than a value to write", async () => {
+    const { embedText } = await loadModule();
+    const fetchImpl = (async () => new Response(JSON.stringify({ data: [{ embedding: new Array(384).fill(0.1) }] }), { status: 200 })) as unknown as typeof fetch;
+    const result = await embedText!("q", { embedUrl: "https://e", embedModel: "m" }, fetchImpl);
+    expect(result.ok).toBe(false);
+    expect(result.ok ? "" : result.error).toContain("384 dimensions");
+  });
+
+  it("reports an embedder that answers badly, and one that does not answer at all", async () => {
+    const { embedText } = await loadModule();
+    const bad = (async () => new Response("input (646 tokens) is too large to process", { status: 500 })) as unknown as typeof fetch;
+    const tooLong = await embedText!("q", { embedUrl: "https://e", embedModel: "m" }, bad);
+    expect(tooLong.ok ? "" : tooLong.error).toContain("answered 500");
+    expect(tooLong.ok ? "" : tooLong.error).toContain("too large to process");
+
+    const down = await embedText!("q", { embedUrl: "http://127.0.0.1:1", embedModel: "m", embedTimeoutMs: 500 });
+    expect(down.ok).toBe(false);
+    expect(down.ok ? "" : down.error).toContain("unreachable");
+
+    const off = await embedText!("q", { embeddings: false });
+    expect(off.ok).toBe(false);
+    expect(off.ok ? "" : off.error).toContain("switched off");
+  });
+
+  it("asks the store's own retrieval function, weighted after the index", async () => {
+    const { vectorSearch } = await loadModule();
+    const statement = vectorSearch!("home-ops", [0.1, 0.2], { limit: 5, sinceDays: 30, ownWeight: 1, otherWeight: 0.65 });
+    expect(statement.sql).toBe("select * from memory_search($1, $2::vector, $3, $4, $5, now() - make_interval(days => $6::int))");
+    expect(statement.values).toEqual(["home-ops", "[0.1,0.2]", 5, 1, 0.65, 30]);
+    expect(vectorSearch!("a", [0], { limit: 999 }).values[2]).toBe(50);
+  });
+
+  it("labels a vector hit by similarity and a text hit by score", async () => {
+    const { formatMemoryHit } = await loadModule();
+    const vectorRow = { agent_id: "coral", mine: false, created_at: "2026-11-08T01:00:00.000Z", subjects: ["dns"], summary: "fixed dns", score: 0.565, similarity: 0.868 };
+    const line = formatMemoryHit!(vectorRow, "home-ops", "vector");
+    expect(line).toContain("coral ");
+    expect(line).toContain("[vector similar 0.868]");
+    expect(formatMemoryHit!({ ...vectorRow, mine: true }, "home-ops", "vector")).toContain("mine ");
+    expect(formatMemoryHit!({ agent_id: "home-ops", created_at: "2026-11-08T01:00:00.000Z", subjects: [], summary: "s", rank: 0.1, weight: 1 }, "home-ops", "text")).toContain("[text score 1.100]");
+  });
+});
+
 
 describe("the spool", () => {
   it("round-trips rows, and survives a torn line", async () => {
