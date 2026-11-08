@@ -395,6 +395,38 @@ describe("recording a branch", () => {
     expect(awake.filter((row) => row.meta.dream_turn === true).map((row) => `${row.kind}:${row.sourceEntryId}`)).toEqual(["marker:d2", "tool_call:d3", "tool_result:d4"]);
   });
 
+  it("finds the boundary again after a restart, with no state to remember it", async () => {
+    const { rowsFromBranch } = await loadModule();
+    // The case the previous test still leaves open: `closeDreamTurn` records the boundary in memory, and memory does
+    // not survive a pod. Roll out a fix, and every session that had already dreamed reopens the same blindness on
+    // resume. This is the transcript of a real fleet session after the 14:33 UTC bounce - a dream, its own settling
+    // turn, then three hours later a teammate wake with real work in it - and no boundary is passed.
+    const afterRollout: any[] = [
+      { type: "message", id: "w1", timestamp: "2026-11-08T12:55:00.000Z", message: { role: "user", content: "the work before the dream" } },
+      { type: "custom", id: "d2", customType: "memory:dream", timestamp: "2026-11-08T12:55:53.000Z", content: "You are dreaming." },
+      { type: "message", id: "d3", timestamp: "2026-11-08T12:56:00.000Z", message: { role: "assistant", content: [{ type: "toolCall", name: "memory_dream", arguments: { summary: "shipped" } }] } },
+      { type: "message", id: "d4", timestamp: "2026-11-08T12:56:03.000Z", message: { role: "toolResult", toolName: "memory_dream", toolCallId: "call-9", isError: false, content: [{ type: "text", text: "dream recorded" }] } },
+      { type: "custom", id: "s5", customType: "turn-stats", timestamp: "2026-11-08T12:56:05.000Z", content: "settled" },
+      { type: "custom", id: "s6", customType: "pi-team-room-wake", timestamp: "2026-11-08T16:06:24.000Z", content: "a steer from a teammate" },
+      { type: "message", id: "s7", timestamp: "2026-11-08T16:06:48.000Z", message: { role: "assistant", content: [{ type: "toolCall", name: "team_room", arguments: { action: "reply" } }] } },
+      { type: "message", id: "s8", timestamp: "2026-11-08T16:06:52.000Z", message: { role: "toolResult", toolName: "team_room", toolCallId: "call-10", isError: false, content: [{ type: "text", text: "Reply sent" }] } },
+    ];
+    // Nothing passed, nothing remembered: the boundary comes from the harness's own settling turn.
+    const rows = rowsFromBranch!(afterRollout, {}) as any[];
+    const residue = rows.filter((row) => row.meta.dream_turn === true).map((row) => row.sourceEntryId);
+    // The settling turn is the last thing the dream produced, so it counts as residue too.
+    expect(residue).toEqual(["d2", "d3", "d4", "s5"]);
+    // The teammate's reply and the work behind it are visible again, which is the whole point of the split.
+    expect(rows.filter((row) => row.meta.dream_turn !== true).map((row) => row.sourceEntryId)).toEqual(["w1", "s6", "s7", "s8"]);
+    // And a dream that never settled still falls back to the next user message rather than running forever.
+    const unsettled: any[] = [
+      { type: "custom", id: "d1", customType: "memory:dream", timestamp: "2026-11-08T12:55:53.000Z", content: "You are dreaming." },
+      { type: "message", id: "d2", timestamp: "2026-11-08T12:56:00.000Z", message: { role: "assistant", content: [{ type: "text", text: "thinking" }] } },
+      { type: "message", id: "u3", timestamp: "2026-11-08T13:00:00.000Z", message: { role: "user", content: "the user speaks again" } },
+    ];
+    expect((rowsFromBranch!(unsettled, {}) as any[]).filter((row) => row.meta.dream_turn === true).map((row) => row.sourceEntryId)).toEqual(["d1", "d2"]);
+  });
+
   it("records markers and compactions, and skips harness bookkeeping", async () => {
     const { rowsFromBranch } = await loadModule();
     const rows = rowsFromBranch!(branch(), {}) as any[];

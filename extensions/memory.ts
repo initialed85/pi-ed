@@ -377,12 +377,18 @@ export function rowsFromBranch(entries: unknown[], cfg: Config, dreamTurnEnd?: s
   // this tag a session that has dreamed once always looks like it has an unsummarized stretch, so it dreams about
   // dreaming.
   //
-  // The boundary is the end of the dream turn, which `closeDreamTurn` records as `dreamTurnEnd`. The next user
-  // message is kept as a fallback for a dream that never settled, but it cannot be the rule: a session that goes on
-  // to take a teammate steer, a scheduled prompt or a resume without the user speaking is doing real work that the
-  // tag would describe as residue, and everything after that is invisible to the gate and to the floor. This is not
-  // hypothetical - one session on the fleet had 363 rows tagged as dream residue after its dream, none of which the
-  // memory system was willing to count.
+  // The boundary is the end of the dream turn. Two ways of finding it, and the second is the important one:
+  //
+  // 1. `dreamTurnEnd`, the row `closeDreamTurn` recorded when the turn settled in this process. Precise, but it is
+  //    in-memory and it dies with the pod.
+  // 2. The first `turn-stats` after the dream started. The harness emits one every time a turn settles, so the
+  //    boundary is readable from the transcript itself, needs no state, and survives a restart.
+  //
+  // Without (2) a rollout silently reopens the bug this whole line of work was about. Observed on the fleet after the
+  // 14:33 UTC bounce: a session dreamed at 12:56, its pod restarted, and three hours later a teammate steer woke it
+  // and every row from there on was tagged residue - the dream's marker, its own turn, and then the wake, an assistant
+  // reply, a bash call and a team_room call, all of it invisible to the gate. The reason is that the next user message
+  // is the fallback, and a team-room wake is not a user message. It cannot be the rule.
   let inDreamTurn = false;
   for (const row of rows) {
     if (row.kind === "marker" && row.toolName === "memory:dream") inDreamTurn = true;
@@ -391,6 +397,7 @@ export function rowsFromBranch(entries: unknown[], cfg: Config, dreamTurnEnd?: s
     if (inDreamTurn) row.meta = { ...row.meta, dream_turn: true };
     // The boundary row itself is dream output; the turn after it is not.
     if (dreamTurnEnd && row.sourceEntryId === dreamTurnEnd) inDreamTurn = false;
+    else if (inDreamTurn && row.kind === "marker" && row.toolName === "turn-stats") inDreamTurn = false;
   }
 
   return rows.filter((row) => !skip.has(row.kind));
