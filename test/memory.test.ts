@@ -189,8 +189,51 @@ describe("identity", () => {
     expect(agentIdentity!(context as any, { agent: "explicit" })).toBe("explicit");
     expect(agentIdentity!(context as any, {})).toBe("home-ops");
     const { context: unnamed } = createContext({ cwd: "/workspace/pi-ed", sessionName: undefined });
-    const fallback = agentIdentity!(unnamed as any, {});
-    expect(fallback.split(":")[1]).toBe("pi-ed");
+    // The pod this suite runs in exports NAME, and the deployment name outranks the host below, so the last-resort
+    // branch has to be reached with it removed or the assertion is measuring the environment rather than the code.
+    const saved = process.env.NAME;
+    delete process.env.NAME;
+    try {
+      const fallback = agentIdentity!(unnamed as any, {});
+      expect(fallback.split(":")[1]).toBe("pi-ed");
+    } finally {
+      if (saved !== undefined) process.env.NAME = saved;
+    }
+  });
+
+  it("does not make a pod restart look like a different agent", async () => {
+    const { agentIdentity } = await loadModule();
+    // The case that orphans a whole agent's memories: an unnamed checkout in a pod, where `hostname()` is the pod
+    // name and therefore changes with every rollout. `NAME` is exported by the deployment and is what the schedule
+    // extension also falls back through, so the same agent must resolve to the same id across both pod names.
+    const { context } = createContext({ cwd: "/workspace/camry", sessionName: undefined });
+    const previous = process.env.NAME;
+    try {
+      process.env.NAME = "camry";
+      const first = agentIdentity!(context as any, {});
+      expect(first).toBe("camry");
+      // Called twice because the assertion that matters is that the id does not depend on anything the pod renames
+      // when it comes back; the hostname is not reachable in-process, so this pins the branch that outranks it.
+      expect(agentIdentity!(context as any, {})).toBe(first);
+      // And a session a human named still wins over the deployment's idea of who it is.
+      const { context: named } = createContext({ cwd: "/workspace/camry", sessionName: "camry-nightly" });
+      expect(agentIdentity!(named as any, {})).toBe("camry-nightly");
+    } finally {
+      if (previous === undefined) delete process.env.NAME;
+      else process.env.NAME = previous;
+    }
+    // With neither a session name nor a deployment name, the host and directory remain the last resort, and the
+    // assertion worth keeping is what that id actually looks like: in a pod the host half is the pod name
+    // (`pi-ed-5d4d47d856-f7hdv`), which is exactly why this branch is last rather than first.
+    const saved = process.env.NAME;
+    delete process.env.NAME;
+    try {
+      const lastResort = agentIdentity!(context as any, {});
+      expect(lastResort.endsWith(":camry")).toBe(true);
+      expect(lastResort.split(":")[0]).not.toBe("camry");
+    } finally {
+      if (saved !== undefined) process.env.NAME = saved;
+    }
   });
 });
 

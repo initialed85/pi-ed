@@ -164,6 +164,14 @@ export function agentIdentity(ctx: Pick<ExtensionContext, "cwd"> & Partial<Exten
   if (cfg.agent) return cfg.agent;
   const named = ctx.sessionManager?.getSessionName?.();
   if (named) return named;
+  // A checkout with no session name still has to be somebody, and the obvious answer - the host - is the one thing
+  // that is guaranteed to change. In slopyphus `hostname()` is the pod name (`camry-7fdf5564b8-mnjmb`), so an
+  // unnamed agent would write memories under one id, come back after a rollout under another, and never find them
+  // again. `NAME` is what the deployment exports for exactly this purpose, and it is the same variable the schedule
+  // extension falls back through, so two extensions now agree on who is talking. The session name still wins: a
+  // human who named a session meant it, and changing ids that are already in the store is not this fix's job.
+  const deployed = process.env.NAME?.trim();
+  if (deployed) return deployed;
   return `${hostname()}:${basename(ctx.cwd)}`;
 }
 
