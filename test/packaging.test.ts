@@ -321,9 +321,13 @@ describe("ci shape", () => {
     const ci = readFileSync(path.join(root, ".woodpecker", "ci.yaml"), "utf8");
     const testStep = ci.slice(ci.indexOf("- name: test"), ci.indexOf("- name: package-shape"));
     expect(testStep, "the k8s backend only takes resources under backend_options.kubernetes").toContain("backend_options:");
-    const limit = /limits:\s*\n\s*memory:\s*(\d+)Mi/.exec(testStep);
+    // Comments are stripped before matching rather than excluded by the pattern. A key and its value being separated
+    // by an explanation is normal YAML and the thing this repository is made of; a guard that forbids it would punish
+    // documentation, which is a worse outcome than a slightly looser match.
+    const declarations = testStep.split("\n").filter((line) => !/^\s*#/.test(line)).join("\n");
+    const limit = /limits:\s*memory:\s*(\d+)Mi/.exec(declarations);
     expect(limit, "a step whose memory limit is inherited from a backend default is a step that fails as an OOM").toBeTruthy();
-    // Measured peak was ~650 MB. Anything under 1 GiB is a re-run of the same incident waiting to happen.
-    expect(Number(limit![1]), "measured peak RSS of the test step is ~650 MB at node 22").toBeGreaterThanOrEqual(1024);
+    // Measured peak with maxWorkers 2 is ~390 MB; the pod limit also has to cover the heap caps the step hands out.
+    expect(Number(limit![1]), "measured peak RSS of the test step is ~390 MB at node 22, with two 768 MB heap caps").toBeGreaterThanOrEqual(1024);
   });
 });
