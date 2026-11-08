@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { targetedReset as resetTracked } from "./statements-cleanup.ts";
+import { snapshotQueryIds, targetedReset as resetTracked, type StatementClient } from "./statements-cleanup.ts";
 
 /**
  * The rules of the statistics view, measured against the store rather than recited.
@@ -26,6 +26,19 @@ import { targetedReset as resetTracked } from "./statements-cleanup.ts";
 
 const liveDsn = process.env.PI_LIVE_DSN ?? "";
 const PROBE = "stat_probe";
+/**
+ * Every marker this file writes into a statement, so a run can collect the litter of a run that never finished.
+ *
+ * The gate makes a cleanup refuse rows that predate the run, and that is correct for other people's rows and wrong
+ * for mine: a cancelled run left its probes here, and the next run would not touch them because they predated it. The
+ * resolution is the pre-clean in `beforeAll`, which runs on the file's own namespace *before* the gate snapshot is
+ * taken - the only reset that legitimately needs no gate, because a row whose text carries a name only this file
+ * writes was made by a run of this file. Had a submission of mine merged into an older row, the older row would name
+ * somebody else's statement, not mine.
+ *
+ * `sweep_probe` is deliberately absent: it is home-ops' marker, and neither repo reads or removes the other's rows.
+ */
+const OWN_MARKERS = [PROBE, "probe_bucket", "probe_split", "probe_sibling"];
 // A relation unique to this run, created once as a temp table. Three probes that differ only in their alias MUST land
 // on one row - that is the finding this file exists to assert - and a shared store makes that finding expensive: a
 // merged bucket is a counter other agents' statements can join, and `pg_stat_statements_reset` clears a whole bucket,
@@ -56,17 +69,39 @@ let statsResetAtBefore = "";
  * the other's counters.
  */
 const probeRows = async () =>
-  query(`select queryid, dbid, userid, calls, total_exec_time, query from pg_stat_statements where query like $1 order by queryid`, [
-    like(`%${PROBE}_%`),
-  ]);
+  query(
+    `select queryid, dbid, userid, calls, total_exec_time, query
+     from pg_stat_statements s
+     where exists (select 1 from unnest($1::text[]) m where position(m in s.query) > 0)
+     order by queryid`,
+    [OWN_MARKERS],
+  );
 
 /** Every statement this file ran against its own temp relation, including the DDL that created it. */
 const bucketRows = async () =>
   query(`select queryid, dbid, userid from pg_stat_statements where query like $1`, [like(`%${bucket}%`)]);
 
+/** The gate: ids present when this run started, taken after the pre-run sweep of its own leftovers. Module-level
+ * because the reset helper that consults it is shared by every test in the file. */
+let idsAtStart: Set<string> | undefined;
+let refusedResets = 0;
+
 /** Removes one tracked statement, in the argument order *this build* declares. The helper is shared with
- * `statements-prepare.test.ts`, which needs the same cleanup for the labels its own sweep creates. */
+ * `statements-prepare.test.ts`, which needs the same cleanup for the labels its own sweep creates.
+ *
+ * Gated on the before-snapshot, which is the difference between cleanup and somebody else's lost baseline. A row whose
+ * id was already in the view when this run started was not created by the run - it is a row the run's shape merged
+ * into, and resetting it deletes every other writer's history on that shape to remove one call of ours. The one
+ * ungated reset is the pre-run sweep in `beforeAll`, which happens before the snapshot is taken: it removes this
+ * file's own leftovers from a previous crashed run, and it is safe because the marker is a name only this file
+ * writes, and a row that carries my name in its text was created by a run of mine - had my submission merged into
+ * an older row, the older row's text would name somebody else's statement.
+ */
 const targetedReset = async (row: Record<string, unknown>) => {
+  if (idsAtStart?.has(String(row.queryid))) {
+    refusedResets += 1;
+    return;
+  }
   await resetTracked(client, row, resetArgs);
 };
 
@@ -87,13 +122,19 @@ describe.skipIf(!liveDsn)("pg_stat_statements contract", () => {
 
       statsResetAtBefore = String((await query(`select stats_reset from pg_stat_statements_info`))[0].stats_reset);
 
+      // A previous run's probes, cleared through the only route that exists: the view is not deletable in this
+      // version, so the targeted reset is the cleanup - and it doubles as the first measurement below. This is the
+      // one reset that runs without the gate, and it is the only one that legitimately can: the ids are still
+      // undefined, and the marker is a name only this file writes, so a row carrying it was made by a run of mine.
+      for (const row of await probeRows()) await targetedReset(row);
+
+      // The gate, taken before this run's own first statement. Everything created after this line is the run's to
+      // remove; everything in the set is not, and a reset aimed at it would delete another writer's counter.
+      idsAtStart = await snapshotQueryIds(client as unknown as StatementClient);
+
       // Session-scoped, so it dies with the client. Temp relations are resolved to their own OID, which is what makes
       // a probe against one structurally unreachable from any other reader's statement.
       await query(`create temp table ${bucket} (agent_id text, repo text)`);
-
-      // A previous run's probes, cleared through the only route that exists: the view is not deletable in this
-      // version, so the targeted reset is the cleanup - and it doubles as the first measurement below.
-      for (const row of await probeRows()) await targetedReset(row);
     });
 
     afterAll(async () => {
@@ -103,6 +144,9 @@ describe.skipIf(!liveDsn)("pg_stat_statements contract", () => {
       const stamp = String((await query(`select stats_reset from pg_stat_statements_info`))[0].stats_reset);
       // The window a *different* reader is measuring against is shared state. Nothing in this file may move it.
       expect(stamp).toBe(statsResetAtBefore);
+      // The gate is not decoration: a row this run merged into must have been refused, not removed. Zero refusals
+      // means nothing predating the run was touched, which is the claim a cleanup in a shared store has to make.
+      expect(refusedResets, "a reset refused by the gate is a row the run merged into; report it, do not delete it").toBe(0);
       await client.end();
     });
 
@@ -140,7 +184,11 @@ describe.skipIf(!liveDsn)("pg_stat_statements contract", () => {
 
     it("separates statements that differ in structure and merges ones that differ in literals", async () => {
       await query(`select 7011 as ${PROBE}_shape_unused from ${bucket} where false`);
-      const every = await probeRows();
+      // `probeRows()` now reads the file's whole marker namespace, because that is what the pre-clean needs to collect
+      // a cancelled run's litter. This partition is about one family of statements, so it is narrowed back to the
+      // aliases this test writes - otherwise the bucket's own `insert` rows, which carry the relation name and no
+      // probe alias, land in the "no where clause" half and read as a second family.
+      const every = (await probeRows()).filter((row) => String(row.query).includes(PROBE));
       // Both families now carry a table clause, so the partition cannot be "has a FROM" - a shared table clause
       // merges just as happily as a bare one, which is the half of the lesson a table clause alone does not teach.
       // The partition is the filter clause, which is the structure that actually separated them.

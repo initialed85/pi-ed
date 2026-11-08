@@ -29,6 +29,17 @@
  *    writer's counter. The relation is the only identifier that reliably creates a row, which is why
  *    live probes fence themselves with a private relation and the shared `hack/pg-statement-traces.mjs`
  *    reports a landing delta instead of trusting "leftovers 0".
+ *  - **A name is not a novelty fence, and the marker is only visible under one protocol.** home-ops measured
+ *    both halves. A comment, an alias and a label are all outside the hash, so a marker-carrying probe whose
+ *    shape already exists lands on a row somebody else created first: their marker search returned 0 rows
+ *    while 10 shared counters each grew by one of their calls. The construction that makes a shape novel is
+ *    a private wrapper, `select * from (<statement>) as <run_token>`. And a `prepare` label reaches the stored
+ *    text only under the *simple* protocol (`client.query(sql)` with no values, `psql -c`); an
+ *    extended-protocol or Parse-preparing client never stores it, so "0 rows carry my label" is a claim
+ *    about the protocol, not about cleanliness.
+ *  - **`like` is not a substring test.** `_` is a single-character wildcard and every probe name here is
+ *    full of them; `select count%from memory%` matches 14 rows carrying 395 calls that neither repo named.
+ *    Read markers with `position($1 in query) > 0`, and reset only what the before-snapshot says you created.
  */
 /**
  * The narrowest thing these helpers need: something that can run a query and hand rows back. Typed
@@ -81,24 +92,115 @@ export async function targetedReset(client: StatementClient, row: Record<string,
 }
 
 /**
- * Removes every tracked statement whose stored text carries `pattern`, and returns how many rows and
- * how many calls that was. `merged` counts nothing: it is the number of rows found, which is by
- * construction the number the view was willing to attribute to this run's name.
+ * The ids present in the view right now. Cheap (a few hundred rows) and it is the only thing that turns a cleanup
+ * into a *gated* one: a row whose id is absent from this set was created by the invocation that takes the snapshot,
+ * and a row whose id is in it predates the run and belongs to whoever saw the shape first.
+ */
+export async function snapshotQueryIds(client: StatementClient): Promise<Set<string>> {
+  const result = await client.query(`select queryid::text as queryid from pg_stat_statements`);
+  return new Set(result.rows.map((row) => String(row.queryid)));
+}
+
+/**
+ * Rows whose stored text carries `marker`, read with `position($1 in query) > 0` and never with `like`.
+ *
+ * The change is not cosmetic. `LIKE` treats `_` as a single-character wildcard, and every probe name in this repo is
+ * full of underscores: `%heartbeat-probe%` is narrow only by luck, and `%pi_ed_probe_1%` also matches
+ * `piXedprobeY1`. Patterns shaped like statements are worse still - home-ops measured
+ * `select count%from memory%` on this store against **14 rows carrying 395 accumulated calls** that neither repo
+ * named, and a caller that passed such a pattern would reset all of them.
+ */
+export async function findStatementTraces(
+  client: StatementClient,
+  marker: string,
+): Promise<Array<{ queryid: string; dbid: string; userid: string; calls: number; query: string }>> {
+  const found = await client.query(
+    `select queryid::text as queryid, dbid::text as dbid, userid::text as userid, calls, query
+       from pg_stat_statements where position($1 in query) > 0`,
+    [marker],
+  );
+  return found.rows.map((row) => ({
+    queryid: String(row.queryid),
+    dbid: String(row.dbid),
+    userid: String(row.userid),
+    calls: Number(row.calls),
+    query: String(row.query),
+  }));
+}
+
+/**
+ * Collects the litter of a run that never reached its cleanup.
+ *
+ * The gate makes a run refuse rows that predate it, which is right for other people's counters and wrong for mine: a
+ * cancelled test leaves its probes in the view forever, because the next run sees them as predating itself. This is
+ * the one reset that runs without a before-snapshot, and it is legitimate for a specific reason - a row whose stored
+ * text carries my marker was created by a submission that carried my marker, because the text is the first statement
+ * that ever saw the shape. Had my submission merged into an older row, the older row would name somebody else's
+ * statement and this would find nothing.
+ *
+ * The corollary is a namespace rule, not a technical one: the marker must be a name only this file writes. Passing a
+ * broad prefix here deletes a peer's history on the same reasoning, which is why the fleet's markers are
+ * `stat_probe`/`probe_*` here, `sweep_probe`/`zz_homeops` there, and never a shared word like `pi_ed`.
+ */
+export async function preCleanOwnLitter(
+  client: StatementClient,
+  marker: string,
+  extraMarkers: string[] = [],
+): Promise<{ rows: number; calls: number }> {
+  const order = await resetArgumentOrder(client);
+  const found = await findStatementTraces(client, marker).then(async (rows) => {
+    const rest = await Promise.all(extraMarkers.map((m) => findStatementTraces(client, m)));
+    return [...rows, ...rest.flat()];
+  });
+  let calls = 0;
+  for (const row of found) {
+    calls += row.calls;
+    await targetedReset(client, row, order);
+  }
+  return { rows: found.length, calls };
+}
+
+/**
+ * Removes the tracked statements this invocation created, and refuses the rest.
+ *
+ * `before` is the gate. Without it the function does nothing at all: an ungated name-scoped cleanup is a different
+ * tool from the one `hack/pg-statement-traces.mjs` permits, and keeping both was the second answer to one question.
+ * A row that carries the marker but predates the run is somebody else's counter that this run's shape merged into -
+ * resetting it erases their history to remove one call of ours.
  */
 export async function cleanStatementTraces(
   client: StatementClient,
-  pattern: string,
-): Promise<{ rows: number; calls: number; leftovers: number }> {
-  const order = await resetArgumentOrder(client);
-  const found = await client.query(
-    `select queryid::text as queryid, dbid::text as dbid, userid::text as userid, calls from pg_stat_statements where query like $1`,
-    [pattern],
-  );
-  let calls = 0;
-  for (const row of found.rows) {
-    calls += Number(row.calls);
-    await targetedReset(client, row, order);
+  marker: string,
+  before?: Set<string>,
+): Promise<{ rows: number; calls: number; refused: number; leftovers: number }> {
+  const found = await findStatementTraces(client, marker);
+  if (!before) {
+    const calls = found.reduce((sum, row) => sum + row.calls, 0);
+    throw new Error(
+      `statements-cleanup: refusing an ungated cleanup of ${JSON.stringify(marker)}. ` +
+        `It matches ${found.length} row(s) carrying ${calls} call(s), and without a before-snapshot nothing distinguishes ` +
+        `a row this run created from a row it merged into. Take snapshotQueryIds() before the run and pass it here.`,
+    );
   }
-  const leftovers = await client.query(`select count(*)::int as n from pg_stat_statements where query like $1`, [pattern]);
-  return { rows: found.rowCount ?? 0, calls, leftovers: leftovers.rows[0].n };
+  const order = await resetArgumentOrder(client);
+  let calls = 0;
+  let removed = 0;
+  let refused = 0;
+  for (const row of found) {
+    if (before.has(row.queryid)) {
+      refused += 1;
+      continue;
+    }
+    calls += row.calls;
+    await targetedReset(client, row, order);
+    removed += 1;
+  }
+  // Count what is *left* by the same substring test, and do not let the counting query speak for itself: the read
+  // excludes rows whose text is a pg_stat_statements reader, which is the shape of this very query.
+  const leftovers = await client.query(
+    `select count(*)::int as n from pg_stat_statements
+       where position($1 in query) > 0 and query not like '%from pg_stat_statements%'`,
+    [marker],
+  );
+  return { rows: removed, calls, refused, leftovers: leftovers.rows[0]?.n ?? 0 };
 }

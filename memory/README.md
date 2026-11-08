@@ -733,6 +733,35 @@ Three rules follow, and the first two are rewrites of crash-scoped caveats into 
   makes it do nothing and still report success. The reset calls themselves are visible - 15 rows carrying 378 calls
   whose text contains `pg_stat_statements_reset(` - but the scope of each is a parameter, so the count proves resets
   happened and never says what they removed.
+- **`like` is not a substring test, and on a shared store the difference is other people's history.** `_` is a
+  single-character wildcard in `LIKE`, and every probe name in this fleet is full of underscores, so
+  `%heartbeat-probe%` is narrow only by luck. Patterns shaped like statements are worse: home-ops measured
+  `select count%from memory%` against this store at **14 rows carrying 395 accumulated calls** that neither repo
+  named, and the old `cleanStatementTraces` would have reset every one of them, because it was gated on nothing but
+  the pattern. The helper now reads markers with `position($1 in query) > 0` and **refuses to clean at all without a
+  before-snapshot** - the safe tool and the ungated helper are one thing now, and the refusal names the stakes
+  (`matches 2 row(s) carrying 403 call(s)`) instead of failing quietly. A row that carries the marker but predates
+  the run is refused and counted, never deleted.
+- **A name is only visible under the protocol that wrote it.** home-ops measured the second half of the label story:
+  a `prepare` label reaches the stored text under the *simple* protocol (`client.query(sql)` with no values, `psql -c`)
+  and **never** under the extended one - psycopg3, and anything that Parse-prepares, stores only the inner statement.
+  Their sweep prepares through named labels and `where position('probe_prepare' in query) > 0` returned **0** while
+  their own counters grew. So `assert --name <prepare label>` is vacuous for half the fleet, and the tool now says so
+  on the line rather than letting a zero read as cleanliness. This suite is safe because it goes through
+  `client.query`; a future writer that binds parameters is not.
+- **A name tag cannot make a shape novel.** A comment, an alias and a label are all outside the hash, so a
+  marker-carrying probe whose shape already exists lands on a row somebody else created first - home-ops' marker
+  search returned 0 rows while **10 shared counters each grew by one of their calls**, permanently, and their
+  unwrapped sweep was inflating this repo's baselines while reporting nothing. The only construction that makes a
+  shape novel is a private *clause*: a relation you create (what this suite's temp table does), or
+  `select * from (<statement>) as <run_token>`, which is what their sweep now wraps by default because it reads
+  shared tables and cannot create one.
+- **One contract, two implementations, on purpose.** home-ops' sweep reaches the store through `kubectl exec` and
+  will not hand a cluster credential to a Node script to satisfy an interface, so `hack/check-pied-statements.py`
+  implements the same gate - marker in the text **and** `queryid` absent from the before-snapshot, order read from
+  `pg_proc.proargnames`, ids as text - and writes its snapshots in this tool's `readSnapshot` shape. The
+  interoperability was proved in both directions: their snapshot parsed by `assert` and failed only on a bogus DSN.
+  The gate is the contract; the code is allowed to be two.
 - **A row's text is a label, not a record.** Attribute by `queryid`. A probe earns its own counter by being
   structurally distinctive - a different relation, a join, a filter that references a column rather than a constant -
   not by a more creative alias, a more unusual literal, or a `from` clause everybody else already uses. In a shared

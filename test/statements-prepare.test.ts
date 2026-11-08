@@ -3,7 +3,7 @@ import { existsSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { cleanStatementTraces } from "./statements-cleanup.ts";
+import { cleanStatementTraces, preCleanOwnLitter, snapshotQueryIds } from "./statements-cleanup.ts";
 
 /** The prefix every `prepare` label in this file carries, so cleanup can find what this file named. */
 const PREPARE_LABEL = "pi_ed_prepare_probe";
@@ -227,6 +227,10 @@ describe.skipIf(!liveDsn)("every exported statement, prepared against the real s
   let pg: typeof import("pg");
   let Client: new (dsn: string) => import("pg").Client;
   let statsResetAtStart: string;
+  // The gate for every cleanup in this file, taken before any of it has run. A row whose id is absent from this set
+  // was created by this invocation and is its to remove; a row whose id is in it predates the run, and the run's
+  // shape may well have merged into it - which is why the name scope is not enough to decide ownership.
+  let idsAtStart: Set<string>;
 
   beforeAll(async () => {
     pg = await import("pg");
@@ -234,11 +238,16 @@ describe.skipIf(!liveDsn)("every exported statement, prepared against the real s
     // Recorded before anything this file runs, so the cleanup test can prove it never moved the shared window.
     const seed = new Client(liveDsn);
     await seed.connect();
+    // A run that was cancelled mid-file left its prepare labels and its prepare-key relation here, and the gate
+    // would refuse to remove them on the next run because they predate it. Collect them first, on the file's own
+    // namespace, before the snapshot is taken.
+    const litter = await preCleanOwnLitter(seed, PREPARE_LABEL, ["stat_probe_preparekey"]);
+    if (litter.rows) console.log(`statements-prepare: collected ${litter.rows} tracked statement(s) carrying ${litter.calls} call(s) from an earlier run`);
     const info = await seed.query(`select stats_reset::text as stats_reset from pg_stat_statements_info`);
     statsResetAtStart = info.rows[0].stats_reset;
+    idsAtStart = await snapshotQueryIds(seed);
     await seed.end();
   });
-
   it("is accepted by Postgres without executing anything", async () => {
     const specs = collect(await loadModule());
     const client = new Client(liveDsn);
@@ -300,6 +309,9 @@ describe.skipIf(!liveDsn)("every exported statement, prepared against the real s
     const inner = `select count(*)::int as n from ${rel}`;
     const client = new Client(liveDsn);
     await client.connect();
+    // Taken after the connection and before any statement of the test: the gate is the ids that existed when the
+    // run started, so a row this run merged into is refused rather than reset.
+    const idsBefore = await snapshotQueryIds(client);
     const rows = async () =>
       (
         await client.query(
@@ -333,7 +345,7 @@ describe.skipIf(!liveDsn)("every exported statement, prepared against the real s
     } finally {
       // The temporary relation dies with the session; the trace of it does not, and this is the case where a name
       // scope genuinely works - the relation is the run's own, and the relation is in the hash.
-      const swept = await cleanStatementTraces(client, `%${rel}%`);
+      const swept = await cleanStatementTraces(client, rel, idsBefore);
       expect(swept.leftovers).toBe(0);
       await client.end();
     }
@@ -355,11 +367,11 @@ describe.skipIf(!liveDsn)("every exported statement, prepared against the real s
     const client = new Client(liveDsn);
     await client.connect();
     try {
-      const swept = await cleanStatementTraces(client, `%${PREPARE_LABEL}%`);
+      const swept = await cleanStatementTraces(client, PREPARE_LABEL, idsAtStart);
       expect(swept.leftovers, "a probe label this file invented must not survive the file that made it").toBe(0);
 
       // Idempotence: a second sweep finding nothing is what distinguishes cleanup from a lucky count.
-      const again = await cleanStatementTraces(client, `%${PREPARE_LABEL}%`);
+      const again = await cleanStatementTraces(client, PREPARE_LABEL, idsAtStart);
       expect(again.rows).toBe(0);
       expect(again.leftovers).toBe(0);
 

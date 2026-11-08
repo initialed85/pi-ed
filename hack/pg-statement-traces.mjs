@@ -318,6 +318,14 @@ async function main() {
   }
   if (unattributable.length > 6) console.log(`    ...and ${unattributable.length - 6} more; the count is the point, not the list`);
   console.log(`  leftovers carrying this run's names: ${leftovers.length}`);
+  if (!leftovers.length && names.length) {
+    // "0 rows carry my name" is a claim about the protocol before it is a claim about cleanliness. home-ops measured
+    // it: a `prepare` label reaches the stored text only under the simple protocol (node-pg `client.query(sql)` with
+    // no values, `psql -c`), and an extended-protocol or Parse-preparing client - psycopg3, and anything that binds
+    // parameters - never stores it. Their sweep prepares through named labels and the name search returned 0 rows
+    // while 10 shared counters each grew by one of their calls.
+    console.log(`  note: a name matching nothing is also what a name that was never stored looks like. Under the extended protocol a prepare label is not in the row text at all, so this line is not proof of cleanliness for a client that binds parameters.`);
+  }
   for (const [queryid, row] of leftovers.slice(0, 10)) console.log(`    ${queryid}  ${row.query.slice(0, 100)}`);
 
   // The sibling report: the merge's counterpart. A statement the caller named may be spread over several rows,

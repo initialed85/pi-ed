@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { cleanStatementTraces } from "./statements-cleanup.ts";
+import { cleanStatementTraces, preCleanOwnLitter, snapshotQueryIds } from "./statements-cleanup.ts";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -42,10 +42,20 @@ async function query(sql: string, values: unknown[] = []) {
 const suite = liveDsn ? describe : describe.skip;
 
 suite("the writer heartbeat, against the store someone would alert on", () => {
+  // The gate for the afterAll cleanup: ids present before this suite ran anything. A row that carries the
+  // `heartbeat-probe` name and predates the suite is not this suite's, and resetting it would delete another
+  // writer's counter to remove one call of ours.
+  let idsAtStart: Set<string>;
+
   beforeAll(async () => {
     const pg = (await import("pg")) as unknown as { Client: new (options: { connectionString: string }) => Client };
     client = new pg.Client({ connectionString: liveDsn });
     await client.connect();
+    // Collect this file's own litter from a run that never reached its afterAll, before the gate is armed. The one
+    // shared namespace risk here is a peer that also writes `heartbeat-probe`; home-ops' markers are `sweep_probe`
+    // and `zz_homeops`, and a row whose text carries this name was submitted by a run that wrote it.
+    await preCleanOwnLitter(client, "heartbeat-probe");
+    idsAtStart = await snapshotQueryIds(client);
     await query(`delete from memory.writer_heartbeat where agent_id like 'heartbeat-probe%'`);
   });
 
@@ -57,8 +67,9 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
       // and they can be given back. The sweep SELECTs it ran name no probe, and their structures merge into rows
       // other writers have already counted - those are left alone, because resetting a merged row would erase another
       // writer's history with it (memory/README.md, "a statement that merged is not yours to remove").
-      const traces = await cleanStatementTraces(client, `%heartbeat-probe%`);
+      const traces = await cleanStatementTraces(client, "heartbeat-probe", idsAtStart);
       expect(traces.leftovers, "a statement this file named must not survive the file that ran it").toBe(0);
+      expect(traces.refused, "a row this suite did not create is not its to remove").toBeGreaterThanOrEqual(0);
       await client.end();
       client = undefined;
     }
