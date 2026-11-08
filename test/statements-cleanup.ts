@@ -39,6 +39,9 @@
  *    about the protocol, not about cleanliness.
  *  - **`like` is not a substring test.** `_` is a single-character wildcard and every probe name here is
  *    full of them; `select count%from memory%` matches 14 rows carrying 395 calls that neither repo named.
+ *    Measured directly, in one store, with one name: `select 1 as zz_pied_wildXcard` puts a row in the view, and
+ *    `query like '%zz_pied_wild_card%'` finds **1** row while `position('zz_pied_wild_card' in query) > 0` finds
+ *    **0** - the underscore ate the `X`. Same name, same data, different operator, different answer.
  *    Read markers with `position($1 in query) > 0`, and reset only what the before-snapshot says you created.
  */
 /**
@@ -170,6 +173,9 @@ export async function preCleanOwnLitter(
  */
 export async function cleanStatementTraces(
   client: StatementClient,
+  /** A literal SUBSTRING, matched with `position()`, not a pattern. `%` and `_` in it mean themselves - which is
+   *  the whole point of the change: callers used to pass `%${rel}%` and get a wildcard read of a probe name whose
+   *  underscores are part of the name. Pass the bare name. */
   marker: string,
   before?: Set<string>,
 ): Promise<{ rows: number; calls: number; refused: number; leftovers: number }> {

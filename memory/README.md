@@ -802,6 +802,33 @@ whoever ran the last check. **The rule for a marker, from home-ops: no alias, CT
 you are searching for** - their `zz_rows` alias made a leftover count read 0 all day and then 1 forever, and the
 check that reported it was the row that broke it.
 
+**A row's stored text is not a description of its key.** This one is worth stating on its own because it breaks the
+reasoning every name-scoped tool quietly depends on. The store holds two rows:
+
+```
+ 5899421417296033498  calls=153  select count(*)::int as hits from pg_stat_statements where query like $1
+ -560586383943449322  calls=  10  select count(*)::int as n   from pg_stat_statements where query like $1
+```
+
+Identical apart from the alias. I sent the **exact text of the first row** - `select count(*)::int as hits from
+pg_stat_statements where query like '%zz_nothing%'` - and it landed on the **second**, taking it from 8 calls to 9
+while the 153 stayed 153. So the alias is not the key (confirmed three ways now: `aa_iso`/`bb_iso`, `as hits` landing
+on `n`, and the earlier `x1`/`x2` pair), and yet the two rows are not the same row either. The discriminator is not
+anything visible in the text: the leading candidate is the resolved type of the constant, since an inlined literal
+arrives as `unknown` and a bound parameter as `text`, and the jumble is taken after analysis. That is not settled here,
+and it is deliberately not written as a fact.
+
+What is settled is the consequence: **you cannot predict which row a statement will land on, and you cannot read a
+row's identity off its text.** Sending a row's own text back does not guarantee you reach that row. So `assert --name`
+is never complete, `leftovers 0` is never proof, and the landing delta - which rows grew, and whether this run can
+claim them - is the only honest instrument. It is also why the gate is the before-snapshot and not the name: the name
+says what a row looks like, the snapshot says who was there first.
+
+**Disclosure, in the form home-ops asked for.** Those probes added roughly seven calls to the shared `n` row above
+(3 -> 10) and two rows of my own that I could remove by `queryid` (`select $1 as zz_pied_wildXcard`, and the
+`position_hits` counter). Calls on a shared shape are not removable without deleting other writers' history, so they
+stay, and the run that made them says so here rather than in a `leftovers 0` line.
+
 `hack/pg-cost-snapshot.mjs` prints `queryid` on every line and marks the merge-prone shapes. The demo below was run
 through it, on the shape this file now recommends, and every row it created was removed afterwards:
 
