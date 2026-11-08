@@ -676,6 +676,39 @@ describe("dream gate", () => {
     expect(dreamPending!(3, 3)).toBe(false);
     expect(dreamPending!(0, 0)).toBe(false);
   });
+
+  it("holds a thin stretch below the floor, which is what keeps a no-op from buying a dream", async () => {
+    const { dreamPending } = await loadModule();
+    // A wake that accomplished nothing is a row or two of prompt and reply. The floor is what says so without
+    // asking the model to spend a turn discovering it.
+    expect(dreamPending!(3, 0, 4)).toBe(false);
+    expect(dreamPending!(4, 0, 4)).toBe(true);
+    expect(dreamPending!(12, 8, 4)).toBe(true);
+    expect(dreamPending!(11, 8, 4)).toBe(false);
+    // A gate with no floor is the old gate: any new row re-opens it, which is how a refused dream came back every
+    // idle window.
+    expect(dreamPending!(1, 0)).toBe(true);
+  });
+  it("refuses to remember a stretch too thin to be a memory, in the unit the gate counts", async () => {
+    const { dreamFloorNote } = await loadModule();
+    expect(dreamFloorNote!(4, 4)).toBeUndefined();
+    expect(dreamFloorNote!(9, 4)).toBeUndefined();
+    expect(dreamFloorNote!(3, 4)).toContain("under the 4 a memory is worth");
+    expect(dreamFloorNote!(0, 4)).toContain("nothing unsummarized since the last dream");
+    // A floor of 1 is the old behaviour, and an empty span is still refused under it.
+    expect(dreamFloorNote!(1, 0)).toBeUndefined();
+    expect(dreamFloorNote!(0, 0)).toContain("0 non-dream events");
+  });
+
+  it("tells the agent that declining an empty stretch is safe, because the watermark closes either way", async () => {
+    // The instruction used to end the other way: "a dream that admits it was empty is fine", which is exactly what put
+    // four paragraphs of "nothing happened" into a store that other agents then retrieve.
+    const { DREAM_PROMPT } = await loadModule();
+    expect(String(DREAM_PROMPT)).toContain("do not call memory_dream");
+    expect(String(DREAM_PROMPT)).toContain("closed either way");
+    expect(String(DREAM_PROMPT)).not.toContain("use subjects {none}");
+    expect(String(DREAM_PROMPT)).toContain("Call memory_dream exactly once");
+  });
 });
 
 describe("the extension", () => {
@@ -821,6 +854,85 @@ describe("the extension", () => {
     vi.advanceTimersByTime(11 * 60_000);
     vi.useRealTimers();
     expect(pi.sentMessages).toHaveLength(0);
+  });
+
+  it("does not dream about a stretch thinner than the floor", async () => {
+    // The shape a no-op leaves behind: one message, one answer, nothing else. Asking a model to reflect on that
+    // costs a turn and puts the asking itself in the context.
+    vi.useFakeTimers();
+    const { context } = contextFor({ branch: branch().slice(0, 1) });
+    await pi.emit("session_start", { reason: "new" }, context);
+    await pi.emit("agent_settled", { aborted: false }, context);
+    vi.advanceTimersByTime(11 * 60_000);
+    vi.useRealTimers();
+    expect(pi.sentMessages, "a one-row scrap is not a stretch").toHaveLength(0);
+  });
+
+  it("asks about the same thin stretch when the repository lowers the floor", async () => {
+    // The pair of the test above, so that one is known to be about the floor rather than about the branch being
+    // unreadable. A repository that wants every stretch dreamed about can still ask for that.
+    writeFileSync(agentConfigPath, JSON.stringify({ flushMs: 50, minDreamWork: 1 }), "utf8");
+    vi.useFakeTimers();
+    const keen = await load();
+    const { context } = contextFor({ branch: branch().slice(0, 1) });
+    await keen.emit("session_start", { reason: "new" }, context);
+    await keen.emit("agent_settled", { aborted: false }, context);
+    vi.advanceTimersByTime(11 * 60_000);
+    vi.useRealTimers();
+    expect(keen.sentMessages).toHaveLength(1);
+    expect(keen.sentMessages[0]?.message).toMatchObject({ customType: "memory:dream", details: { trigger: "idle10m" } });
+  });
+
+  it("closes the stretch when a dream wrote nothing, so the next idle window is quiet", async () => {
+    // The runaway this exists to stop: five dream turns in one session, the last three with no work between them.
+    // The watermark only moved on a successful write, so an agent that answered "nothing here is worth remembering"
+    // - or declined to call the tool, exactly as the dream prompt tells it to - was asked again every window, and
+    // each asking left hidden rows in the branch that collect() counts.
+    vi.useFakeTimers();
+    const { context } = contextFor();
+    await pi.emit("session_start", { reason: "new" }, context);
+    await pi.emit("turn_end", { turnIndex: 0, messageEntryId: "e2", toolResultEntryIds: ["e3"] }, context);
+    await pi.emit("agent_settled", { aborted: false }, context);
+    vi.advanceTimersByTime(11 * 60_000);
+    expect(pi.sentMessages).toHaveLength(1);
+    // The dream turn ends, and it wrote nothing.
+    await pi.emit("agent_settled", { aborted: false }, context);
+    vi.advanceTimersByTime(21 * 60_000);
+    vi.useRealTimers();
+    expect(pi.sentMessages, "a dream that wrote nothing must still close its stretch").toHaveLength(1);
+  });
+
+  it("keeps the stretch open when the store refused the write, so a memory is not lost to a connection", async () => {
+    // The exception to closing: a stretch the store would not take really is unsummarized, and dreaming twice
+    // about real work is far better than forgetting it because Postgres was restarting.
+    vi.useFakeTimers();
+    const { context } = contextFor();
+    await pi.emit("session_start", { reason: "new" }, context);
+    await pi.emit("turn_end", { turnIndex: 0, messageEntryId: "e2", toolResultEntryIds: ["e3"] }, context);
+    await pi.emit("agent_settled", { aborted: false }, context);
+    vi.advanceTimersByTime(11 * 60_000);
+    expect(pi.sentMessages).toHaveLength(1);
+    const result = await callTool(pi, "memory_dream", { summary: "shipped the store", subjects: ["infra"], feel: "wary" }, context);
+    expect(String(result.content[0]?.text)).toContain("memory_dream not written");
+    await pi.emit("agent_settled", { aborted: false }, context);
+    vi.advanceTimersByTime(11 * 60_000);
+    vi.useRealTimers();
+    expect(pi.sentMessages, "a refused write leaves the stretch unsummarized, and it should be").toHaveLength(2);
+    expect(pi.sentMessages.at(-1)?.message).toMatchObject({ customType: "memory:dream" });
+  });
+
+  it("does not stack a second dream prompt on a dream that is still running", async () => {
+    vi.useFakeTimers();
+    const { context } = contextFor();
+    await pi.emit("session_start", { reason: "new" }, context);
+    await pi.emit("turn_end", { turnIndex: 0, messageEntryId: "e2", toolResultEntryIds: ["e3"] }, context);
+    await pi.emit("agent_settled", { aborted: false }, context);
+    vi.advanceTimersByTime(11 * 60_000);
+    expect(pi.sentMessages).toHaveLength(1);
+    // Compaction arrives while the dream turn is still in flight.
+    await pi.emit("session_before_compact", {}, context);
+    vi.useRealTimers();
+    expect(pi.sentMessages, "a session that is dreaming is not due for another dream").toHaveLength(1);
   });
 
   it("dreams before compaction, and again ten minutes after a session arrived from history", async () => {

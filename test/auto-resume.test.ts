@@ -481,6 +481,32 @@ describe("auto-resume in a session", () => {
     expect(injected().message.content).toContain("say one short line and do nothing else");
   });
 
+  /** A settings file that names `enabled` and nothing else, so the assertions below are about DEFAULT_CONFIG. */
+  const enableAtDefault = (): void => {
+    mkdirSync(path.join(dir, CONFIG_DIR_NAME), { recursive: true });
+    writeFileSync(settingsFile(), `${JSON.stringify({ v: 1, enabled: true, maxAgeMs: 0 }, null, 2)}\n`, "utf8");
+  };
+
+  it("leaves a settled session alone without being told to, because a no-op wake is context nobody asked for", async () => {
+    // The shape this default exists to prevent: a pod restart wakes a session that finished its work, the model says
+    // one short line, and both rows sit in the transcript - where the memory extension then reads them as an
+    // unsummarized stretch and asks the session to dream about the nothing it just made.
+    enableAtDefault();
+    const { ui } = await start({
+      branch: [userMessage("u1", NOW - 2 * HOUR), assistantMessage("a1", NOW - HOUR, { text: "all done, nothing pending" }), marker("k1", NOW - HOUR + 1000, { v: 1, op: "quit", at: NOW - HOUR + 1000, idle: true, reason: "quit" })],
+    });
+
+    expect(pi.sentMessages, "a session whose last turn finished has nothing to resume").toHaveLength(0);
+    expect(ui.notifications.at(-1)?.message).toContain("idle when it stopped");
+  });
+
+  it("wakes a session that stopped mid-task without being told to, because that is the whole point", async () => {
+    enableAtDefault();
+    await start({ branch: [userMessage("u1", NOW - 2 * HOUR), assistantMessage("a1", NOW - HOUR, { stopReason: "toolUse", toolCalls: [{ name: "bash", arguments: { command: "make deploy" } }] })] });
+
+    expect(injected().message.details.state).toContain("mid-task");
+  });
+
   it("leaves a session that has been sitting past the age cap, and says what the cap was", async () => {
     enable({ maxAgeMs: 2 * HOUR });
     const { ui } = await start({

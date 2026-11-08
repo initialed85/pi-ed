@@ -30,9 +30,13 @@
  * points at a kubectl port-forward), PI_MEMORY_DISABLED=1 turns it off for one process.
  *
  * The store is pgvector Postgres 16 in the `pi-ed` namespace on home-dev, deployed by home-ops. The shape it holds is
- * memory/schema/001_init.sql in this repository. Recall today is keyword-based because the embedder is still being
- * shipped: rows with a null embedding are invisible to vector recall and visible to keyword recall, so the two can
- * coexist while the embedding side lands.
+ * memory/schema/001_init.sql in this repository, and recall is vector-first with the keyword path as the fallback that
+ * carries a memory whose embedding failed.
+ *
+ * A dream that decided nothing was worth remembering is a no-op, and a no-op must not leave a mark in the session's
+ * context. That is not a rendering question - the dream prompt is already `display: false` - it is a bookkeeping one:
+ * the watermark has to advance on any dream turn that ends cleanly, or the next idle window re-asks the same question
+ * and the refusals stack up in the context forever. See `closeDreamTurn` and `minDreamWork`.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -86,6 +90,10 @@ interface Config {
   /** Minutes of idleness, and minutes after a resume, before a dream runs. */
   idleDreamMinutes?: number;
   resumeDreamMinutes?: number;
+  /** How much work a stretch has to contain before a dream is worth asking about it. A pod restart that woke a
+   *  settled session, a one-line answer, and nothing else is two or three rows, and prompting over that buys a
+   *  hidden message plus a refusal in the context for a stretch that has nothing in it. */
+  minDreamWork?: number;
   /** Turn the vectors off without turning dreaming off: memories land unembedded and only the keyword path finds them. */
   embeddings?: boolean;
   /** An OpenAI-compatible embeddings service. Same shape as the other home-dev model services, so the config - not
@@ -106,6 +114,7 @@ const DEFAULTS = {
   maxTextChars: 12_000,
   idleDreamMinutes: 10,
   resumeDreamMinutes: 10,
+  minDreamWork: 4,
   embeddings: true,
   embedUrl: "https://embeddings.dev.initialed85.cc",
   embedModel: "bge-base-en-v1.5",
@@ -116,7 +125,7 @@ const DEFAULTS = {
   embedTimeoutMs: 30_000,
   ownWeight: 1,
   otherWeight: 0.65,
-} satisfies Required<Pick<Config, "dreams" | "flushMs" | "maxTextChars" | "idleDreamMinutes" | "resumeDreamMinutes" | "embeddings" | "embedUrl" | "embedModel" | "embedMaxChars" | "embedTimeoutMs" | "ownWeight" | "otherWeight">>;
+} satisfies Required<Pick<Config, "dreams" | "flushMs" | "maxTextChars" | "idleDreamMinutes" | "resumeDreamMinutes" | "minDreamWork" | "embeddings" | "embedUrl" | "embedModel" | "embedMaxChars" | "embedTimeoutMs" | "ownWeight" | "otherWeight">>;
 
 function readConfigFile(path: string): Partial<Config> {
   if (!existsSync(path)) return {};
@@ -1209,14 +1218,35 @@ export function dreamCursorStatement(sessionId: string): Statement {
 /* ------------------------------------------------------------------ dreaming */
 
 /**
- * The one test every dream trigger shares: is there a stretch that has not been summarized yet?
+ * The one test every dream trigger shares: is there a stretch that has not been summarized yet, and is it big enough
+ * that asking about it is worth a turn?
  *
  * `recorded` counts the rows this session has handed over, `dreamed` counts how many there were the last time a dream
- * was written. Counting the rows still queued in memory would be wrong: a flush empties the queue, so a session that
+ * turn ended. Counting the rows still queued in memory would be wrong: a flush empties the queue, so a session that
  * recorded a hundred turns and then went idle would look like it had nothing to think about.
+ *
+ * `minWork` is the floor. `dreamed` advances on a dream that wrote nothing as well as one that wrote something, so
+ * without the floor the gate is only ever open by one stretch's worth of rows; with it, the two-or-three-row residue
+ * of a no-op wake does not buy a dream at all.
  */
-export function dreamPending(recorded: number, dreamed: number): boolean {
-  return recorded > dreamed;
+export function dreamPending(recorded: number, dreamed: number, minWork = 1): boolean {
+  return recorded - dreamed >= Math.max(1, minWork);
+}
+
+/**
+ * The store-side half of the same bar the triggers use, in words an agent can act on.
+ *
+ * Returns `undefined` when the stretch is worth a memory. This is not a fault path: a stretch that is below the floor
+ * has been looked at and judged, so the dream still closes it and the next idle window does not ask again. Returning
+ * the wording rather than writing the row is what keeps four empty "nothing happened" paragraphs out of a store whose
+ * whole purpose is being searched by somebody who was not there.
+ */
+export function dreamFloorNote(workEvents: number, floor: number): string | undefined {
+  const bar = Math.max(1, floor);
+  if (workEvents >= bar) return undefined;
+  return workEvents
+    ? `memory_dream not written: the span holds ${workEvents} work event(s), under the ${bar} a memory is worth. Say in the reply that the stretch was thin and leave it there - nothing else is needed and the stretch is closed either way.`
+    : `memory_dream not written: nothing unsummarized since the last dream (0 non-dream events in the span). Either this stretch is already remembered or the only thing that happened since was dreaming - say what you learned in the reply instead.`;
 }
 
 export const DREAM_PROMPT = [
@@ -1225,8 +1255,8 @@ export const DREAM_PROMPT = [
   "summary: two to four sentences about what actually happened and what would be useful later — decisions, findings, dead ends, the state things were left in.",
   "subjects: three to six loose, generic labels. They are the index your future self scans, so a label that only makes sense inside one file is a bad label.",
   "feel: one honest line about how this stretch felt to work on. Not decoration — this is the part that shows up over months.",
-  "If nothing here is worth remembering, say so in one sentence and use subjects {none}. A dream that admits it was empty is fine.",
-  "If the only thing that has happened since your last dream is other dreams, do not call the tool at all: the store will refuse the write, and a memory about a memory is not a memory.",
+  "If the stretch is thin or empty, say so in one sentence and do not call memory_dream: the store refuses a span with too few work events to be a memory, and an empty stretch should leave no rows behind. Declining is safe - the stretch is closed either way, and you will not be asked about it again.",
+  "If the only thing that has happened since your last dream is other dreams, do not call the tool at all: a memory about a memory is not a memory.",
 ].join("\n");
 
 /** How long a dream turn is allowed to look in-flight before a later trigger may run again. */
@@ -1263,6 +1293,9 @@ export default function memoryExtension(api: ExtensionAPI): void {
   let flushTimer: NodeJS.Timeout | undefined;
   let dreamTimer: NodeJS.Timeout | undefined;
   let dreamStartedAt = 0;
+  /** Set when a dream turn ended with the store refusing the write for a transient reason - no connection, or the
+   *  events it would summarize did not land. That is the one case where the gate must stay open. */
+  let dreamWriteFaulty = false;
   let recorded = 0;
   let workSeen = 0;
   let dreamed = 0;
@@ -1508,9 +1541,9 @@ export default function memoryExtension(api: ExtensionAPI): void {
   async function runDream(ctx: ExtensionContext, trigger: Trigger): Promise<void> {
     if (!cfg.dreams || dreaming()) return;
     collect(ctx);
-    // An unsummarized stretch is the only reason to dream.
-    // "An unsummarized stretch is the only reason to dream" - where a dream's own rows do not count as a stretch.
-    if (!dreamPending(workSeen, dreamed)) {
+    // An unsummarized stretch is the only reason to dream, and it has to be a stretch rather than a scrap: the floor
+    // is what keeps a session that woke up, said one line, and went quiet from being asked to reflect on it.
+    if (!dreamPending(workSeen, dreamed, cfg.minDreamWork ?? DEFAULTS.minDreamWork)) {
       // Silence is what a correctly behaved idle session looks like. The case worth one line of explanation is the
       // one a watcher cannot distinguish from a broken trigger: this session has already dreamed, and the reason it
       // is not dreaming again is that the dreaming itself is not work.
@@ -1519,6 +1552,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
     }
     triggers.set(sessionIdOf(ctx), trigger);
     dreamStartedAt = Date.now();
+    dreamWriteFaulty = false;
     try {
       await api.sendMessage({ customType: "memory:dream", content: DREAM_PROMPT, display: false, details: { trigger } }, { triggerTurn: true });
     } catch (error) {
@@ -1531,9 +1565,53 @@ export default function memoryExtension(api: ExtensionAPI): void {
 
   function scheduleDream(ctx: ExtensionContext, minutes: number, trigger: Trigger): void {
     if (!cfg.dreams) return;
+    // A session that is dreaming is not due for another dream, however short the clock below it is. Without this an
+    // idle tick landing while a dream turn is in flight stacks a second hidden prompt on the first.
+    if (dreaming()) return;
     if (dreamTimer) clearTimeout(dreamTimer);
     dreamTimer = setTimeout(() => attempt("dream timer after its context was replaced", runDream(ctx, trigger)), minutes * 60_000);
     dreamTimer.unref?.();
+  }
+
+  /**
+   * Close a dream turn: the stretch has been looked at, whether or not anything was written about it.
+   *
+   * This is the fix for the runaway one session showed the fleet - five dream turns, the last three with no work
+   * between them. Every dream trigger tests `dreamPending(workSeen, dreamed)`, and until now the only thing that moved
+   * `dreamed` was a successful `memory_dream` write. An agent that answered the prompt with "nothing here is worth
+   * remembering" - or declined to call the tool at all, exactly as the prompt instructs when the stretch is only other
+   * dreams - left the gate wide open, so the next idle window asked the same question again. Each asking costs a turn
+   * and leaves hidden prompt rows in the branch that `collect()` counts, which is how a no-op ends up in the context
+   * and stays there.
+   *
+   * Advancing the cursor on a clean no-op is safe in a way advancing it on a failure is not: the agent saw the stretch
+   * and judged it, and a memory that was never worth writing is not lost by not being written. A store that refused
+   * for a transient reason is different - there the stretch really is unsummarized, so the gate stays open.
+   */
+  function closeDreamTurn(ctx: ExtensionContext): void {
+    if (dreamStartedAt === 0) return;
+    dreamStartedAt = 0;
+    const sessionId = sessionIdOf(ctx);
+    collect(ctx);
+    if (dreamWriteFaulty) {
+      dreamWriteFaulty = false;
+      return;
+    }
+    dreamed = workSeen;
+    triggers.delete(sessionId);
+    // ...and move the store-side watermark with it, or the next pod restart reads `dream_seq`, finds the same
+    // already-considered stretch, and wakes the session up to decline it again.
+    attempt(
+      "dream cursor after a dream that wrote nothing",
+      (async () => {
+        const refused = await flush(ctx, "flush");
+        if (refused) throw new Error(refused);
+        const db = await database();
+        if (!db) throw new Error(connectError || lastError || "no database reachable");
+        const cursor = dreamCursorStatement(sessionId);
+        await db.query(cursor.sql, cursor.values);
+      })(),
+    );
   }
 
   function triggerFor(sessionId: string): Trigger {
@@ -1563,6 +1641,9 @@ export default function memoryExtension(api: ExtensionAPI): void {
 
   api.on("agent_settled", (event, ctx) => {
     scheduleFlush(ctx);
+    // The dream turn is over. It has to be closed here, on the same final boundary the idle clock is armed from, or
+    // the gate stays open and the next window re-asks about a stretch that was already answered.
+    if (!event.aborted) closeDreamTurn(ctx);
     // Idle is when an agent has time to think, so this is the ordinary dream trigger. An aborted run is not idle, it
     // is interrupted, and dreaming about an interrupted stretch is how an agent learns to summarize noise.
     if (!event.aborted) scheduleDream(ctx, cfg.idleDreamMinutes ?? DEFAULTS.idleDreamMinutes, "idle10m");
@@ -1709,6 +1790,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
       const db = await database();
       if (!db) {
         const reason = connectError || lastError || "no database reachable";
+        dreamWriteFaulty = true;
         return { content: [{ type: "text", text: `memory_dream unavailable: ${reason}. Nothing was recorded.` }], details: { error: reason } };
       }
       const summary = String(params.summary ?? "").trim();
@@ -1727,6 +1809,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
         // nothing can check later, and the foreign key would only complain in a way that confuses the agent.
         const flushFailure = await flush(ctx, trigger);
         if (flushFailure) {
+          dreamWriteFaulty = true;
           return { content: [{ type: "text", text: `memory_dream not written: the events it would summarise are not in the store (${flushFailure}). The summary is worth keeping; say it in the reply and try again once the store is reachable.` }], details: { error: flushFailure } };
         }
         client = await db.connect();
@@ -1738,10 +1821,15 @@ export default function memoryExtension(api: ExtensionAPI): void {
         const span = dreamSpanStatement(sessionId);
         const spanResult = await client.query(span.sql, span.values);
         const spanRow = spanResult.rows[0] ?? { last_seq: 0, work_events: 0 };
-        if (!Number(spanRow.work_events)) {
+        const workEvents = Number(spanRow.work_events);
+        const floor = Math.max(1, cfg.minDreamWork ?? DEFAULTS.minDreamWork);
+        // The floor again, this time where the row would land. One rule enforced twice is the point: the trigger does
+        // not ask about a scrap, and the store does not remember one.
+        const refusal = dreamFloorNote(workEvents, floor);
+        if (refusal) {
           return {
-            content: [{ type: "text", text: `memory_dream not written: nothing unsummarized since the last dream (${Number(spanRow.work_events)} non-dream event(s) in the span). Either this stretch is already remembered or the only thing that happened since was dreaming - say what you learned in the reply instead.` }],
-            details: { error: "empty span", workEvents: Number(spanRow.work_events) },
+            content: [{ type: "text", text: refusal }],
+            details: { error: workEvents ? "span below the floor" : "empty span", workEvents, floor },
           };
         }
 
@@ -1791,6 +1879,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
         const message = describeStoreError(error instanceof Error ? error.message : String(error));
         // "not written" rather than the raw Postgres text: a connection refusal and a constraint violation are both
         // true, but only one of them tells the agent what to do next, and the spool hint is what makes the retry safe.
+        dreamWriteFaulty = true;
         return { content: [{ type: "text", text: `memory_dream not written: ${message}. Nothing was summarised; the events are in the local spool and this dream can be tried again once the store answers.` }], details: { error: message } };
       } finally {
         client?.release();

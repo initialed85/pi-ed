@@ -27,7 +27,8 @@
  *   /auto-resume                     toggle on or off for this repository (off until you say on)
  *   /auto-resume on | off | status | why | fire
  *   /auto-resume max-age <dur|off>   leave a resume alone if the last activity is older than this
- *   /auto-resume skip-idle on|off    drop the turn when the record already says the session was idle
+ *   /auto-resume skip-idle on|off    drop the turn when the record already says the session was idle (on by default:
+ *                                    a no-op wake is context nobody asked for)
  *
  * Flags:
  *   --auto-resume-off                do not arm a resumed session in this Pi instance
@@ -90,11 +91,18 @@ export interface Config {
   enabled: boolean;
   /** Leave a resume alone when its last activity is older than this. 0 means no cap. */
   maxAgeMs: number;
-  /** Skip the injection when the record already says the session was idle. */
+  /** Leave a resume alone when the record already says the session was idle. */
   skipIdle: boolean;
 }
 
-const DEFAULT_CONFIG: Config = { v: STATE_VERSION, enabled: false, maxAgeMs: 0, skipIdle: false };
+/**
+ * On by default. A session that settled cleanly has nothing for auto-resume to say, and the wake it gets anyway is
+ * the worst shape a context can take: a hidden instruction, an answer of one short line, and no work - two rows of
+ * chatter that occupy the transcript and then look like an unsummarized stretch to the memory extension. The value
+ * of this extension is entirely in the runs that were cut off mid-task, and the record distinguishes those from a
+ * turn that finished. `/auto-resume skip-idle off` restores the old behaviour for anyone who wants the greeting.
+ */
+const DEFAULT_CONFIG: Config = { v: STATE_VERSION, enabled: false, maxAgeMs: 0, skipIdle: true };
 
 /* ------------------------------------------------------------------ settings file */
 

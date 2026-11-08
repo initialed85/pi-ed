@@ -71,7 +71,10 @@ try {
   const before = await counts(agent);
   console.log(`store reachable, rows for "${agent}" before this run: ${JSON.stringify(before)}`);
 
-  pi = spawn("pi", ["--mode", "rpc", "-e", EXTENSION, "--name", agent], {
+  // `-ne` is not cosmetic. The fleet installs this very extension from git into ~/.pi/agent, so a check that only
+  // says `-e <repo path>` loads two copies of memory.ts and Pi refuses the second one for registering tools that are
+  // already registered - which reads like a bug in the extension and is really a bug in the harness.
+  pi = spawn("pi", ["--mode", "rpc", "-ne", "-e", EXTENSION, "--name", agent], {
     cwd: scratch,
     env: { ...process.env, PI_MEMORY_DSN: DSN, PI_MEMORY_CONFIG: configPath, PI_MEMORY_SPOOL: path.join(scratch, "spool.jsonl") },
     stdio: ["pipe", "pipe", "pipe"],

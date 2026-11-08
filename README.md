@@ -217,9 +217,10 @@ Two things worth knowing before turning it on:
 - `pi -c` arrives as `session_start` with reason `startup`, not `resume` — only `/resume` says `resume`.
   So the reason is not the signal; the session's own entries are. A session with no activity in it is left
   alone, and so are `new`, `fork` and `reload`.
-- Re-arming a session costs one model turn before you type anything. `/auto-resume skip-idle on` drops
-  that turn when the record already says the session was idle. It is off until you turn it on per
-  repository, because that turn is a real cost on a repo you only occasionally resume.
+- Re-arming a session costs one model turn before you type anything. `skip-idle` is **on** by default, so a
+  session whose record says it finished its work is left alone — a no-op wake is two rows of context nobody asked
+  for, and the memory extension then reads those rows as a stretch worth dreaming about. `/auto-resume skip-idle
+  off` restores the wake for a repository that wants the greeting.
 
 It never injects in print or JSON mode: the prompt there already came from the command line. A silent
 no-op is still explainable — `/auto-resume status` prints what was read and what it would have done, and
@@ -257,9 +258,17 @@ Dreaming is the interesting half, and it is not code summarising the agent. Afte
 a session arrives from history, or immediately before the harness compacts the context away, the extension posts one
 hidden message and the agent writes its own memory with `memory_dream`: two to four sentences about the stretch, three
 to six loose subjects, and one honest line about how it felt. `feel` is its own column because the point is to watch
-it change without parsing prose. A dream only runs when there is an unsummarized stretch (`event_count > dream_seq`),
-so a session that is merely open is not a session worth thinking about, and an interrupted run never dreams — that
-was somebody hitting Escape on purpose.
+it change without parsing prose. A dream only runs over work rows it has not already considered — the rows a dream
+produced itself do not count as work — and only when that stretch holds at least `minDreamWork` rows (4 by default),
+so a session that woke up, said one line and went quiet is not asked to reflect on it. An interrupted run never
+dreams: that was somebody hitting Escape on purpose.
+
+A dream that decides nothing was worth remembering has to close its stretch anyway. Until it did, the watermark moved
+only on a successful `memory_dream` write, so an agent that answered the prompt with "nothing here is worth
+remembering" got asked again every idle window — five dream turns in one session, the last three with no work between
+them, each one a hidden prompt and a refusal sitting in the context forever. `closeDreamTurn` moves both the local
+gate and the store's `dream_seq` on a clean no-op, and deliberately leaves the gate open when the store refused for a
+transient reason: a stretch Postgres would not take really is unsummarized.
 
 Retrieval is `memory_search`, and it runs two paths rather than choosing between them: the query is embedded and
 handed to pgvector's hnsw index, and full text over summary and feel runs underneath as the net - a memory written
@@ -287,11 +296,11 @@ is safe to leave in the package before the store exists.
 | --- | --- |
 | Commands | `/memory` (what this agent has, and what is buffered) |
 | Tools | `memory_search` (query, limit, since_days, own_only) · `memory_dream` (summary, subjects, feel) |
-| Config | `.pi/memory.json` then `~/.pi/agent/memory.json`: `dsn` · `agent` · `dreams` · `idleDreamMinutes` · `resumeDreamMinutes` · `flushMs` · `maxTextChars` · `skip` · `neverStore` · `embeddings` · `embedUrl` · `embedModel` · `embedMaxChars` · `embedTimeoutMs` · `ownWeight` · `otherWeight` |
+| Config | `.pi/memory.json` then `~/.pi/agent/memory.json`: `dsn` · `agent` · `dreams` · `idleDreamMinutes` · `resumeDreamMinutes` · `minDreamWork` · `flushMs` · `maxTextChars` · `skip` · `neverStore` · `embeddings` · `embedUrl` · `embedModel` · `embedMaxChars` · `embedTimeoutMs` · `ownWeight` · `otherWeight` |
 | Env | `PI_MEMORY_DSN` (wins over both files) · `PI_MEMORY_DISABLED` · `PI_MEMORY_CONFIG` · `PI_MEMORY_SPOOL` |
 | Store | `memory.pi-ed.svc.cluster.local:5432` in-cluster; `192.168.1.113:5434` from the LAN (LAN-only LoadBalancer); secret in home-ops' `___secret/` |
 | Embedder | `https://embeddings.dev.initialed85.cc` — `bge-base-en-v1.5`, 768-dim, `POST /v1/embeddings` |
-| Writes | `event` (raw turns: user / assistant / tool_call / tool_result / marker / system), `session`, `agent` on the way in; `memory` (with `embedding`, `embedding_model`, `detail`) and `subject_index` when a dream lands |
+| Writes | `event` (raw turns: user / assistant / tool_call / tool_result / marker / system), `session`, `agent` on the way in; `memory` (with `embedding`, `embedding_model`, `detail`) and `subject_index` when a dream lands, plus `session.dream_seq` when a dream ends having written nothing |
 | Reads | the session branch, the session id, `session.dream_seq`, and `agent.name` for cross-agent attribution |
 | Live check | `hack/memory-live-check.mjs` — a real Pi session against the real store; needs the DSN, spends model tokens, and deletes what it wrote, including when it fails halfway |
 
