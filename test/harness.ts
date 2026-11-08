@@ -20,6 +20,8 @@ export interface ToolDefinitionLike {
   label?: string;
   description?: string;
   promptSnippet?: string;
+  /** Pi renders these as rule bullets in the <rules> section while this tool is active. */
+  promptGuidelines?: string[];
   parameters?: unknown;
   outputSchema?: unknown;
   annotations?: Record<string, unknown>;

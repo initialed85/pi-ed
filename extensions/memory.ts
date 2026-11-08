@@ -979,6 +979,27 @@ sentences about the text. */
 
 export const EMBEDDING_DIMENSIONS = 768;
 
+/**
+ * The three ways a model reaches for the `subjects` parameter, all of them accepted.
+ *
+ * An array is the documented shape. A comma-separated string is the most common miss, and refusing a dream over it
+ * would be refusing a memory over a comma. A newline-separated list is the same miss with different punctuation, so
+ * both delimiters are honoured. The third shape is a JSON array typed as a string, and until it was handled it
+ * stored subjects like `["agent memory and recall"` - brackets and a stray quote welded onto a label, which is a
+ * subject nobody will ever match when they search, and 33 of the store's 105 labels were exactly that.
+ *
+ * `none` and `{none}` are what the dream instructions ask for when a stretch was not worth remembering. Those are an
+ * honest answer, not a subject, and indexing a memory under the word "none" is how an index fills up.
+ */
+export function parseSubjects(raw: unknown): string[] {
+  const pieces = Array.isArray(raw) ? raw : [String(raw ?? "")];
+  return pieces
+    .flatMap((piece) => String(piece).trim().replace(/^\[+|\]+$/g, "").split(/[,\n]/))
+    .map((subject) => subject.trim().replace(/^["']+|["']+$/g, "").trim().toLowerCase())
+    .filter((subject) => subject && subject !== "none" && subject !== "{none}")
+    .slice(0, 8);
+}
+
 /** The text a memory's vector stands for: what happened, what it was about, and how it felt. */
 export function memoryText(summary: string, subjects: string[] = [], feel?: string): string {
   const parts = [summary.trim()];
@@ -1586,6 +1607,14 @@ export default function memoryExtension(api: ExtensionAPI): void {
     label: "memory_search",
     description: "Search the fleet's recorded memories: what this agent remembered, and what its teammates remembered (ranked lower and labelled).",
     promptSnippet: "Search agent memory (own memories ranked above teammates')",
+    // Deliberately short, and deliberately about *when* rather than *how*: the tool description already says what a
+    // search returns. The gap this fills is ordering - a web search is a reflex for a question this fleet has already
+    // answered once - and the second bullet is the ceiling, because an agent that searches memory three times per
+    // question spends more on recall than recall is worth.
+    promptGuidelines: [
+      "Before web_search, or before guessing, about something already settled in this fleet - a decision, an incident, a number measured before - run one memory_search.",
+      "One search is the budget. If nothing useful comes back, answer from the session in front of you instead of searching again.",
+    ],
     parameters: Type.Object({
       query: Type.String({ description: "Words to search the memory summaries, subject labels and notes for" }),
       limit: Type.Number({ description: "Maximum results (default 8, max 50)" }),
@@ -1665,6 +1694,10 @@ export default function memoryExtension(api: ExtensionAPI): void {
     label: "memory_dream",
     description: "Record what this agent decided was worth remembering about the stretch it just worked on: summary, subjects, and how it felt.",
     promptSnippet: "Write one memory for the stretch just worked on",
+    // The subject index is the cheapest place to lose the whole point of the store: 105 labels for 23 memories meant
+    // almost every dream minted a narrower label than the one before it, so the index was a list of one-off phrases
+    // rather than something a future self could scan. The store canonicalises labels, but this is where they are born.
+    promptGuidelines: ["Reuse a subject you have already written under; a memory that joins an existing subject helps a future search more than a new narrow one does."],
     parameters: Type.Object({
       summary: Type.String({ description: "Two to four sentences about what happened and what matters later" }),
       subjects: Type.Union([Type.Array(Type.String()), Type.String()], { description: "Three to six loose generic labels; the index a future self scans. A single comma-separated string is accepted too" }),
@@ -1680,12 +1713,9 @@ export default function memoryExtension(api: ExtensionAPI): void {
       }
       const summary = String(params.summary ?? "").trim();
       if (!summary) return { content: [{ type: "text", text: "memory_dream needs a summary" }], details: { error: "missing summary" } };
-      // One string rather than an array is the most common way a model misses this parameter, and the difference
-      // between a dream written and a dream refused should not be a comma.
-      const subjects = (Array.isArray(params.subjects) ? params.subjects : String(params.subjects ?? "").split(","))
-        .map((subject) => String(subject).trim().toLowerCase())
-        .filter(Boolean)
-        .slice(0, 8);
+      // parseSubjects, not a split: an array, a comma-separated string and a JSON array written as a string all mean
+      // the same thing here, and none of them should end up stored with brackets around the label.
+      const subjects = parseSubjects(params.subjects);
       const feel = String(params.feel ?? "").trim() || undefined;
       const sessionId = sessionIdOf(ctx);
       const agent = agentIdentity(ctx, cfg);

@@ -1142,6 +1142,40 @@ describe("the extension", () => {
   });
 });
 
+describe("subject labels", () => {
+  it("accepts the three ways a model writes them, and keeps none of the punctuation", async () => {
+    const { parseSubjects } = await loadModule();
+    expect(parseSubjects!(""), "required export").toEqual([]);
+    expect(parseSubjects!("CI Memory Limits \n  Vitest Forks ")).toEqual(["ci memory limits", "vitest forks"]);
+    expect(parseSubjects!("ci memory limits, vitest forks")).toEqual(["ci memory limits", "vitest forks"]);
+    // The shape that used to reach the store: a JSON array written as a plain string. Splitting that on commas left
+    // `["ci memory limits"` as a subject, and 33 of the store's 105 labels were a fragment of that kind.
+    const jsonish = parseSubjects!('["ci memory limits", "vitest forks"]');
+    expect(jsonish).toEqual(["ci memory limits", "vitest forks"]);
+    expect(jsonish.join("|"), "a label with a bracket welded on is one no future search will match").not.toMatch(/[\[\]"]/);
+    // "nothing here was worth remembering" is an honest answer, not a subject. Two memories were indexed under `none`.
+    expect(parseSubjects!("none")).toEqual([]);
+    expect(parseSubjects!("{none}")).toEqual([]);
+    expect(parseSubjects!('["{none}"]')).toEqual([]);
+    expect(parseSubjects!(undefined)).toEqual([]);
+    expect(parseSubjects!(Array.from({ length: 20 }, (_unused, index) => `subject ${index}`)), "eight labels is the ceiling").toHaveLength(8);
+  });
+
+  it("keeps the prompt-side footprint a nudge rather than a policy", async () => {
+    const pi = await load();
+    const search = pi.tools.get("memory_search");
+    const dream = pi.tools.get("memory_dream");
+    expect(search?.promptGuidelines, "nothing on the prompt side currently motivates a search; this is the lever").toBeTruthy();
+    const bullets = [...(search?.promptGuidelines ?? []), ...(dream?.promptGuidelines ?? [])];
+    expect(bullets.join(" "), "the ordering this exists to change: web search is the reflex for a question this fleet already answered").toContain("web_search");
+    expect(bullets.some((bullet) => /budget/i.test(bullet)), "a nudge with no ceiling is an invitation to wade").toBe(true);
+    expect(dream?.promptGuidelines?.length, "the subject index is shaped at the moment the labels are born").toBeGreaterThan(0);
+    // The character count is the guard. Two short bullets is a lean inkling; the same idea written earnestly becomes a
+    // paragraph per tool, and every agent in the fleet pays for that on every request, forever.
+    expect(bullets.join(" ").length, "measured footprint of these bullets, in characters").toBeLessThan(430);
+  });
+});
+
 /* helpers */
 
 function mkdirRepoConfig(root: string, config: Record<string, unknown>): void {
