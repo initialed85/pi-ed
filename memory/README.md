@@ -1486,24 +1486,45 @@ silently skips a volume that is *detached* when the job fires - labelled, select
 and has **never** produced a backup, because its only writer is a CronJob that runs at 03:00Z and detaches the volume
 between runs. It is silent by configuration, not by failure.
 
-### 2026-11-08: the store came up empty, and why the schema was still there
+### 2026-11-08: I reported a data-loss incident that did not happen, twice over
 
 At 04:40Z the `pi-ed-postgres` pod came up with every table in `memory` empty - `memory`, `event`, `session`, `agent`,
-`writer_heartbeat` all zero rows - while `pg_stat_statements` reported a `stats_reset` equal to
-`pg_postmaster_start_time()`. **Schema present and data absent is the tell**: the initdb ConfigMap mounted at
-`/docker-entrypoint-initdb.d` only runs against an empty data directory. The pod was new (`restarts: 0`, empty
-`lastState`) rather than restarted, on a Longhorn volume still reported `attached`/`healthy`, whose
-`OfflineRebuilding` condition last transitioned at 04:38:32Z - the same minute. The statistics reset was a *symptom* of
-a fresh cluster, not evidence about anyone's cleanup, and it is the case this whole section exists for: every counter
-both repositories had been measuring became history of a window that no longer exists, and only the `stats_reset`
-comparison distinguishes "the numbers moved" from "the window moved".
+`writer_heartbeat` all zero rows - while `pg_stat_statements` showed a `stats_reset` equal to
+`pg_postmaster_start_time()`. I reported that as data loss. **It was not data loss.** And the correction I wrote in
+its place was also wrong, which is the more useful half of this section.
 
-Both restore points were timestamped 18:00Z the previous evening - the Longhorn copy (`backup-10d7529b14bc43ec`,
-247 MB, Completed) and the `pg_dump`. What turned this from a loss into a setback is a property of the store's design:
-**the memory store is derived**, its source of truth being the pi session files on a separate NFS share, which were
-untouched - so `hack/memory-backfill.mjs` can rebuild it. What is genuinely gone is everything written between the
-last backup and the loss; at 19:27Z the store held 4 agents, 3 sessions, 1,079 memories and 77 heartbeat rows. That
-four-hour gap is the argument for a second dump schedule rather than a cleverer one.
+**What actually happened.** A Longhorn replica died and was rebuilt - `Removing unknown replica tcp://10.42.3.88:10050
+in mode ERR from engine`, then `Start rebuilding replica … r-63a5f0f7`, then `Rebuilt` - with the engine passing
+through `OfflineRebuilding` at 04:38:32Z. The same minute, readiness and liveness probes were failing cluster-wide on
+`macgrubernetes`, `rooter`, `maclet`, `deployed`, `structmeta`, `minecraft-pinger`, `pi-team-room` and `camry`, so pods
+broadly restarted; `Recreate` gave `pi-ed-postgres` a new pod (`restarts: 0`, empty `lastState`). A new postmaster
+starts `pg_stat_statements` from nothing, which is the whole of "437 rows became 62". The volume was never replaced
+and the mount was never wrong: one pod, the `memory` Service pointing at it (`10.42.0.167`), one user database, no
+orphan `base/<oid>` directories, volume `attached`/`healthy`, `subPath: pgdata` continuous since `initdb` at 16:09Z.
+
+**Why the tables are empty, which is the part that was not an incident at all.** They are not pristine - I first claimed
+they were never written to, and that claim came from a bad measurement: I listed `base/16384` sorted by time, took the
+oldest eight entries, and concluded about the five tables I cared about. Sampling a directory and generalising to the
+objects you actually named is exactly the error this repository keeps writing rules about. Stat the objects:
+`agent` = `base/16384/16733` mtime `2026-11-08 04:50:22`, `session` `16744` `04:50:22`, `memory` `16781` `04:50:22`,
+`writer_heartbeat` `17056` `04:50:25`, `event` `16761` `2026-11-07 23:37:43`. Their free-space maps are older still
+(`16761_fsm` 21:02, `17056_fsm` 04:32) and their visibility maps are zero bytes - the signature of rows inserted and
+then removed, repeatedly, with `relfilenode` unchanged, so `DELETE` rather than `TRUNCATE`. The removals are ours:
+`test/retrieval-scoping.test.ts` ends by deleting its own probe rows from `memory.memory`, `memory.session` and
+`memory.agent`. **The store is empty because it holds only test traffic and the tests clean it up.** Cross-agent
+retrieval is proven in tests and has never been observed in production; I read a mirror of our own suite and called it
+fleet data.
+
+**The trap that made the first error possible, and it is a fleet trap rather than a me-trap: home-ops' git dates are
+Perth and my measurements are UTC.** `stats_reset` read `2026-11-07 19:27:33Z` all day and I kept saying - correctly,
+about myself - that I had not performed that reset. home-ops' `9325af4` is dated **03:27 Perth**, which is **19:27Z
+UTC**: "pi-ed/postgres: statement-level observability, so the next diagnosis is not blind". That commit is the reset.
+Comparing a Perth-dated commit against a UTC timestamp is off by eight hours, and eight hours is enough to make a
+routine deploy look like an incident. Convert before inferring.
+
+The surviving finding is the quiet one the rest of this file has been circling: **the store has never recorded a real
+session.** The nightly dumps and the Longhorn backup are real, and today they protect an empty store. That is an
+argument for shipping `memory.ts` and measuring a week of genuine traffic - not for a second dump schedule.
 
 **Coverage is read from the volume, and `lastBackupAt` is the half that cannot be inferred from a label.** This
 volume's own record: `recurring-job-group.longhorn.io/backup-daily: enabled` and `status.lastBackupAt
