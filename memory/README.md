@@ -829,7 +829,7 @@ Deployment and the PVC released the stuck staging immediately.
 
 ### Reading an attachment without lying to yourself
 
-`hack/pi-ed-attach-state.sh` prints the four views side by side and is read-only, so the reason it exists is a field
+`hack/pi-ed-attach-state.sh` prints the attachment views side by side and is read-only, so the reason it exists is a field
 layout that produces a confident wrong answer if it is guessed. In `volumeattachments.longhorn.io`, the object holds a
 request half and an answer half:
 
@@ -853,11 +853,30 @@ The healthy reading, taken now rather than described:
 | k8s `volumeattachment` | `attacher`, `nodeName`, `attached` | `driver.longhorn.io`, `k3s-bee-2`, `True`, created `19:27:20Z` |
 | Longhorn `volumeattachments.longhorn.io` | `spec.attachmentTickets.<id>.nodeID`, `type` | `k3s-bee-2`, `csi-attacher` - **one ticket** |
 | the same object's status half | `satisfied`, `conditions[0]` | `True`, `Satisfied=True since 19:27:25Z` |
-| Longhorn `volume` | `spec.nodeID`, `status.robustness`, `numberOfReplicas` | `k3s-bee-2`, `healthy`, `2` |
+| Longhorn `volume` | `spec.nodeID`, `status.state`, `status.robustness`, `numberOfReplicas` | `k3s-bee-2`, `attached`, `healthy`, `2` |
 
 The timestamps line up into a story, which is what makes them useful as a baseline: pod created `19:27:17Z`, attach
 requested `19:27:20Z`, answer satisfied `19:27:25Z`, and this store's `stats_reset` is `19:27:33Z` - volume,
 database, extension, in that order, eight seconds apart.
+
+**The script classifies the volume rather than leaving `robustness` for a human to interpret.** `status.state:
+detached` with an empty `spec.nodeID` and `robustness: unknown` is the *ordinary* reading of a volume that simply is
+not attached - a dump scratch volume between CronJob runs - and home-ops found it being read as damage across ten
+volumes (home-ops `19599d1`). It is the same invitation to go pull something that is not stuck as a wrong `nodeID`
+read, so the tool now prints an explicit verdict for each shape and the fields that separate them: `Scheduled=True`
+with `WaitForBackingImage`, `TooManySnapshots`, `Restore` and `OfflineRebuilding` all `False`. Measured on
+`woodpecker/woodpecker-pgdump`, which is a real detached volume on this cluster:
+
+```text
+state detached  robustness unknown  spec.nodeID ''  replicas 2
+  Scheduled=True  WaitForBackingImage=False  TooManySnapshots=False  Restore=False  OfflineRebuilding=False
+verdict: detached and nothing is blocking it. This is NOT a stuck mount and NOT a fault -
+         `robustness: unknown` and an empty nodeID are the ordinary reading of a detached volume.
+```
+
+It prints that volume's backup coverage in the same output, which for `woodpecker-pgdump` is `status.lastBackupAt:
+(never)` despite carrying `recurring-job-group.longhorn.io/backup-daily: enabled` - the silent skip, sitting next to
+the "not stuck" verdict, because the two are read together and neither one alone is the story.
 
 **What has never been recorded is which of those fields flips in the stuck shape.** Finding 17's stranded staging was
 diagnosed from kubelet events and Longhorn plugin logs (`is in use.`, `already mounted or mount point busy.`), not
@@ -1186,7 +1205,9 @@ Two copies exist and they are not equally trustworthy. The nightly `pg_dump` Cro
 NFS share directly and writes `pi-ed-dump-<utc>.sql` to romulus - is the copy worth restoring from. The Longhorn
 `backup-daily` group in dev also carries `pvc-4b1dccc5`, and that is the copy to hope is never needed: Longhorn
 silently skips a volume that is *detached* when the job fires - labelled, selected, reported as handled,
-`lastBackupAt: none`. Not hypothetical; it happened to `woodpecker-pgdump` on 2026-11-07.
+`lastBackupAt: none`. Not hypothetical, and not a one-off either: `woodpecker-pgdump` carries the `backup-daily` label
+and has **never** produced a backup, because its only writer is a CronJob that runs at 03:00Z and detaches the volume
+between runs. It is silent by configuration, not by failure.
 
 **Coverage is read from the volume, and `lastBackupAt` is the half that cannot be inferred from a label.** This
 volume's own record: `recurring-job-group.longhorn.io/backup-daily: enabled` and `status.lastBackupAt
@@ -1199,6 +1220,37 @@ found ten volumes across the two clusters labelled while the cluster's only recu
 `spec.recurringJobSelector`, `status.lastBackupAt` - and asks the target - `spec.backupTargetURL`, **not** `spec.url`,
 which is empty even on a cluster that backed up eight volumes ninety minutes earlier - and it carries the condition
 type name with its status, because a healthy target reports `type: Unavailable`, `status: "False"`.
+
+**The mechanism of the skip, and why it leaves no evidence.** `allow-recurring-job-while-volume-detached` is `false` in
+both clusters, and the value lives at top-level `.value` on the setting object - `spec.value` and `status.value` are
+both absent there, so reading either prints nothing and looks like "unset". With it off, a recurring job fires only if
+the volume is attached at the cron minute, and a skip **creates no Backup object and no error**: this cluster returns
+5 `backup.longhorn.io` records and none of them is in an error state, while `woodpecker-pgdump` - labelled
+`backup-daily`, and detached between its 03:00Z dump runs - has never produced one. So "no failed backups" is
+byte-for-byte the output of "nothing was ever attempted", and a coverage sweep cannot infer the difference from the
+absence of errors. A job's own counters are not coverage either: `recurringjob.status.executionCount` is per object
+lifetime (home-ops reset theirs by recreating the job during a backup-target fix), and this cluster caps a job's
+history at one successful and one failed entry (`recurring-successful-jobs-history-limit: 1`,
+`recurring-failed-jobs-history-limit: 1`).
+
+**Attributing a backup to a volume reads the answer half again.** `spec.volumeName` does not exist on the Backup CRD;
+the volume is `status.volumeName`, the job is `spec.labels.RecurringJob`, and the snapshot name corroborates it
+(`backup-d-…` from the daily job, `backup-v-…` from a verification job). Same request/answer asymmetry as the
+attachment tickets' `nodeID`, and the same failure mode: read the wrong half and the field is simply empty.
+`hack/pi-ed-attach-state.sh` now prints both readings, and classifies the volume rather than leaving `robustness`
+for a human to interpret - because `robustness: unknown` with an empty `spec.nodeID` is the *ordinary* reading of a
+volume that is merely detached, and has been misread as damage. This store's own record, live:
+
+```text
+state attached  robustness healthy  spec.nodeID 'k3s-bee-2'  replicas 2
+volume recurring labels: {"backup-daily": "enabled"}
+status.lastBackupAt: 2026-11-07T18:00:34Z   (the only per-volume coverage there is)
+Backup objects for this volume: 1 of 5 in the cluster
+  backup-10d7529b14bc43ec  job=backup-daily  state=Completed  snapshot=backup-d-e0808e27…  created=2026-11-07T18:00:37Z
+```
+
+One backup, because the store is ~17 hours old and that is one daily cycle. "One" is the right number here and would
+be the wrong number next week; the assertion is the pair, not the count.
 
 **And both copies are on one device.** Measured, not assumed:
 
@@ -1216,7 +1268,9 @@ failure domains. Whether that is acceptable - a second backup target on differen
 one NAS is the floor this store is willing to sit on - is Ed's call, not something a runbook should quietly assume away
 by listing two copies.
 
-So nothing detaches this volume between 17:55Z and 18:10Z. No `kubectl rollout restart deploy/pi-ed-postgres`, no
+So nothing detaches this volume between 17:55Z and 18:10Z - and the reason is now a mechanism rather than a superstition:
+with the setting above at `false`, being detached at 18:00Z is not a failed backup, it is a *skipped* one that leaves
+no object, no error, and no line anywhere. No `kubectl rollout restart deploy/pi-ed-postgres`, no
 scale to zero, no cordon that evicts it. A manifest change that alters the pod template - `shared_preload_libraries`
 for `pg_stat_statements`, an image bump - belongs at some other hour, because Argo rolls the pod whenever the sync
 wave lands and a pod rolled at 18:00Z is a volume detached exactly when the backup job enumerates it. A rollout

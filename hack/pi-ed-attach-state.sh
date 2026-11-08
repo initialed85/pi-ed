@@ -18,6 +18,15 @@
 # Run this BEFORE reaching for any lever. Force-detaching, restarting `longhorn-csi-plugin` or an
 # instance-manager destroys the evidence, and those are Ed's calls in any case.
 #
+# Two more things it prints, because both have been misread in the field:
+#
+#   - a detached volume's `robustness: unknown` and empty `spec.nodeID` are the ORDINARY reading of a volume that is
+#     simply not attached, not a fault (home-ops `19599d1`). The verdict line says which case it is looking at.
+#   - recurring backup coverage, read off the volume's `status.lastBackupAt`. With
+#     `allow-recurring-job-while-volume-detached: false` (measured on this cluster), a volume that is detached at the
+#     cron minute is skipped with no Backup object and no error, so "no failed backups" and "never attempted" are
+#     byte-for-byte the same output.
+#
 #   ./hack/pi-ed-attach-state.sh
 #   PVC=pi-ed-postgres NAMESPACE=pi-ed ./hack/pi-ed-attach-state.sh
 #
@@ -106,11 +115,81 @@ if not o.get("kind"):
     print("  (no volume object)")
     raise SystemExit
 spec, status = o.get("spec", {}), o.get("status", {})
-print("  spec.nodeID %s  status.robustness %s  numberOfReplicas %s" % (spec.get("nodeID"), status.get("robustness"), spec.get("numberOfReplicas")))
+conds = {c.get("type"): c.get("status") for c in status.get("conditions", []) or []}
+state = status.get("state")
+blockers = [t for t, v in conds.items() if str(v).lower() == "true" and t in ("WaitForBackingImage", "TooManySnapshots", "Restore", "OfflineRebuilding")]
+print("  state %s  robustness %s  spec.nodeID %r  replicas %s" % (state, status.get("robustness"), spec.get("nodeID"), spec.get("numberOfReplicas")))
 print("  engine image %s  created %s" % (status.get("currentImage"), o["metadata"].get("creationTimestamp")))
 for c in status.get("conditions", []) or []:
     print("  %s=%s since %s %s" % (c.get("type"), c.get("status"), c.get("lastTransitionTime", ""), c.get("message", "")))
+# Recorded so that nobody reads an ordinary detached volume as a fault. `robustness: unknown` with an empty
+# `spec.nodeID` is what Longhorn reports for a volume that is simply not attached - a dump scratch volume between
+# CronJob runs, for instance (home-ops `19599d1`, and the same class as reading `nodeID` from the answer half).
+# The fields that separate "detached" from "stuck" are `status.state: detached` together with `Scheduled=True` and
+# every blocker condition False.
+if state == "detached" and not blockers:
+    print("  verdict: detached and nothing is blocking it. This is NOT a stuck mount and NOT a fault -")
+    print("           `robustness: unknown` and an empty nodeID are the ordinary reading of a detached volume.")
+    print("           Do not restart the plugin, force-detach, or delete anything on the strength of this output.")
+elif state == "detached" and blockers:
+    print("  verdict: detached AND blocked (%s) - this is the shape to investigate." % ", ".join(blockers))
+elif blockers:
+    print("  verdict: attached with a blocking condition (%s) - capture the events below before touching anything." % ", ".join(blockers))
+else:
+    print("  verdict: attached and no condition is blocking it. If the pod is still in ContainerCreating, the")
+    print("           answer is in the kubelet events and the csi-plugin logs, not in these fields.")
 ' || echo "  (no volume object)"
+echo
+
+echo "== recurring backup coverage of this volume =="
+# The mechanism, measured on this cluster (home-ops `19599d1`, corroborated here): the setting
+# `allow-recurring-job-while-volume-detached` is `false`, so a recurring backup fires only if the volume is attached
+# at the cron minute, and a skip leaves NO Backup object and NO error. "No failed backups" is therefore byte-for-byte
+# the output of "nothing was attempted", and coverage cannot be inferred from the absence of errors. Only the
+# volume's own `status.lastBackupAt` is coverage; a job's `executionCount` is per object lifetime and its history is
+# capped at one successful and one failed entry by settings on this cluster.
+kubectl --context "$CTX" -n "$LHNS" get "volume/$pv" -o json 2>/dev/null | python3 -c '
+import json, subprocess, sys
+o = json.load(sys.stdin)
+labels = {k.split("/")[-1]: v for k, v in (o["metadata"]["labels"].items() if o.get("metadata") else []) if "recurring" in k}
+status = o.get("status", {})
+state = status.get("state")
+last = status.get("lastBackupAt") or "(never)"
+print("  volume recurring labels: %s" % (json.dumps(labels) if labels else "(none)"))
+print("  status.lastBackupAt: %s   (the only per-volume coverage there is)" % last)
+print("  state at the moment of reading: %s" % state)
+if state == "detached":
+    print("  note: while detached, a recurring backup on this volume is SKIPPED silently with this cluster setting")
+    print("        (see the setting line below). A scratch volume that only attaches for a few minutes is never")
+    print("        covered by a schedule, and nothing in the cluster will say so.")
+setting = subprocess.run(["kubectl", "--context", sys.argv[1], "-n", sys.argv[2], "get", "setting",
+                          "allow-recurring-job-while-volume-detached", "-o", "json"],
+                         capture_output=True, text=True)
+try:
+    value = json.loads(setting.stdout).get("value")
+    # The value is top-level `.value` on this CRD; `spec.value` and `status.value` are both absent, and reading
+    # either of those prints nothing and looks like "unset".
+    print("  setting allow-recurring-job-while-volume-detached = %r" % value)
+except Exception:
+    print("  setting allow-recurring-job-while-volume-detached: could not read (%s)" % setting.stderr.strip().splitlines()[-1:])
+backups = subprocess.run(["kubectl", "--context", sys.argv[1], "-n", sys.argv[2], "get", "backup.longhorn.io", "-o", "json"],
+                         capture_output=True, text=True)
+try:
+    items = json.loads(backups.stdout).get("items", [])
+    # The volume name is in the ANSWER half (`status.volumeName`); `spec.volumeName` does not exist. This is the
+    # same request/answer asymmetry as the attachment tickets.
+    mine = [i for i in items if (i.get("status") or {}).get("volumeName") == o["metadata"]["name"]]
+    print("  Backup objects for this volume: %d of %d in the cluster" % (len(mine), len(items)))
+    for i in mine:
+        job = (i.get("spec", {}).get("labels") or {}).get("RecurringJob")
+        print("    %s  job=%s  state=%s  snapshot=%s  created=%s" % (
+            i["metadata"]["name"], job, i.get("status", {}).get("state"),
+            i.get("status", {}).get("snapshotName"), i.get("status", {}).get("backupCreatedAt")))
+    if not mine:
+        print("    (none, and a silent skip also produces none - do not read this list as \"no failures\")")
+except Exception:
+    print("  could not list Backup objects")
+' "$CTX" "$LHNS" || echo "  (no volume object to describe)"
 echo
 
 echo "== mount and attach events in ${NS} (the part kubelet hides behind exit status 32) =="
