@@ -206,13 +206,27 @@ for (const row of rows.slice(0, top)) {
 }
 if (!rows.length) console.log("  nothing attributable to the run");
 
-// The other direction of the same warning: a row can also *disappear*. home-ops saw a 9-call row and a 2-call row
-// absent on a later read with no crash anywhere, `max = 5000` and only 41 rows present. And a row can stop being
+// The other direction of the same warning: a row can also *disappear*. And a row can stop being
 // written without vanishing: after a rename or a column added to a `select *`, the old queryid sits there with its
 // accumulated calls while a second row carries the traffic. So the diff below is a lower bound whenever the view shrank
 // without anybody resetting it, and a row whose `calls` has stopped growing is not evidence the statement got cheaper.
 if (after.byId.size < before.byId.size && String(before.statsReset) === String(after.statsReset)) {
-  console.log(`note: ${before.byId.size - after.byId.size} tracked statement(s) disappeared with no reset. The view evicts; a missing "before" row makes this run's delta a lower bound, not a measurement.`);
+  const gone = before.byId.size - after.byId.size;
+  // Two ways a row leaves without a global reset, and on a shared store the second is the common one. A targeted
+  // `pg_stat_statements_reset(userid, dbid, queryid)` removes exactly one row and does NOT move `stats_reset` -
+  // measured in `test/statistics-view.test.ts` - and every agent doing name-scoped cleanup here is calling it.
+  // Capacity eviction is only plausible when the view is near `pg_stat_statements.max`, which is a setting and not a
+  // column of the view (`select max from pg_stat_statements` fails with errorMissingColumn). So the label is "a row
+  // is missing", never "the view evicted it": the latter is a claim about occupancy that this line can check.
+  const capacity = Number((await client.query("show pg_stat_statements.max")).rows[0]["pg_stat_statements.max"]);
+  const occupancy = after.byId.size;
+  const evictionPlausible = occupancy > capacity / 2;
+  console.log(
+    `note: ${gone} tracked statement(s) disappeared with stats_reset unmoved. The view holds ${occupancy} of max ` +
+      `${capacity}, so eviction is ${evictionPlausible ? "plausible" : "not the explanation"} - the other way a row ` +
+      `leaves is a peer's targeted pg_stat_statements_reset(), which moves nothing. A missing "before" row makes this ` +
+      `run's delta a lower bound, not a measurement.`,
+  );
 }
 
 await client.end();

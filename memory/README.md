@@ -355,10 +355,30 @@ Two guards close the gap, both in `test/statements-prepare.test.ts`:
 1. **Parenthesis balance and parameter-count agreement, with no database involved** - the cheapest thing that would have
    caught the typo, and the only half CI can run. Re-running the test against the broken line reports `sessionStatement`
    as an offender; reverting it goes green. (Checked, not assumed.)
-2. **`PREPARE` against the real store, 19 statements, nothing executed.** `PREPARE` parses the SQL, resolves every table
-   and column name against the actual schema, checks the parameter numbers against the real column list, and writes no
-   rows. It is also what makes schema qualification testable rather than a preference: a name that resolves only through
-   `search_path` and a name that is not there at all fail the same way, in the same place.
+2. **`PREPARE` against the real store, every exported builder, nothing executed.** `PREPARE` parses the SQL, resolves
+   every table and column name against the actual schema, checks the parameter numbers against the real column list,
+   and writes no rows. It is also what makes schema qualification testable rather than a preference: a name that
+   resolves only through `search_path` and a name that is not there at all fail the same way, in the same place.
+   This sentence previously said "19 statements" and the assertion behind it said `>= 18`, which is how the file
+   ended up preparing **18** while claiming 19: `heartbeatFailureStatement` needs a fourth argument and
+   `eventStatement` needs a rows array, and neither shape existed, so the two most write-shaped statements in the
+   extension went unvalidated on a green run. The live test now asserts the invariant instead of a floor - no
+   exported builder may be absent from the prepared set - and the frozen name list below is what catches it.
+3. **The name list is frozen, and its one exception is named.** `eventStatement` assembles its value tuples in a loop,
+   so no *static* extraction can reach its SQL, and a sweep that only reads the source has to report it as information
+   rather than as a validation. Home-ops' runner reaches it the better way, by supplying a real rows array: the SQL is
+   dynamic, the statement is not untestable, and this file now does the same (`argShapes` carries a two-row case).
+   All 19 names are therefore asserted exactly, and the split is 18 statically extractable plus one
+   dynamic, which is the strongest signal available: a builder that leaves
+   the reachable set shows up as a diff in a list somebody reviews, instead of as a count in a table of results that
+   quietly dropped by one. The 19/18/1 split was measured independently by home-ops (`395bf54`) from their runner
+   discovering the list from this source, and the numbers agree.
+
+Both halves are free against the statistics window, which is worth saying before anyone declines the technique on the
+assumption that it pollutes the view. Measured on both sides: a `PREPARE` that is never executed leaves **no row at
+all** in `pg_stat_statements` - the probe labels were absent afterwards and `stats_reset` was unmoved. Validation that
+parses, resolves and type-checks against the real schema costs nothing observable; it is `EXECUTE` that writes, and
+that is the half the sweep does only against names it can clean up.
 
 Which leaves a rule wider than SQL:
 
@@ -635,8 +655,16 @@ Three rules follow, and the first two are rewrites of crash-scoped caveats into 
 - **`calls` is unsafe for arithmetic in ordinary operation**, not only after a crash. Two agents using the same
   constant-select shape share a counter, and neither sees it.
 - **Absence from the view is weak evidence in both directions, always** - a statement that ran may be folded into a
-  row whose text names a different statement, and a row can also be evicted (`max = 5000`, and home-ops watched a
-  9-call and a 2-call row disappear with no crash and no reset).
+  row whose text names a different statement, and a row can also *leave*. The first candidate cause is capacity
+  eviction at `pg_stat_statements.max` (a setting, not a column of the view: `select max from pg_stat_statements`
+  fails with `errorMissingColumn`, which is why this file used to say "the view evicts" without checking). On the
+  numbers it does not fit: home-ops watched a 9-call and a 2-call row disappear with no crash and no reset, and the
+  view held a few hundred rows against a `max` of 5000. The cause that fits is much closer to home - **a peer's
+  name-scoped cleanup**, because a targeted `pg_stat_statements_reset(userid, dbid, queryid)` removes exactly one row
+  and leaves `stats_reset` untouched, which is the whole design of the cleanup helper above. Both agents in this
+  fleet run such a cleanup, so a vanishing row is most likely a peer, not capacity. `test/statistics-view.test.ts`
+  performs the removal deliberately and asserts the pair: the row is gone, `stats_reset` is byte-identical, and the
+  view is nowhere near full.
 - **A row's text is a label, not a record.** Attribute by `queryid`. A probe earns its own counter by being
   structurally distinctive - a different relation, a join, a filter that references a column rather than a constant -
   not by a more creative alias, a more unusual literal, or a `from` clause everybody else already uses. In a shared
@@ -782,6 +810,14 @@ clause doing the fencing: `select count(*) as fence_probe_alpha from homeops_fen
 statement with `where agent_id = $1` printed identically while carrying different `queryid`s. A reader comparing the
 printed texts would have concluded the view was inconsistent. Filters had always read the untruncated text; the print
 now matches it, and truncation is opt-in (`--max-text N`), with a capped line saying it is capped.
+
+The same rule has a JavaScript edge that was hit while cleaning up after these measurements. `console.log(a, b, c)`
+treats `a` as a *format string*: printing the pattern `%stat_probe%` alongside another argument substituted `->` for its
+`%s`, and `%fence_demo%` printed as `NaNence_demo%`, because `%f` with no argument is `NaN`. The printed text disagreed
+with the text the query had filtered on, and one of the arguments was silently consumed - the exact defect this section
+is about, arriving from the logging call rather than from the database. With a single argument `console.log` prints
+verbatim (verified), and `process.stdout.write` never interprets. Any string that came from a query belongs in an
+argument, never in the format position.
 
 **`create temp table … on commit drop` under an autocommitting client drops the table inside the transaction that
 created it** (home-ops' first probe died with `relation … does not exist`). This repository's probes create plain temp

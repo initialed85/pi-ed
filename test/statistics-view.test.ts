@@ -292,4 +292,51 @@ describe.skipIf(!liveDsn)("pg_stat_statements contract", () => {
       );
       expect(found, "an identifier in the statement text is what a name-scoped cleanup can actually see").toHaveLength(1);
     });
+
+    it("loses a row without moving stats_reset, which is what a peer's cleanup looks like from the outside", async () => {
+      // This file's README used to say that a tracked statement which disappeared had been evicted by the view. On
+      // the numbers, that explanation does not hold: the view holds a few hundred rows against a `max` of 5000, and
+      // there is a second, far more mundane way to lose a row on a shared store - another agent's name-scoped
+      // cleanup, which calls the three-argument reset and, by design, leaves `stats_reset` exactly where it was.
+      // Both agents in this fleet run such a cleanup, so a vanishing row is most likely a peer, not capacity.
+      const before = await query(`select stats_reset from pg_stat_statements_info`);
+      const occupancy = await query(`select count(*)::int as present from pg_stat_statements`);
+      // `max` is a setting, not a column of the view; `select max from pg_stat_statements` fails with
+      // errorMissingColumn, which is why this reads the GUC instead.
+      const capacity = await query(`show pg_stat_statements.max`);
+      const max = Number(Object.values(capacity[0])[0]);
+      const present = Number(occupancy[0].present);
+      expect(max, "this build exposes pg_stat_statements.max").toBeGreaterThan(0);
+      expect(present, "the view is nowhere near capacity, so eviction is not the explanation on offer").toBeLessThan(max / 4);
+
+      const bucket = `stat_probe_vanish_${Date.now()}`;
+      await query(`create temp table ${bucket} (n int)`);
+      await query(`insert into ${bucket} (n) values (1)`);
+      await query(`select count(*)::int as n from ${bucket}`);
+      const mine = await query(
+        `select queryid::text as queryid, dbid::text as dbid, userid::text as userid, calls from pg_stat_statements where query like $1`,
+        [like(`%${bucket}%`)],
+      );
+      expect(mine.length, "the probe's statements are tracked, DDL included").toBeGreaterThan(0);
+
+      // The peer's action, performed by this file's own cleanup helper.
+      //
+      // The count is taken twice, and the reason is the same trap this file keeps documenting: the first read of
+      // `select count(*)::int as present from pg_stat_statements` creates its own row in the view, so a "before"
+      // taken early and an "after" taken late measure the probe's own statements as well as the removal. The two
+      // reads here land on one row, so the delta is the removal.
+      const immediatelyBefore = await query(`select count(*)::int as present from pg_stat_statements`);
+      for (const row of mine) await targetedReset(row);
+
+      const after = await query(`select stats_reset from pg_stat_statements_info`);
+      expect(String(after[0].stats_reset), "a targeted reset leaves stats_reset exactly where it was").toBe(
+        String(before[0].stats_reset),
+      );
+      expect(await query(`select queryid from pg_stat_statements where query like $1`, [like(`%${bucket}%`)]),
+        "the rows are gone").toHaveLength(0);
+      const shrunk = await query(`select count(*)::int as present from pg_stat_statements`);
+      expect(Number(shrunk[0].present), "the view shrank, with no reset anywhere to explain it")
+        .toBeLessThan(Number(immediatelyBefore[0].present));
+      await query(`drop table if exists ${bucket}`);
+    });
   });

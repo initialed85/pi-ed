@@ -47,6 +47,16 @@ const argShapes: unknown[][] = [
   ["agent-id"],
   ["agent-id", 12],
   ["agent-id", "a rolled-back flush", 3],
+  // `heartbeatFailureStatement(agentId, repo, error, spoolRows)`. Without a four-argument shape this builder threw
+  // on every shape above and left the reachable set silently - which is exactly what the frozen name list in
+  // `names exactly the builders...` caught, and exactly what the README's "19 statements" claim had been wrong about.
+  ["agent-id", "repo", "could not connect to 10.43.5.96:5432", 7],
+  // `eventStatement(sessionId, agentId, rows)` builds its value tuples in a loop, so a rows array is the only way to
+  // reach it at all. The SQL is dynamic; the statement is not untestable.
+  ["session-1", "agent-id", [
+    { sourceEntryId: "entry-1", kind: "user", at: "2026-01-01T00:00:00Z", text: "how do I roll this back", meta: {} },
+    { sourceEntryId: "entry-2", kind: "tool_result", at: "2026-01-01T00:00:01Z", toolName: "bash", text: "ok", meta: { exit: 0 } },
+  ]],
   [{ sessionId: "s1", agentId: "a", cwd: "/w", repo: "r", firstAt: "2026-01-01T00:00:00Z", lastAt: "2026-01-01T00:00:00Z" }],
   [{ agentLike: "a%" }],
   ["how do I roll this back", "agent-id"],
@@ -157,6 +167,52 @@ describe("every exported statement", () => {
     expect(mismatched).toEqual([]);
   });
 
+  it("names exactly the builders the fleet sweep validates, so a name leaving the set is a diff and not a gap", async () => {
+    // home-ops' runner discovers the builder list from this source rather than trusting a list it maintains, and the
+    // reason is worth encoding here as well: the row of counts a validation sweep prints says nothing when a builder
+    // stops being reachable, while a diff in the *name list* says it immediately. Frozen here so the list changes in
+    // a diff that gets reviewed, not in someone's memory.
+    const mod = await loadModule();
+    const builders = Object.keys(mod).filter((name) => name.endsWith("Statement")).sort();
+    expect(builders).toEqual([
+      "agentStatement",
+      "dreamCursorStatement",
+      "dreamSpanStatement",
+      "dreamStatement",
+      "eventStatement",
+      "heartbeatActivityStatement",
+      "heartbeatAdvisoryAlertStatement",
+      "heartbeatFailureStatement",
+      "heartbeatFlushStatement",
+      "heartbeatPageAlertStatement",
+      "heartbeatReadStatement",
+      "heartbeatSweepStatement",
+      "identityPairStatement",
+      "ownRowCountStatement",
+      "sessionStatement",
+      "storeReadingSanityStatement",
+      "storeShapeCountsStatement",
+      "subjectsStatement",
+      "vectorCoverageStatement",
+    ]);
+
+    // One builder assembles its value tuples in a loop, so no static extraction can reach its SQL and it is the one
+    // name a sweep has to report as information rather than as a validation. Naming it here keeps the exception a
+    // reviewed fact instead of a silent hole: a second name appearing in this list means a statement left the
+    // reachable set without anyone saying so.
+    const text = readFileSync(source, "utf8");
+    const dynamic = builders.filter((name) => {
+      const after = text.split(`export function ${name}(`)[1] ?? "";
+      return /\bfor \(|\.map\(|\.push\(/.test(after.slice(0, after.indexOf("\nexport ")));
+    });
+    expect(dynamic).toEqual(["eventStatement"]);
+
+    // And every name in the list is actually reachable by the sweep's argument shapes. A builder that started
+    // requiring an argument the sweep does not try would be absent from the collected set while still being here.
+    const collected = collect(mod).map((s) => s.name);
+    expect(builders.filter((name) => !collected.includes(name))).toEqual([]);
+  });
+
   it("leaves the spool it was handed alone", async () => {
     // A sweep that calls every export with fixture arguments is a sweep that can reach a file handle. Run the sweep,
     // then look at the file it would have written to.
@@ -217,6 +273,15 @@ describe.skipIf(!liveDsn)("every exported statement, prepared against the real s
     // same statement list.
     expect(rejected).toEqual([]);
     expect(prepared).toBeGreaterThanOrEqual(18);
+    // The stronger invariant, and the one that would have caught this file's own gap: not "at least 18", but "no
+    // exported builder is missing". Two builders were unreachable through the argument shapes above -
+    // `heartbeatFailureStatement` needed a fourth argument and `eventStatement` needed a rows array - and a run of 18
+    // looked like a pass while the two most write-shaped statements in the extension went unvalidated. A count is
+    // evidence about the sweep; a name list is evidence about the store.
+    const preparedNames = new Set(specs.map((s) => s.name));
+    const unreachable = Object.keys(await loadModule())
+      .filter((name) => name.endsWith("Statement") && !preparedNames.has(name));
+    expect(unreachable, "every exported builder must be reachable by the sweep's argument shapes").toEqual([]);
   });
 
   it("leaves no statement in the view labelled with its own probe names", async () => {
