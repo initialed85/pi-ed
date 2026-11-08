@@ -26,6 +26,10 @@ export interface SiblingHit {
   row: { calls: number; dbid: string; userid: string; query: string };
   byClause: boolean;
   byHead: boolean;
+  /** The row whose stored text IS the statement - the row it would land on. A tier above the two candidate keys,
+   *  because the measured curve says no normalisation recovers a generation family, so "this is the row" and "this
+   *  resembles the row" must never be added together. */
+  exact: boolean;
 }
 /** Rows that are the same statement to a reader and different rows to Postgres. */
 export function siblings(rows: Record<string, { calls: number; dbid: string; userid: string; query: string }>, statement: string): SiblingHit[];

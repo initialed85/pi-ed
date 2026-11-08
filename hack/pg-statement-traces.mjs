@@ -197,17 +197,37 @@ export function resetArguments(order, row, queryid) {
  * Two keys are used, because a generation can move either side of the statement: the relation clause catches a
  * select-list change, and the leading text catches a `where`-clause change. A match on either is a candidate
  * sibling, not a verdict, and the report says which key fired.
+ *
+ * A third tier is reported above both of them: `exact`, the row whose stored text IS the statement. It exists because
+ * replaying home-ops' committed baseline through this function (home-ops `13aef71`, `test/fixtures/
+ * home-ops-baseline-2026-11-08.json`) showed that their claim - "signature matching, aliases and qualification
+ * stripped, i.e. what the hash does, recovers the seven" - is the one thing the curve forbids. The seven generations
+ * are seven BECAUSE they are structurally different, and the hash is that structure. Measured, probing
+ * `insert into writer_heartbeat (agent_id, repo, last_activity_at) values ...`:
+ *
+ *   exact text (the hash itself)              1/7 recovered, 0 false
+ *   aliases + qualification stripped          1/7, 0
+ *   + column list stripped                    1/7, 0
+ *   + values list stripped                    1/7, 0
+ *   my clause|head union                     5/7, 13 false
+ *   table name only                          7/7, 57 false
+ *
+ * Every identity-normalised key recovers exactly one, because normalising toward the hash walks toward the split, not
+ * toward the family. There is no key that recovers a generation family and stays precise, because the family is
+ * defined by the differences that created it. So the tiers are reported, never merged.
  */
 export function siblings(rows, statement) {
   const norm = (text) => text.replace(/\s+/g, " ").trim().toLowerCase();
   const clause = skeleton(statement);
   const head = norm(statement).slice(0, 40);
+  const exact = norm(statement);
   const hits = [];
   for (const [queryid, row] of Object.entries(rows)) {
     const text = norm(row.query);
+    const isExact = text === exact;
     const byClause = clause.length > 0 && skeleton(row.query) === clause;
     const byHead = head.length > 0 && text.startsWith(head);
-    if (byClause || byHead) hits.push({ queryid, row, byClause, byHead });
+    if (isExact || byClause || byHead) hits.push({ queryid, row, byClause, byHead, exact: isExact });
   }
   return hits;
 }
@@ -348,18 +368,25 @@ async function main() {
     for (const statement of runStatements) {
       const hits = siblings(after.byId, statement);
       const head = statement.replace(/\s+/g, " ").trim().slice(0, 60);
+      // Three tiers, reported separately, because the measured trade-off is that no two of them agree and none of
+      // them is an identity. `exact` is the row the statement would land on; the others are candidates.
+      const exact = hits.filter((hit) => hit.exact);
       const byClause = hits.filter((hit) => hit.byClause);
       const byHead = hits.filter((hit) => hit.byHead);
       console.log(`    ${head}`);
-      console.log(`      ${byClause.length} row(s) share its relation clause; ${byHead.length} row(s) share its leading 40 characters`);
+      console.log(
+        `      ${exact.length} row(s) whose text IS this statement; ${byClause.length} share its relation clause; ${byHead.length} share its leading 40 characters`,
+      );
       for (const hit of [...hits].sort((a, b) => Number(b.row.calls) - Number(a.row.calls)).slice(0, 8)) {
-        const key = hit.byClause && hit.byHead ? "clause+head" : hit.byClause ? "clause" : "head";
+        const key = hit.exact ? "exact" : hit.byClause && hit.byHead ? "clause+head" : hit.byClause ? "clause" : "head";
         console.log(`        ${hit.queryid}  calls=${hit.row.calls}  ${key}  ${hit.row.query.replace(/\s+/g, " ").slice(0, 88)}`);
       }
       if (hits.length > 1) {
         console.log(`      ${hits.length} rows in the group, ${hits.reduce((sum, hit) => sum + Number(hit.row.calls), 0)} calls summed across them`);
         console.log("      rows matched by clause alone may be different statements on the same relation; the group is a signal, not a verdict");
         console.log("      a baseline keyed on this view is per-generation, not per-statement: sum the rows or drop the count");
+        // The measured curve, said out loud, because "just normalise it" is the first thing a reader reaches for.
+        console.log("      no normalisation recovers a generation family: replaying home-ops' 370-row baseline, every identity key recovers 1 of 7 and the only key that recovers 7 carries 57 false");
       }
     }
   }
