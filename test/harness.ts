@@ -247,7 +247,11 @@ export function createFakeUi(): FakeUi {
       ui.notifications.push({ message, level });
     },
     setWidget: (key, value) => {
-      ui.widgets.set(key, value);
+      // Pi's contract is that `setWidget(key, undefined)` clears. A double that keeps the key holding an undefined
+      // value lets a test pass on a panel that is still registered and merely empty, which is the difference between
+      // "hidden" and "taking up the space anyway".
+      if (value === undefined) ui.widgets.delete(key);
+      else ui.widgets.set(key, value);
     },
     setStatus: (key, value) => {
       ui.statuses.set(key, value);

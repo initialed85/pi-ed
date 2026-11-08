@@ -1246,6 +1246,8 @@ export default function memoryExtension(api: ExtensionAPI): void {
   let workSeen = 0;
   let dreamed = 0;
   let sessionOpenedAt = Date.now();
+  /** Whether the `/memory` panel is currently above the editor. Pi keeps a widget until something clears it. */
+  let panelOpen = false;
   const triggers = new Map<string, Trigger>();
   /**
    * Faults this extension caught rather than caused, newest last, capped at five.
@@ -1271,7 +1273,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
    * take the session down with it, so the notify path is wrapped and the dropped message is recorded. By the time any
    * of these run, the rows are already in the store or on disk: the message was always the optional part.
    */
-  function ui(ctx: ExtensionContext | undefined): { notify: (text: string, level?: "info" | "warning" | "error") => void; widget: (key: string, lines: string[]) => void } {
+  function ui(ctx: ExtensionContext | undefined): { notify: (text: string, level?: "info" | "warning" | "error") => void; widget: (key: string, lines: string[]) => void; clear: (key: string) => void } {
     return {
       notify: (text, level) => {
         try {
@@ -1286,6 +1288,13 @@ export default function memoryExtension(api: ExtensionAPI): void {
           else if (ctx) ctx.ui.notify(lines.join("\n"), "info");
         } catch (error) {
           fault(`render ${key} into a replaced context`, error);
+        }
+      },
+      clear: (key) => {
+        try {
+          ctx?.ui.setWidget(key, undefined);
+        } catch (error) {
+          fault(`clear ${key} on a replaced context`, error);
         }
       },
     };
@@ -1514,6 +1523,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
 
   api.on("session_start", (event, ctx) => {
     sessionOpenedAt = Date.now();
+    panelOpen = false;
     queued = [];
     seen.clear();
     recorded = 0;
@@ -1537,9 +1547,15 @@ export default function memoryExtension(api: ExtensionAPI): void {
     if (!event.aborted) scheduleDream(ctx, cfg.idleDreamMinutes ?? DEFAULTS.idleDreamMinutes, "idle10m");
   });
 
-  api.on("agent_start", () => {
+  api.on("agent_start", (_event, ctx) => {
     // Work arrived. A dream about to fire is now badly timed and would collide with the turn.
     if (dreamTimer) clearTimeout(dreamTimer);
+    // ...and a diagnostic panel above the editor is now in the way of that work. Pi holds a widget until something
+    // clears it, and nothing else in this extension ever cleared one, which is how `/memory` became furniture.
+    if (panelOpen) {
+      panelOpen = false;
+      ui(ctx).clear("memory");
+    }
   });
 
   api.on("session_before_compact", (_event, ctx) => {
@@ -1753,8 +1769,20 @@ export default function memoryExtension(api: ExtensionAPI): void {
   });
 
   api.registerCommand("memory", {
-    description: "What this agent's memory holds, and whether writes are landing",
-    handler: async (_args, ctx) => {
+    description: "What this agent's memory holds, and whether writes are landing (run it again, or `/memory off`, to put the panel away)",
+    handler: async (args, ctx) => {
+      // Putting the panel away must not need the store, so it happens before any work: a command whose only job is to
+      // stop drawing should not be the slowest command in the session.
+      if (panelOpen && !args.trim()) {
+        panelOpen = false;
+        ui(ctx).clear("memory");
+        return;
+      }
+      if (args.trim() === "off") {
+        panelOpen = false;
+        ui(ctx).clear("memory");
+        return;
+      }
       await flush(ctx, "manual");
       const db = await database();
       const agent = agentIdentity(ctx, cfg);
@@ -1807,6 +1835,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
       // The widget is the output: a command that answers with a wall of text in the transcript is a command that
       // pollutes the session it was run in. Pi's command handlers return nothing.
       ui(ctx).widget("memory", lines);
+      panelOpen = true;
     },
   });
 }

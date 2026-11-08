@@ -1096,6 +1096,50 @@ describe("the extension", () => {
     expect(widget).toContain("recorded row(s)");
     expect([...ui.widgets.keys()]).toContain("memory");
   });
+
+  it("puts the /memory panel away when asked, twice over", async () => {
+    // 2026-11-08, Ed: "it seems to pin a memory state to the bottom of the chat, but then you can't make it go away."
+    // Correct, and the reason is a rule about Pi rather than a bug in a line: a widget stays until something clears
+    // it, and this extension had no code path that cleared one. So the panel was furniture.
+    const { context, ui } = contextFor();
+    const command = pi.commands.get("memory")!;
+
+    await command.handler!("", context);
+    expect(ui.widgets.get("memory"), "the widget is the output of /memory").toBeTruthy();
+    // Running the same command again is the dismiss a user reaches for first, before any subcommand exists.
+    await command.handler!("", context);
+    expect(ui.widgets.get("memory"), "a panel above the editor that the user cannot dismiss takes the editor's space forever").toBeUndefined();
+
+    await command.handler!("", context);
+    expect(ui.widgets.get("memory")).toBeTruthy();
+    await command.handler!("off", context);
+    expect([...ui.widgets.keys()], "`/memory off` has to actually unregister the widget, not leave it there empty").not.toContain("memory");
+  });
+
+  it("gets out of the way when work resumes", async () => {
+    // A diagnostic is worth its height only while it is the thing being read. Once a turn starts, a panel above the
+    // editor is competing with the work it was describing.
+    const { context, ui } = contextFor();
+    await pi.commands.get("memory")!.handler!("", context);
+    expect(ui.widgets.get("memory")).toBeTruthy();
+    await pi.emit("agent_start", { type: "agent_start" }, context);
+    expect(ui.widgets.get("memory"), "the panel survived into a new turn, which is how it stopped being a diagnostic").toBeUndefined();
+  });
+
+  it("does not need the store to put the panel away", async () => {
+    // The dismiss runs before any database work on purpose. A command whose only job is to stop drawing should not be
+    // the slowest command in the session, and unreachable-store sessions are exactly where people reach for it.
+    const { context, ui } = contextFor();
+    const command = pi.commands.get("memory")!;
+    await command.handler!("", context);
+    const opened = ui.widgets.get("memory") as string[] | undefined;
+    expect(opened).toBeTruthy();
+    expect(opened!.some((line) => line.includes("127.0.0.1:1/memory-test")), "this test's store is unreachable, and the panel is reporting that").toBe(true);
+    const started = Date.now();
+    await command.handler!("off", context);
+    expect(ui.widgets.get("memory")).toBeUndefined();
+    expect(Date.now() - started, "hiding a panel must not wait on a connection").toBeLessThan(250);
+  });
 });
 
 /* helpers */
