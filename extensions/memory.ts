@@ -1247,6 +1247,76 @@ export default function memoryExtension(api: ExtensionAPI): void {
   let dreamed = 0;
   let sessionOpenedAt = Date.now();
   const triggers = new Map<string, Trigger>();
+  /**
+   * Faults this extension caught rather than caused, newest last, capped at five.
+   *
+   * A caught fault that nobody can see is a fault that never happened, and `/memory` is the only place this writer
+   * reports. They are kept separate from `lastError` because they mean something different: `lastError` is the store
+   * refusing a batch, these are us reaching across a lifetime boundary the harness moved.
+   */
+  const internalFaults: { at: number; label: string; error: string }[] = [];
+
+  function fault(label: string, error: unknown): void {
+    internalFaults.push({ at: Date.now(), label, error: describeStoreError(error instanceof Error ? error.message : String(error)) });
+    if (internalFaults.length > 5) internalFaults.shift();
+  }
+
+  /**
+   * A notification belongs to a context, and a context can outlive its own right to deliver one.
+   *
+   * Pi invalidates an extension context on `/reload`, on a new session, on a fork and on a session switch, and then
+   * throws from `assertActive` when anything on the old one is read - including `ctx.hasUI`, which is a getter, so a
+   * bare existence check is enough to trip it. Every UI touch in this file sits after an `await`, which is exactly
+   * where the boundary moves underneath it. A writer whose only crime was trying to say "the write failed" must not
+   * take the session down with it, so the notify path is wrapped and the dropped message is recorded. By the time any
+   * of these run, the rows are already in the store or on disk: the message was always the optional part.
+   */
+  function ui(ctx: ExtensionContext | undefined): { notify: (text: string, level?: "info" | "warning" | "error") => void; widget: (key: string, lines: string[]) => void } {
+    return {
+      notify: (text, level) => {
+        try {
+          if (ctx?.hasUI) ctx.ui.notify(text, level);
+        } catch (error) {
+          fault("notify into a replaced context", error);
+        }
+      },
+      widget: (key, lines) => {
+        try {
+          if (ctx?.hasUI) ctx.ui.setWidget(key, lines);
+          else if (ctx) ctx.ui.notify(lines.join("\n"), "info");
+        } catch (error) {
+          fault(`render ${key} into a replaced context`, error);
+        }
+      },
+    };
+  }
+
+  /**
+   * Nothing in this extension is allowed to be fire-and-forget.
+   *
+   * A discarded promise whose rejection nobody handles is not a quiet failure in Pi: Node reports it as an
+   * uncaughtException and the agent exits. That is how this writer killed the whole slopyphus fleet on `/reload` -
+   * `void flush(ctx)` had already handed its rejection to nobody, so the stale-context throw surfaced as a process
+   * death rather than as a bad write. Internal correctness cannot fix a call site that drops a promise, so every
+   * call site keeps the rejection here, and a rescue runs when dropping the work would lose rows.
+   */
+  function attempt(label: string, work: Promise<unknown>, rescue?: () => void): void {
+    work.catch((error) => {
+      fault(label, error);
+      try {
+        rescue?.();
+      } catch (rescueError) {
+        fault(`${label} (rescue)`, rescueError);
+      }
+    });
+  }
+
+  /** Rows queued while the context was live keep their own session, so an aborted flush can still be written out. */
+  function rescueQueue(): void {
+    if (!queued.length) return;
+    writeSpool(queued.map((row) => ({ ...row, sessionId: row.sessionId ?? "unknown-session" })));
+    queued = [];
+  }
 
   async function database(): Promise<Db | undefined> {
     if (pool) return pool;
@@ -1273,7 +1343,10 @@ export default function memoryExtension(api: ExtensionAPI): void {
       const key = `${sessionId}|${row.sourceEntryId}|${row.kind}|${row.toolName ?? ""}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      queued.push(row);
+      // The session is baked in here, at the moment it is knowable, rather than resolved at write time. A flush that
+      // fires from a timer or after the context is gone cannot ask a dead context which session it belonged to, and a
+      // row that cannot name its session cannot be rescued to the spool.
+      queued.push({ ...row, sessionId });
       fresh += 1;
     }
     recorded = seen.size;
@@ -1351,7 +1424,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
       }
       // The batch and whatever was already spooled both go back to disk together.
       writeSpool(all.map((row) => ({ ...row, sessionId: row.sessionId ?? sessionId })));
-      if (ctx?.hasUI) ctx.ui.notify(`memory: write failed, ${all.length} row(s) spooled (${lastError})`, "warning");
+      ui(ctx).notify(`memory: write failed, ${all.length} row(s) spooled (${lastError})`, "warning");
       client?.release();
       client = undefined;
       await stamp(agent, repo, "failure", lastError, all.length);
@@ -1394,7 +1467,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
     collect(ctx);
     if (!queued.length) return;
     if (flushTimer) clearTimeout(flushTimer);
-    flushTimer = setTimeout(() => void flush(ctx, "flush"), cfg.flushMs ?? DEFAULTS.flushMs);
+    flushTimer = setTimeout(() => attempt("debounced flush after its context was replaced", flush(ctx, "flush"), rescueQueue), cfg.flushMs ?? DEFAULTS.flushMs);
     flushTimer.unref?.();
   }
 
@@ -1411,18 +1484,25 @@ export default function memoryExtension(api: ExtensionAPI): void {
       // Silence is what a correctly behaved idle session looks like. The case worth one line of explanation is the
       // one a watcher cannot distinguish from a broken trigger: this session has already dreamed, and the reason it
       // is not dreaming again is that the dreaming itself is not work.
-      if (ctx.hasUI && dreamed > 0) ctx.ui.notify(`memory: idle after dreaming - ${workSeen} work row(s), all already summarized`, "info");
+      if (dreamed > 0) ui(ctx).notify(`memory: idle after dreaming - ${workSeen} work row(s), all already summarized`, "info");
       return;
     }
     triggers.set(sessionIdOf(ctx), trigger);
     dreamStartedAt = Date.now();
-    await api.sendMessage({ customType: "memory:dream", content: DREAM_PROMPT, display: false, details: { trigger } }, { triggerTurn: true });
+    try {
+      await api.sendMessage({ customType: "memory:dream", content: DREAM_PROMPT, display: false, details: { trigger } }, { triggerTurn: true });
+    } catch (error) {
+      // The dream never started, so the clock has to be let go or this session believes it is dreaming for the next
+      // DREAM_TURN_TIMEOUT_MS and quietly refuses every later trigger.
+      dreamStartedAt = 0;
+      fault("dream prompt into a replaced context", error);
+    }
   }
 
   function scheduleDream(ctx: ExtensionContext, minutes: number, trigger: Trigger): void {
     if (!cfg.dreams) return;
     if (dreamTimer) clearTimeout(dreamTimer);
-    dreamTimer = setTimeout(() => void runDream(ctx, trigger), minutes * 60_000);
+    dreamTimer = setTimeout(() => attempt("dream timer after its context was replaced", runDream(ctx, trigger)), minutes * 60_000);
     dreamTimer.unref?.();
   }
 
@@ -1444,7 +1524,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
     // `pi -c` reports "startup" rather than "resume", so both are treated as a session that arrived from history.
     // The activity half of the watermark: an agent that opened a session and then never committed anything is the
     // exact shape a broken write path leaves behind.
-    void stamp(agentIdentity(ctx, cfg), basename(ctx.cwd ?? process.cwd()), "activity");
+    attempt("activity stamp", Promise.resolve().then(() => stamp(agentIdentity(ctx, cfg), basename(ctx.cwd ?? process.cwd()), "activity")));
     if (event.reason === "resume" || event.reason === "startup") scheduleDream(ctx, cfg.resumeDreamMinutes ?? DEFAULTS.resumeDreamMinutes, "resume10m");
   });
 
@@ -1465,14 +1545,14 @@ export default function memoryExtension(api: ExtensionAPI): void {
   api.on("session_before_compact", (_event, ctx) => {
     // Flush without waiting for it: compaction is the harness discarding context, and a slow database must not hold
     // that up. The rows land a moment later, and the spool catches the case where they cannot.
-    void flush(ctx, "pre_compaction");
-    void runDream(ctx, "pre_compaction");
+    attempt("pre-compaction flush", flush(ctx, "pre_compaction"), rescueQueue);
+    attempt("pre-compaction dream", runDream(ctx, "pre_compaction"));
   });
 
   api.on("session_shutdown", (_event, ctx) => {
     if (flushTimer) clearTimeout(flushTimer);
     if (dreamTimer) clearTimeout(dreamTimer);
-    void flush(ctx, "manual");
+    attempt("shutdown flush", flush(ctx, "manual"), rescueQueue);
   });
 
   /* The model-facing surface. */
@@ -1656,7 +1736,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
         dreamed = workSeen;
         triggers.delete(sessionId);
         const vectorNote = embedded.ok ? `vector from ${embedded.model} (${embedded.tokens} tokens, ${embedded.chunks} chunk(s))` : `no vector (${embedded.error})`;
-        if (ctx.hasUI) ctx.ui.notify(`memory: dream written (${subjects.join(", ") || "no subjects"}, ${vectorNote})`, "info");
+        ui(ctx).notify(`memory: dream written (${subjects.join(", ") || "no subjects"}, ${vectorNote})`, "info");
         return {
           content: [{ type: "text", text: `dream recorded for session ${sessionId} (${trigger}); subjects: ${subjects.join(", ") || "none"}; ${vectorNote}` }],
           details: { subjects, trigger, embedded: embedded.ok, embed: embedded.ok ? { tokens: embedded.tokens, chunks: embedded.chunks, model: embedded.model } : embedded.error },
@@ -1723,10 +1803,10 @@ export default function memoryExtension(api: ExtensionAPI): void {
       lines.push(`dreams     ${cfg.dreams ? `idle ${cfg.idleDreamMinutes ?? DEFAULTS.idleDreamMinutes}m, resume ${cfg.resumeDreamMinutes ?? DEFAULTS.resumeDreamMinutes}m, before compaction` : "off"}`);
       lines.push(`embedder   ${cfg.embeddings === false ? "off (memories will be written without vectors)" : `${cfg.embedUrl ?? DEFAULTS.embedUrl} · ${cfg.embedModel ?? DEFAULTS.embedModel} · ${EMBEDDING_DIMENSIONS}-dim`}`);
       if (lastEmbed) lines.push(`last embed ${lastEmbed.error ? `failed: ${lastEmbed.error}` : `${lastEmbed.model} ${lastEmbed.tokens} tokens in ${lastEmbed.chunks} chunk(s)`}`);
+      if (internalFaults.length) lines.push(`faults     ${internalFaults.map((f) => `${f.label}: ${f.error}`).join(" | ")}`);
       // The widget is the output: a command that answers with a wall of text in the transcript is a command that
       // pollutes the session it was run in. Pi's command handlers return nothing.
-      if (ctx.hasUI) ctx.ui.setWidget("memory", lines);
-      else ctx.ui.notify(lines.join("\n"), "info");
+      ui(ctx).widget("memory", lines);
     },
   });
 }

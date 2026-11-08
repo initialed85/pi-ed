@@ -1622,6 +1622,66 @@ ticket and the Longhorn CSI plugin's own logs, and the fix from there is Ed's ca
 Assert presence and mtime when checking a backup, never size. A few hundred bytes is the correct output of a healthy
 store the live check has just cleaned out; a `Complete` CronJob with no new file is the failure mode.
 
+## Live: the fleet started writing, and the first thing it did was crash
+
+2026-11-08 13:39 Perth, home-ops `a6a1181` "Turn on memory, maybe, idk let's see": `PI_MEMORY_DSN` mounted from a
+Secret into every slopyphus agent. Ed ignored my staged canary plan, which turned out to be a reasonable call - the
+only way to learn what this store does at fleet scale is to run it at fleet scale.
+
+**It works.** Half an hour after it went on: 20 agents, 20 sessions, 20,880 events, 15 memories, **15 with vectors**,
+and a `writer_heartbeat` row per writer with `failures = 0`, `spool_rows = 0`, and activity/flush timestamps agreeing
+to the second. The debounce contract this file has been arguing about for days is now an observation rather than a
+design claim. Dreams fired on several agents, including honest ones - "Nothing worth recording: the stretch was a
+greeting exchange" - which is the behaviour the dream prompts were written to produce.
+
+**And `/reload` killed every agent that ran it.**
+
+```
+pi exiting due to uncaughtException:
+Error: This extension ctx is stale after session replacement or reload. ...
+    at ExtensionRunner.assertActive (.../pi-coding-agent/dist/bundle/chunks-chunk-D4DLKSKE.js:530:13443)
+    at get hasUI
+    at flush (/root/.pi/agent/git/initialed85/d85/pi-ed/extensions/memory.ts:1354:14)
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+```
+
+Two faults, and only one of them is about contexts:
+
+1. **A notification belongs to a context, and a context can outlive its right to deliver one.** Pi invalidates an
+   extension context on `/reload`, a new session, a fork and a session switch, then throws from `assertActive` on any
+   read of the old one - including `ctx.hasUI`, which is a *getter*, so merely asking whether there is a UI trips it.
+   Every UI read in `memory.ts` sat after an `await`, which is exactly where the boundary moves underneath it.
+2. **`void flush(ctx)` handed its rejection to nobody.** That is the part that killed the process: Node reports an
+   unhandled rejection as an uncaughtException and Pi exits. Six call sites did this. Internal correctness cannot fix
+   a call site that throws a promise away, so the fix is at the call sites.
+
+The shape of the fix, in `extensions/memory.ts`: `ui(ctx)` is the one place allowed to read `hasUI`, and it wraps the
+read; `attempt(label, work, rescue)` keeps every rejection and runs a rescue when dropping the work would lose rows;
+and `collect` now bakes `sessionId` into each queued row at the moment the session is knowable, because a flush that
+fires from a timer or after its context is dead cannot ask a dead context which session it belonged to. Faults are
+recorded in `internalFaults` (newest five) and printed by `/memory` - a caught fault nobody can see is a fault that
+never happened.
+
+The regression tests drive a context that reads exactly as a replaced one does, and the assertion that failed before
+the fix was the production message itself appearing in Node's `unhandledRejection`. One of the assertions is a static
+rule over the source - no `void flush(`, no `ctx.hasUI` outside `ui(ctx)` - and its first run failed on **the comment
+that documents the bug it exists to prevent**, because a scan that cannot tell prose from code reports its own
+description as a violation. That is the third time this repository has tripped on that, and it is now part of the
+assertion rather than a lesson in a comment.
+
+**A live test is a claim about the store, and the store stopped being quiet.** `retrieval-scoping.test.ts` planted one
+probe memory, searched as a different identity with `limit 5`, and asserted the result set was exactly one row. It
+came back with the probe row plus four things agents had genuinely remembered. Nothing was broken in the query or the
+store; the assertion was a count over a corpus that this system exists to fill. It now asserts the properties it is
+actually about - the planted row is findable, labelled `mine: false`, weighted 0.65 as a teammate row - plus one new
+invariant worth having: no row in the result set carries a probe name, because a probe that outlives its test becomes
+part of the corpus it was meant to measure.
+
+**One number that is not yet a decision:** of 20,880 events, 7,122 are `marker` rows and 458 are `assistant`. Markers
+are the majority of what this store holds after half an hour. They may be exactly the right thing to keep; they are
+currently kept because no one decided either way, and `skip: ["marker"]` exists as the lever.
+
+
 ## Apply
 
 Apply them in filename order - `001` is the store, `002` added `event.source_entry_id`, `003` added

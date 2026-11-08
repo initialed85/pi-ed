@@ -77,6 +77,32 @@ async function spooled(deadlineMs = 15_000): Promise<string[]> {
   }
 }
 
+/**
+ * A context in the state Pi puts one in after `/reload`, a new session, a fork or a session switch.
+ *
+ * Pi's `assertActive` throws from any property read on a replaced context, `hasUI` included - and `hasUI` is a getter,
+ * so a bare "is there a UI to talk to" check is enough to trip it. Mutating the object the extension already captured
+ * is closer to what actually happens than handing it a different object: the capture is the bug.
+ */
+function makeStale(ctx: any): void {
+  const boom = () => {
+    throw new Error("This extension ctx is stale after session replacement or reload.");
+  };
+  for (const key of ["hasUI", "ui", "cwd", "sessionManager"]) Object.defineProperty(ctx, key, { get: boom, configurable: true });
+}
+
+/**
+ * Node's verdict on a discarded promise, which is also Pi's: an unhandled rejection is reported as an
+ * uncaughtException and the agent exits. A writer that cannot crash the process it lives in has to be able to see
+ * the moment it is about to.
+ */
+function watchUnhandledRejections(): { reasons: unknown[]; stop: () => void } {
+  const reasons: unknown[] = [];
+  const onRejection = (reason: unknown) => reasons.push(reason);
+  process.on("unhandledRejection", onRejection);
+  return { reasons, stop: () => process.off("unhandledRejection", onRejection) };
+}
+
 function branch(): any[] {
   return [
     { type: "message", id: "e1", parentId: null, timestamp: "2026-11-08T01:00:00.000Z", message: { role: "user", content: "ship the pgvector store" } },
@@ -689,6 +715,72 @@ describe("the extension", () => {
     const first = JSON.parse(lines[0]!);
     expect(first.sessionId).toBe("session-1");
     expect(["user", "assistant", "tool_call", "tool_result", "marker", "system"]).toContain(first.kind);
+  });
+
+  it("survives a context replaced under a debounced write", async () => {
+    // 2026-11-08, slopyphus: every agent that ran /reload exited with `pi exiting due to uncaughtException ... This
+    // extension ctx is stale after session replacement or reload`, the stack frame naming `flush` in this file. The
+    // debounce had captured a context, the human replaced the session inside the debounce window, and the timer fired
+    // the captured context into a getter that no longer allows being read.
+    const watcher = watchUnhandledRejections();
+    try {
+      const live = contextFor();
+      await pi.emit("turn_end", { turnIndex: 0, messageEntryId: "e2", toolResultEntryIds: ["e3"] }, live.context);
+      makeStale(live.context);
+      vi.useFakeTimers();
+      vi.advanceTimersByTime(5_000);
+      vi.useRealTimers();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(watcher.reasons, "a flush that outlived its context reached Node as an unhandled rejection, and Pi exits on that").toEqual([]);
+      const lines = await spooled();
+      expect(lines.length, "the aborted flush dropped the queued rows instead of rescuing them").toBeGreaterThan(0);
+      expect(JSON.parse(lines[0]!).sessionId, "a row has to carry its session from the moment the context was still live, because the flush that writes it out may not have one").toBe("session-1");
+    } finally {
+      watcher.stop();
+    }
+  });
+
+  it("survives a context already dead when shutdown asks for the last write", async () => {
+    const watcher = watchUnhandledRejections();
+    try {
+      const live = contextFor();
+      await pi.emit("turn_end", { turnIndex: 0, messageEntryId: "e2", toolResultEntryIds: ["e3"] }, live.context);
+      const dead = contextFor();
+      makeStale(dead.context);
+      await pi.emit("session_shutdown", { reason: "reload" }, dead.context);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(watcher.reasons, "the shutdown flush is the one place a writer is guaranteed to be mid-await when the context goes").toEqual([]);
+      expect((await spooled()).length, "rows queued against a live context must not evaporate with the dead one").toBeGreaterThan(0);
+    } finally {
+      watcher.stop();
+    }
+  });
+
+  it("keeps every asynchronous call site holding its own rejection", () => {
+    // The rule, not one instance of it. Internal correctness cannot fix a call site that throws a promise away, so
+    // the source itself is asserted: no fire-and-forget in a file that runs inside somebody else's process.
+    //
+    // Comment lines are excluded, and not as a convenience. The first run of this assertion failed on the comment
+    // that documents the bug it exists to prevent, which is the lesson this repository already has written down twice:
+    // a scan that cannot tell prose from code reports its own description as a violation and then gets ignored.
+    const source = readFileSync(MODULE, "utf8");
+    // One prose test for both assertions below, because both are counts and a count over prose counts the prose.
+    const isProse = (line: string) => /^\s*(\*|\/\/|\/\*)/.test(line);
+    const dropped = source
+      .split("\n")
+      .flatMap((line, index) => (isProse(line) ? [] : [...line.matchAll(/\bvoid\s+(flush|runDream|stamp|collect|database|dream)\(/g)].map((match) => `line ${index + 1}: ${match[0]}`)));
+    expect(dropped, "a discarded promise here is an unhandled rejection, and Pi treats one as fatal").toEqual([]);
+    const code = source.split("\n").filter((line) => !isProse(line)).join("\n");
+    // Every read of `hasUI` has to live inside ui(ctx), the one place that wraps it. Counting the whole file against
+    // the count inside the helper is what makes it a rule rather than a review note: a new `if (ctx.hasUI)` anywhere
+    // else changes one number and not the other.
+    const startsAt = code.indexOf("function ui(ctx");
+    expect(startsAt, "ui(ctx) is the wrapper every UI read goes through; without it this assertion has nothing to allow").toBeGreaterThan(-1);
+    const helper = code.slice(startsAt, code.indexOf("\n  }", startsAt));
+    const inHelper = (helper.match(/ctx\??\.hasUI/g) ?? []).length;
+    const everywhere = (code.match(/ctx\??\.hasUI/g) ?? []).length;
+    expect(inHelper, "ui(ctx) itself has to be the one reading hasUI").toBeGreaterThan(0);
+    expect(everywhere, "a `ctx.hasUI` read outside ui(ctx) is a getter on a context that may already be dead").toBe(inHelper);
   });
 
   it("dreams ten minutes after going idle, as a hidden message that starts a turn", async () => {

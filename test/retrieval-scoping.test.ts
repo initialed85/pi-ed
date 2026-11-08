@@ -126,14 +126,23 @@ suite("retrieval scope, against the store", () => {
     const statement = mod.vectorSearch!(`${PROBE}-stray`, basis(5), { limit: 5 });
     const rows = (await query(statement.sql, statement.values)).rows;
 
-    // Exactly one row, and the store's own `mine` flag says it is not the searcher's - which is the correct answer to
-    // a correct query. Nothing is broken: the vector matched perfectly, the row is labelled with the id that wrote
-    // it, and the searcher has nothing of its own to find.
-    expect(rows.length).toBe(1);
-    expect(rows[0]!.mine).toBe(false);
-    expect(String(rows[0]!.agent_id)).toBe(`${PROBE}-owner`);
-    expect(Number(rows[0]!.similarity)).toBeGreaterThan(0.99);
-    expect(Number(rows[0]!.weight)).toBe(0.65);
+    // The planted row, found by name rather than by position in the result set.
+    //
+    // This assertion used to be `rows.length` is 1, and it broke the day the store stopped being a test store: 2026-11-08,
+    // Ed shipped memory.ts to every slopyphus agent, fifteen genuine fleet memories landed with vectors in them, and a
+    // limit-5 search on a probe embedding came back with the probe row plus four things agents had actually remembered.
+    // Nothing was wrong with the query and nothing was wrong with the store. A count over a result set is only a
+    // claim about a quiet store, and the entire point of this system is that the store stops being quiet. So the claim
+    // is now about the row this test owns: that it is there, that it is labelled as somebody else's, and that the
+    // weighting the test is named for is the weighting that was applied to it.
+    const planted = rows.find((row) => String(row.agent_id) === `${PROBE}-owner`);
+    expect(planted, "a memory written by the identity this agent used then must still be findable by the identity it uses now").toBeTruthy();
+    expect(planted!.mine, "the searcher is not the writer, and the store has to say so on the row").toBe(false);
+    expect(Number(planted!.similarity)).toBeGreaterThan(0.99);
+    expect(Number(planted!.weight)).toBe(0.65);
+    // Rows that are not this test's are the fleet's, and they must not be leftovers wearing a probe name.
+    const crowd = rows.filter((row) => String(row.agent_id) !== `${PROBE}-owner`);
+    expect(crowd.filter((row) => String(row.agent_id).startsWith(PROBE)).map((row) => row.agent_id), "a probe that outlives its test becomes part of the corpus it was meant to measure").toEqual([]);
 
     // The pair a reader needs to tell identity drift from a missing memory, and the pair the tool's coverage note is
     // built from: rows exist for the old id, none exist for the current one.
