@@ -794,6 +794,14 @@ Three consequences, in the order they bite:
    not describe the same world.
 3. `hack/pg-cost-snapshot.mjs` now labels `select *` lines **split-prone** - "a column added to the table, or a rename,
    gives this identical text a new queryid and a counter starting at 1" - next to the existing **merge-prone** label.
+4. **A change to the select list splits the same way, and the split is invisible in the reader's own diff.** pi-ed
+   `79b0202` added one column, `never_attempted`, to the heartbeat sweep, and that statement's cost went from one row
+   to five: 78 calls on the pre-change text, the new generation starting at 1. The expressions are in the hash and
+   only their aliases are not, which makes bullet 2 and this bullet one sentence. `assert --statement` reports the
+   siblings of any statement a run names, and the rule for a probe that can fail is that its cleanup goes in a
+   `finally` - a failed assertion skips every line after it, and six rows in this store were the result of a probe
+   whose cleanup was the last line of its test. Verified by breaking an assertion on purpose: the run fails, the view
+   holds nothing.
 
 This is the rename split above seen from the other side, and the two together give the rule: **what holds a counter
 together is the analysed structure, not the text you wrote.** Text is how a reader identifies a statement; `queryid` is
@@ -1320,14 +1328,26 @@ the volume is attached at the cron minute, and a skip **creates no Backup object
 `backup-daily`, and detached between its 03:00Z dump runs - has never produced one. So "no failed backups" is
 byte-for-byte the output of "nothing was ever attempted", and a coverage sweep cannot infer the difference from the
 absence of errors. A job's own counters are not coverage either: `recurringjob.status.executionCount` is per object
-lifetime (home-ops reset theirs by recreating the job during a backup-target fix), and this cluster caps a job's
-history at one successful and one failed entry (`recurring-successful-jobs-history-limit: 1`,
-`recurring-failed-jobs-history-limit: 1`).
+lifetime (home-ops reset theirs by recreating the job during a backup-target fix), and a job's `status.history`
+cannot answer "did it run every night" at any retention: `recurring-successful-jobs-history-limit` and
+`recurring-failed-jobs-history-limit` are both `1`, and home-ops measured that in **dev and prod alike**, so the
+object physically holds one success and one failure of evidence and no more. Coverage is per-volume `lastBackupAt`
+plus attach state at the cron minute, or nothing.
 
 **Attributing a backup to a volume reads the answer half again.** `spec.volumeName` does not exist on the Backup CRD;
-the volume is `status.volumeName`, the job is `spec.labels.RecurringJob`, and the snapshot name corroborates it
-(`backup-d-…` from the daily job, `backup-v-…` from a verification job). Same request/answer asymmetry as the
-attachment tickets' `nodeID`, and the same failure mode: read the wrong half and the field is simply empty.
+the volume is `status.volumeName`, the snapshot name corroborates it (`backup-d-…` from the daily job, `backup-v-…`
+from a verification job), and `created` reads `backupCreatedAt` - there is no `status.startTimestamp` on a Backup at
+all, which is how a runbook column literally named `CREATED` printed `<none>` for every object since the day it was
+written (home-ops `384862b`). Same request/answer asymmetry as the attachment tickets' `nodeID`, and the same failure
+mode: read the wrong half and the field is simply empty.
+
+**And the job label is not a complete attribution.** Prod `backup-e04d35e3ff0d4347` is `Completed`, has a real
+`backupCreatedAt`, belongs to a volume with three backup objects, and carries **no `spec.labels.RecurringJob`** - it
+is identified only by `metadata.labels` (`backup-volume`, `backup-target`). So a count that reads the job label
+undercounts the backups a volume started itself, and the reader of that count is making a coverage decision. The
+script names the absent case on the line and prints how many of them there are, rather than leaving `job=None` to be
+read as "not a recurring backup".
+
 `hack/pi-ed-attach-state.sh` now prints both readings, and classifies the volume rather than leaving `robustness`
 for a human to interpret - because `robustness: unknown` with an empty `spec.nodeID` is the *ordinary* reading of a
 volume that is merely detached, and has been misread as damage. This store's own record, live:
@@ -1337,8 +1357,13 @@ state attached  robustness healthy  spec.nodeID 'k3s-bee-2'  replicas 2
 volume recurring labels: {"backup-daily": "enabled"}
 status.lastBackupAt: 2026-11-07T18:00:34Z   (the only per-volume coverage there is)
 Backup objects for this volume: 1 of 5 in the cluster
-  backup-10d7529b14bc43ec  job=backup-daily  state=Completed  snapshot=backup-d-e0808e27…  created=2026-11-07T18:00:37Z
+  backup-10d7529b14bc43ec  job=backup-daily  state=Completed  snapshot=backup-d-e0808e27…  created=2026-11-07T18:00:37Z  uploaded 11626797 newly of 247463936 backup bytes (4.7%; volumeSize 5368709120)
 ```
+
+That last field is the affordability argument for a single backup target, stated as a number: the daily backup moved
+**11.6 MB of a 247.5 MB backup**, 4.7%, because the rest of the blocks were already in the target. The denominator
+matters twice over - against `volumeSize` (the 5 GiB volume) the same figure reads 0.2% and understates the ratio
+20-fold, and `size` is the backup payload. Both numbers are on the same object, and only one of them is the answer.
 
 One backup, because the store is ~17 hours old and that is one daily cycle. "One" is the right number here and would
 be the wrong number next week; the assertion is the pair, not the count.

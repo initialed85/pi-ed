@@ -27,6 +27,16 @@
 #     cron minute is skipped with no Backup object and no error, so "no failed backups" and "never attempted" are
 #     byte-for-byte the same output.
 #
+# The rule all of the above is an instance of, and the reason this script reads `-o json` and asks the object for
+# its keys instead of guessing paths: an empty string from a jsonpath is a fact about the PATH, not the cluster.
+# Five instances in one afternoon across two clusters, every one of them silent and every one of them looking like
+# a finding - `nodeID` read in the status half; `robustness: unknown` on a volume that is simply detached; absent
+# `spec.value` and `status.value` on the recurring-job Setting (the value is top-level `.value`); absent
+# `spec.volumeName` on a Backup (it is `status.volumeName`); and a runbook column literally named `CREATED` reading
+# `status.startTimestamp`, a key that does not exist on a Backup at all, which printed `<none>` for every object
+# since the day it was written (home-ops `384862b`). Before trusting a new path, read it on an object whose value
+# you already know independently, or list the keys once.
+#
 #   ./hack/pi-ed-attach-state.sh
 #   PVC=pi-ed-postgres NAMESPACE=pi-ed ./hack/pi-ed-attach-state.sh
 #
@@ -146,8 +156,12 @@ echo "== recurring backup coverage of this volume =="
 # `allow-recurring-job-while-volume-detached` is `false`, so a recurring backup fires only if the volume is attached
 # at the cron minute, and a skip leaves NO Backup object and NO error. "No failed backups" is therefore byte-for-byte
 # the output of "nothing was attempted", and coverage cannot be inferred from the absence of errors. Only the
-# volume's own `status.lastBackupAt` is coverage; a job's `executionCount` is per object lifetime and its history is
-# capped at one successful and one failed entry by settings on this cluster.
+# volume's own `status.lastBackupAt` is coverage. A job's `executionCount` is per object lifetime, and its
+# `status.history` CANNOT answer "did it run every night" at any retention: the settings
+# `recurring-successful-jobs-history-limit` and `recurring-failed-jobs-history-limit` are both `1`, and home-ops
+# measured that in dev and prod alike, so a job object physically holds one success and one failure of evidence and
+# no more. A skip leaves no object either, so coverage is per-volume `lastBackupAt` plus attach state at the cron
+# minute, or nothing.
 kubectl --context "$CTX" -n "$LHNS" get "volume/$pv" -o json 2>/dev/null | python3 -c '
 import json, subprocess, sys
 o = json.load(sys.stdin)
@@ -180,11 +194,34 @@ try:
     # same request/answer asymmetry as the attachment tickets.
     mine = [i for i in items if (i.get("status") or {}).get("volumeName") == o["metadata"]["name"]]
     print("  Backup objects for this volume: %d of %d in the cluster" % (len(mine), len(items)))
+    # Attribution has two halves, and the spec half alone loses real backups. home-ops found prod
+    # `backup-e04d35e3ff0d4347`: Completed, a real `backupCreatedAt`, this volume, and no
+    # `spec.labels.RecurringJob` at all - it is identified only by `metadata.labels`. A count that reads the job
+    # label therefore undercounts backups the volume itself started, and a bare `job=None` on the line invites the
+    # same misreading. The absent case gets named, and the number of them gets printed.
+    unattributed = [i for i in mine if not ((i.get("spec") or {}).get("labels") or {}).get("RecurringJob")]
     for i in mine:
-        job = (i.get("spec", {}).get("labels") or {}).get("RecurringJob")
-        print("    %s  job=%s  state=%s  snapshot=%s  created=%s" % (
-            i["metadata"]["name"], job, i.get("status", {}).get("state"),
-            i.get("status", {}).get("snapshotName"), i.get("status", {}).get("backupCreatedAt")))
+        job = (i.get("spec", {}).get("labels") or {}).get("RecurringJob") or "(volume-started, no RecurringJob label)"
+        status = i.get("status") or {}
+        # The incremental evidence, which is the whole argument for a single NAS being affordable. The denominator
+        # matters: `size` is the backup payload itself and `volumeSize` is the volume, so reading the ratio against
+        # `volumeSize` understates it by 20x (this volume: 11,626,797 newly of 247,463,936 backup bytes = 4.7%, of
+        # 5,368,709,120 volume = 0.2%). And a Backup has no `status.startTimestamp` - that key does not exist on the
+        # object at all - so `created` below reads `backupCreatedAt`, the key that is actually there.
+        size, newly = status.get("size"), status.get("newlyUploadDataSize")
+        incremental = ""
+        if size and newly is not None:
+            try:
+                pct = 100.0 * int(newly) / int(size)
+                incremental = "  uploaded %s newly of %s backup bytes (%.1f%%; volumeSize %s)" % (newly, size, pct, status.get("volumeSize"))
+            except (TypeError, ValueError):
+                pass
+        print("    %s  job=%s  state=%s  snapshot=%s  created=%s%s" % (
+            i["metadata"]["name"], job, status.get("state") or "(no state)",
+            status.get("snapshotName") or "(none)", status.get("backupCreatedAt") or "(no backupCreatedAt)", incremental))
+    if unattributed:
+        print("    %d of %d carry no RecurringJob label: a job-attributed reading of this cluster undercounts them"
+              % (len(unattributed), len(mine)))
     if not mine:
         print("    (none, and a silent skip also produces none - do not read this list as \"no failures\")")
 except Exception:

@@ -173,44 +173,49 @@ describe.skipIf(!liveDsn)("pg_stat_statements contract", () => {
           like(`select%from ${table} where agent_id = $1`),
         ]);
 
-      await query(`create temp table ${table} (agent_id text, repo text)`);
-      await query(`insert into ${table} values ('split-probe', 'r')`);
+      try {
+        await query(`create temp table ${table} (agent_id text, repo text)`);
+        await query(`insert into ${table} values ('split-probe', 'r')`);
 
-      await query(star);
-      await query(named);
-      const beforeAlter = await mine();
-      expect(new Set(beforeAlter.map((row) => String(row.queryid)))).toHaveLength(2);
+        await query(star);
+        await query(named);
+        const beforeAlter = await mine();
+        expect(new Set(beforeAlter.map((row) => String(row.queryid)))).toHaveLength(2);
 
-      await query(`alter table ${table} add column first_seen_at timestamptz`);
+        await query(`alter table ${table} add column first_seen_at timestamptz`);
 
-      // Same text, run again, with the table's column list changed underneath it.
-      await query(star);
-      await query(named);
+        // Same text, run again, with the table's column list changed underneath it.
+        await query(star);
+        await query(named);
 
-      const rows = await mine();
-      const starRows = rows.filter((row) => String(row.query).startsWith(`select * from ${table}`));
-      const namedRows = rows.filter((row) => String(row.query).startsWith(`select agent_id from ${table}`));
+        const rows = await mine();
+        const starRows = rows.filter((row) => String(row.query).startsWith(`select * from ${table}`));
+        const namedRows = rows.filter((row) => String(row.query).startsWith(`select agent_id from ${table}`));
 
-      // The `select *` half: identical text, two rows, two counters. `*` is expanded to concrete columns during
-      // analysis, and `queryid` is computed from the analysed tree, so adding a column changes the structure the hash
-      // sees. Nothing about the statement's text changed - the table did.
-      expect(new Set(starRows.map((row) => String(row.text_md5)))).toHaveLength(1);
-      expect(starRows.length).toBe(2);
+        // The `select *` half: identical text, two rows, two counters. `*` is expanded to concrete columns during
+        // analysis, and `queryid` is computed from the analysed tree, so adding a column changes the structure the
+        // hash sees. Nothing about the statement's text changed - the table did.
+        expect(new Set(starRows.map((row) => String(row.text_md5)))).toHaveLength(1);
+        expect(starRows.length).toBe(2);
 
-      // The named-column half: identical text across the same ALTER, one row, one counter, two calls.
-      expect(namedRows.length).toBe(1);
-      expect(Number(namedRows[0].calls)).toBe(2);
-
-      await query(`drop table ${table}`);
-
-      // Every statement this test ran, not just the two selects: the `create temp table`, `insert`, `alter` and `drop`
-      // are tracked too, and a test that leaves nine clutter rows behind teaches the next reader that probes are
-      // permanent. The reset is surgical, so the shared window and every other statement's counter are untouched.
-      // The drop comes first so its own row is inside the set being cleaned.
-      const leftovers = await query(`select queryid, dbid, userid from pg_stat_statements where query like $1`, [like(`%${table}%`)]);
-      for (const row of leftovers) await targetedReset(row);
-      expect(await mine()).toHaveLength(0);
-      expect(await query(`select queryid from pg_stat_statements where query like $1`, [like(`%${table}%`)])).toHaveLength(0);
+        // The named-column half: identical text across the same ALTER, one row, one counter, two calls.
+        expect(namedRows.length).toBe(1);
+        expect(Number(namedRows[0].calls)).toBe(2);
+      } finally {
+        // Every statement this test ran, not just the two selects: the `create temp table`, `insert`, `alter` and
+        // `drop` are tracked too, and a test that leaves nine clutter rows behind teaches the next reader that
+        // probes are permanent. The reset is surgical, so the shared window and every other statement's counter are
+        // untouched. The drop comes first so its own row is inside the set being cleaned.
+        //
+        // This is in a `finally` because a failing assertion otherwise skips it, and six rows in this store are the
+        // result: two runs of the sibling test below failed on their first draft and left their probes behind, which
+        // is the exact litter this file's own contract forbids.
+        await query(`drop table if exists ${table}`).catch(() => undefined);
+        const leftovers = await query(`select queryid, dbid, userid from pg_stat_statements where query like $1`, [like(`%${table}%`)]);
+        for (const row of leftovers) await targetedReset(row).catch(() => undefined);
+        expect(await mine()).toHaveLength(0);
+        expect(await query(`select queryid from pg_stat_statements where query like $1`, [like(`%${table}%`)])).toHaveLength(0);
+      }
     });
 
     it("keeps two generations of a statement whose text changed as two rows", async () => {
@@ -220,48 +225,54 @@ describe.skipIf(!liveDsn)("pg_stat_statements contract", () => {
       // generation keeps its counter and the new one starts at 1 - and a reader who does not know the column was
       // added sees the number fall, with nothing in their own diff to explain it.
       const table = `probe_sibling_${Date.now()}`;
-      await query(`create temp table ${table} (agent_id text, repo text)`);
-      const generation1 = `select agent_id, repo from ${table}`;
-      const generation2 = `select agent_id, repo, (agent_id is null) as never_attempted from ${table}`;
+      try {
+        await query(`create temp table ${table} (agent_id text, repo text)`);
+        const generation1 = `select agent_id, repo from ${table}`;
+        const generation2 = `select agent_id, repo, (agent_id is null) as never_attempted from ${table}`;
 
-      await query(generation1);
-      await query(generation1);
-      await query(generation2);
+        await query(generation1);
+        await query(generation1);
+        await query(generation2);
 
-      const selects = await query(
-        `select queryid::text as queryid, calls::int as calls, query from pg_stat_statements where query like $1 and query ilike $2`,
-        [like(`%${table}%`), `select%agent_id%from%${like(table)}%`],
-      );
-      expect(selects).toHaveLength(2);
-      const old1 = selects.find((row) => row.query === generation1);
-      const old2 = selects.find((row) => row.query === generation2);
-      expect(Number(old1!.calls)).toBe(2);
-      expect(Number(old2!.calls)).toBe(1);
-      expect(String(old1!.queryid)).not.toBe(String(old2!.queryid));
-      // What the two rows share, and what they do not, is exactly why the sibling report needs both keys: the
-      // relation clause is identical (so the clause key groups them), while the leading 40 characters already
-      // differ at the comma (so a head-only key would have missed the re-baseline). home-ops' five rows shared
-      // their first 70 characters only because their added column sat further down the list.
-      const clause = (text: string) => text.slice(/\b(from|into|update|join|using)\b/i.exec(text)!.index);
-      expect(clause(String(old2!.query))).toBe(clause(String(old1!.query)));
-      expect(String(old2!.query).slice(0, 40)).not.toBe(String(old1!.query).slice(0, 40));
+        const selects = await query(
+          `select queryid::text as queryid, calls::int as calls, query from pg_stat_statements where query like $1 and query ilike $2`,
+          [like(`%${table}%`), `select%agent_id%from%${like(table)}%`],
+        );
+        expect(selects).toHaveLength(2);
+        const old1 = selects.find((row) => row.query === generation1);
+        const old2 = selects.find((row) => row.query === generation2);
+        expect(Number(old1!.calls)).toBe(2);
+        expect(Number(old2!.calls)).toBe(1);
+        expect(String(old1!.queryid)).not.toBe(String(old2!.queryid));
+        // What the two rows share, and what they do not, is exactly why the sibling report needs both keys: the
+        // relation clause is identical (so the clause key groups them), while the leading 40 characters already
+        // differ at the comma (so a head-only key would have missed the re-baseline). home-ops' five rows shared
+        // their first 70 characters only because their added column sat further down the list.
+        const clause = (text: string) => text.slice(/\b(from|into|update|join|using)\b/i.exec(text)!.index);
+        expect(clause(String(old2!.query))).toBe(clause(String(old1!.query)));
+        expect(String(old2!.query).slice(0, 40)).not.toBe(String(old1!.query).slice(0, 40));
 
-      // A third submission, differing only in an alias, does not add a generation: the alias is outside the hash
-      // while the expression is inside it, which is the whole distinction in one pair of assertions. The pattern is
-      // bound as a parameter here rather than interpolated, because the name inside the checking statement's own
-      // text is what makes an absence check unable to report zero about itself - and this check would have counted
-      // its own SQL as a third generation.
-      await query(`select agent_id as zzz_sibling_alias, repo from ${table}`);
-      const afterAlias = await query(
-        `select queryid::text as queryid, calls::int as calls, query from pg_stat_statements where query like $1 and query ilike $2`,
-        [like(`%${table}%`), `select%agent_id%from%${like(table)}%`],
-      );
-      expect(afterAlias).toHaveLength(2);
-      expect(Number(afterAlias.find((row) => String(row.queryid) === String(old1!.queryid))!.calls)).toBe(3);
-
-      const leftovers = await query(`select queryid, dbid, userid from pg_stat_statements where query like $1`, [like(`%${table}%`)]);
-      for (const row of leftovers) await targetedReset(row);
-      expect(await query(`select queryid from pg_stat_statements where query like $1`, [like(`%${table}%`)])).toHaveLength(0);
+        // A third submission, differing only in an alias, does not add a generation: the alias is outside the hash
+        // while the expression is inside it, which is the whole distinction in one pair of assertions. The pattern
+        // is bound as a parameter here rather than interpolated, because the name inside the checking statement's
+        // own text is what makes an absence check unable to report zero about itself - and this check would have
+        // counted its own SQL as a third generation.
+        await query(`select agent_id as zzz_sibling_alias, repo from ${table}`);
+        const afterAlias = await query(
+          `select queryid::text as queryid, calls::int as calls, query from pg_stat_statements where query like $1 and query ilike $2`,
+          [like(`%${table}%`), `select%agent_id%from%${like(table)}%`],
+        );
+        expect(afterAlias).toHaveLength(2);
+        expect(Number(afterAlias.find((row) => String(row.queryid) === String(old1!.queryid))!.calls)).toBe(3);
+      } finally {
+        // Unconditional, for the reason the test above spells out: two earlier drafts of this test failed on an
+        // assertion and left six rows in the shared view, which is the litter this file forbids and which the
+        // shared tool will not clean up, because a snapshot taken after the fact cannot prove the run created them.
+        await query(`drop table if exists ${table}`).catch(() => undefined);
+        const leftovers = await query(`select queryid, dbid, userid from pg_stat_statements where query like $1`, [like(`%${table}%`)]);
+        for (const row of leftovers) await targetedReset(row).catch(() => undefined);
+        expect(await query(`select queryid from pg_stat_statements where query like $1`, [like(`%${table}%`)])).toHaveLength(0);
+      }
     });
 
     it("cleans a probe only when the reset arguments are in the order this build declares", async () => {
