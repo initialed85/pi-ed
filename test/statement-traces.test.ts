@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { isToolQuery, matchNames, parseArgs, skeleton } from "../hack/pg-statement-traces.mjs";
+import { isToolQuery, matchNames, parseArgs, siblings, skeleton } from "../hack/pg-statement-traces.mjs";
 
 /**
  * The shared statement-trace tool, tested where it can be tested without a store: at its gates.
@@ -98,6 +98,77 @@ describe("the tool does not count itself as a landing", () => {
     expect(matchNames("select count(*)::int as stat_probe_1 from memory.memory", ["stat_probe_1"])).toBe("stat_probe_1");
     // A value carrying the name is normalised to `$1` by the view and is invisible here. Measured, not assumed.
     expect(matchNames("select $1 as n from memory.memory where agent_id = $2", ["stat_probe_1"])).toBeUndefined();
+  });
+
+  it("matches a name that is only part of another writer's alias, which is why a name scope is not attribution", () => {
+    // Measured on this store: `assert --name pi_ed_` reported a leftover that was not mine at all. The row is
+    // home-ops' cleanup verification, and it carries `pi_ed` because that is the name of the database, used as an
+    // alias. `remove` refused it because the row predates the run, which is the only thing standing between a
+    // marker like this and a reset of someone else's counter.
+    const peerRow = "select count(*) filter (where dbid=$1) as probe_rows_after, count(*) filter (where dbid=$2) as pi_ed_rows_after, count(*) as total_after from public.pg_stat_statements";
+    expect(matchNames(peerRow, ["pi_ed_"])).toBe("pi_ed_");
+    // A marker that cannot be an identifier someone else would choose is the fix, and the run's own probes use it.
+    expect(matchNames(peerRow, ["pi_ed_prepare_probe", "stat_probe_"])).toBeUndefined();
+  });
+});
+
+describe("the sibling report: one statement, several rows", () => {
+  // The merge's counterpart, and the one home-ops hit for real. Adding a column to a select list changes the hash,
+  // so the statement starts a new row and the old generation keeps its counter. The five rows they read for the
+  // heartbeat sweep were caused by pi-ed `79b0202` - a routine column addition in this repo, invisible in the diff
+  // of the repo whose baseline broke.
+  const rows = {
+    "1": { calls: 78, dbid: "16384", userid: "10", query: "select agent_id, repo, last_activity_at from memory.writer_heartbeat where last_flush_at is null" },
+    "2": { calls: 7, dbid: "16384", userid: "10", query: "select agent_id, repo, last_activity_at, (flushes = 0) as never_attempted from memory.writer_heartbeat where last_flush_at is null" },
+    "3": { calls: 3, dbid: "16384", userid: "10", query: "select agent_id from memory.writer_heartbeat where repo = $1" },
+    "4": { calls: 1, dbid: "16384", userid: "10", query: "select agent_id, repo from memory.memory where last_activity_at is null" },
+  };
+
+  it("groups the generations of a shape by their relation clause", () => {
+    const hits = siblings(rows, "select agent_id, repo from memory.writer_heartbeat where last_flush_at is null");
+    expect(hits.map((h) => h.queryid).sort()).toEqual(["1", "2"]);
+    // The new generation is found by the clause alone; the extra column is in the target list, which is where the
+    // alias-free difference lives.
+    expect(hits.find((h) => h.queryid === "2")!.byClause).toBe(true);
+  });
+
+  it("reports a nested statement by its leading text, because the clause key cannot fire for one", () => {
+    // The heartbeat sweep is `select * from ( ... ) x`, so `skeleton()` takes the whole subquery as the relation
+    // clause and every generation of the statement has a different clause. This is what the live report showed:
+    // five rows for the sweep, matched by head, zero by clause. The clause key is a flat-statement heuristic and
+    // the report says which key fired rather than pretending they are the same signal.
+    const generations = {
+      a: { calls: 78, dbid: "16384", userid: "10", query: "select * from ( select agent_id, repo, case when (last_flush_at is null) then $1 else $2 end as severity, flushes, failures from memory.writer_heartbeat ) x" },
+      b: { calls: 7, dbid: "16384", userid: "10", query: "select * from ( select agent_id, repo, case when (last_flush_at is null) then $1 else $2 end as severity, flushes, failures, (flushes = 0) as never_attempted from memory.writer_heartbeat ) x" },
+    };
+    const hits = siblings(generations, generations.a.query);
+    expect(hits).toHaveLength(2);
+    expect(hits.every((hit) => hit.byHead)).toBe(true);
+    // The statement matches its own clause trivially; the generation it re-baselined does not, and the head key is
+    // the only thing that finds it.
+    expect(hits.find((hit) => hit.queryid === "a")!.byClause).toBe(true);
+    expect(hits.find((hit) => hit.queryid === "b")!.byClause).toBe(false);
+  });
+
+  it("does not group a different relation or a different filter", () => {
+    const hits = siblings(rows, "select agent_id, repo from memory.writer_heartbeat where last_flush_at is null");
+    expect(hits.some((h) => h.queryid === "4")).toBe(false);
+    expect(hits.some((h) => h.queryid === "3")).toBe(false);
+  });
+
+  it("catches a where-clause change by the leading text, which the clause key cannot", () => {
+    // The page condition is the half of this statement that has actually changed twice, and when it does the
+    // relation clause no longer matches the old generation. The head key is what keeps the report honest.
+    const moved = {
+      a: { calls: 5, dbid: "16384", userid: "10", query: "select agent_id from memory.writer_heartbeat where last_flush_at is null and x < 1" },
+      b: { calls: 2, dbid: "16384", userid: "10", query: "select agent_id from memory.writer_heartbeat where last_flush_at is null and x < 2" },
+    };
+    expect(siblings(moved, "select agent_id from memory.writer_heartbeat where last_flush_at is null and x < 1").map((h) => h.queryid).sort())
+      .toEqual(["a", "b"]);
+  });
+
+  it("reports one row for a shape that has not been re-baselined", () => {
+    expect(siblings(rows, "select agent_id from memory.writer_heartbeat where repo = $1").length).toBe(1);
   });
 });
 

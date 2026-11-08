@@ -21,3 +21,11 @@ export function isToolQuery(text: string): boolean;
 export function skeleton(text: string): string;
 /** The first of the run's names that appears in a row's stored text. */
 export function matchNames(text: string, names: string[]): string | undefined;
+export interface SiblingHit {
+  queryid: string;
+  row: { calls: number; dbid: string; userid: string; query: string };
+  byClause: boolean;
+  byHead: boolean;
+}
+/** Rows that are the same statement to a reader and different rows to Postgres. */
+export function siblings(rows: Record<string, { calls: number; dbid: string; userid: string; query: string }>, statement: string): SiblingHit[];

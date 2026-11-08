@@ -213,6 +213,57 @@ describe.skipIf(!liveDsn)("pg_stat_statements contract", () => {
       expect(await query(`select queryid from pg_stat_statements where query like $1`, [like(`%${table}%`)])).toHaveLength(0);
     });
 
+    it("keeps two generations of a statement whose text changed as two rows", async () => {
+      // The counterpart of the `select *` split above, and the one that broke a baseline in another repository for
+      // real: pi-ed `79b0202` added one column to the heartbeat sweep's select list, and the reader of that
+      // statement's cost went from one row to five. The text change is a new statement to Postgres, so the old
+      // generation keeps its counter and the new one starts at 1 - and a reader who does not know the column was
+      // added sees the number fall, with nothing in their own diff to explain it.
+      const table = `probe_sibling_${Date.now()}`;
+      await query(`create temp table ${table} (agent_id text, repo text)`);
+      const generation1 = `select agent_id, repo from ${table}`;
+      const generation2 = `select agent_id, repo, (agent_id is null) as never_attempted from ${table}`;
+
+      await query(generation1);
+      await query(generation1);
+      await query(generation2);
+
+      const selects = await query(
+        `select queryid::text as queryid, calls::int as calls, query from pg_stat_statements where query like $1 and query ilike $2`,
+        [like(`%${table}%`), `select%agent_id%from%${like(table)}%`],
+      );
+      expect(selects).toHaveLength(2);
+      const old1 = selects.find((row) => row.query === generation1);
+      const old2 = selects.find((row) => row.query === generation2);
+      expect(Number(old1!.calls)).toBe(2);
+      expect(Number(old2!.calls)).toBe(1);
+      expect(String(old1!.queryid)).not.toBe(String(old2!.queryid));
+      // What the two rows share, and what they do not, is exactly why the sibling report needs both keys: the
+      // relation clause is identical (so the clause key groups them), while the leading 40 characters already
+      // differ at the comma (so a head-only key would have missed the re-baseline). home-ops' five rows shared
+      // their first 70 characters only because their added column sat further down the list.
+      const clause = (text: string) => text.slice(/\b(from|into|update|join|using)\b/i.exec(text)!.index);
+      expect(clause(String(old2!.query))).toBe(clause(String(old1!.query)));
+      expect(String(old2!.query).slice(0, 40)).not.toBe(String(old1!.query).slice(0, 40));
+
+      // A third submission, differing only in an alias, does not add a generation: the alias is outside the hash
+      // while the expression is inside it, which is the whole distinction in one pair of assertions. The pattern is
+      // bound as a parameter here rather than interpolated, because the name inside the checking statement's own
+      // text is what makes an absence check unable to report zero about itself - and this check would have counted
+      // its own SQL as a third generation.
+      await query(`select agent_id as zzz_sibling_alias, repo from ${table}`);
+      const afterAlias = await query(
+        `select queryid::text as queryid, calls::int as calls, query from pg_stat_statements where query like $1 and query ilike $2`,
+        [like(`%${table}%`), `select%agent_id%from%${like(table)}%`],
+      );
+      expect(afterAlias).toHaveLength(2);
+      expect(Number(afterAlias.find((row) => String(row.queryid) === String(old1!.queryid))!.calls)).toBe(3);
+
+      const leftovers = await query(`select queryid, dbid, userid from pg_stat_statements where query like $1`, [like(`%${table}%`)]);
+      for (const row of leftovers) await targetedReset(row);
+      expect(await query(`select queryid from pg_stat_statements where query like $1`, [like(`%${table}%`)])).toHaveLength(0);
+    });
+
     it("cleans a probe only when the reset arguments are in the order this build declares", async () => {
       const rows = await probeRows();
       expect(rows.length).toBeGreaterThan(0);

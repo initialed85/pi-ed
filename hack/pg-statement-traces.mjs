@@ -38,7 +38,8 @@
  *
  * `--name` is what the run is called by (a private relation, a label, a marker). `--statement` is what the run
  * actually executed: it lets the report grade a shared row as a likely merged landing instead of a concurrent
- * writer, which the name scope cannot do on its own.
+ * writer, which the name scope cannot do on its own, and it drives the sibling report - the shapes that exist as
+ * more than one queryid, which is what a column added in another repository does to a baseline.
  *
  * Exit codes: 0 clean, 1 leftovers or a moved window or a failed removal, 2 the tool could not measure at all
  * (no DSN, no snapshot, connection refused). A tool that cannot read the view does not report success.
@@ -137,6 +138,33 @@ async function readArgumentOrder(client) {
 
 export function matchNames(text, names) {
   return names.find((name) => text.includes(name));
+}
+
+/**
+ * The rows that are the same statement to a reader, and different rows to Postgres.
+ *
+ * The counterpart of the merge. A *column* in the target list is part of the hash; only its *alias* is not. So
+ * adding one expression to a select list - which is what pi-ed `79b0202` did to the heartbeat sweep - creates a new
+ * queryid and restarts the counter at 1, while the old generation keeps accumulating whatever else shares its shape.
+ * The reader sees five rows whose first 70 characters are identical, and the change that caused it is in a different
+ * repository's diff.
+ *
+ * Two keys are used, because a generation can move either side of the statement: the relation clause catches a
+ * select-list change, and the leading text catches a `where`-clause change. A match on either is a candidate
+ * sibling, not a verdict, and the report says which key fired.
+ */
+export function siblings(rows, statement) {
+  const norm = (text) => text.replace(/\s+/g, " ").trim().toLowerCase();
+  const clause = skeleton(statement);
+  const head = norm(statement).slice(0, 40);
+  const hits = [];
+  for (const [queryid, row] of Object.entries(rows)) {
+    const text = norm(row.query);
+    const byClause = clause.length > 0 && skeleton(row.query) === clause;
+    const byHead = head.length > 0 && text.startsWith(head);
+    if (byClause || byHead) hits.push({ queryid, row, byClause, byHead });
+  }
+  return hits;
 }
 
 async function main() {
@@ -246,6 +274,38 @@ async function main() {
   if (unattributable.length > 6) console.log(`    ...and ${unattributable.length - 6} more; the count is the point, not the list`);
   console.log(`  leftovers carrying this run's names: ${leftovers.length}`);
   for (const [queryid, row] of leftovers.slice(0, 10)) console.log(`    ${queryid}  ${row.query.slice(0, 100)}`);
+
+  // The sibling report: the merge's counterpart. A statement the caller named may be spread over several rows,
+  // because the target list is in the hash and only the alias is not, so a column added in another repository
+  // re-baselines the counter with nothing in this repository's diff to warn about it.
+  //
+  // Two keys are reported as two signals rather than merged into one verdict, because dogfooding on this store
+  // showed both of them lying in opposite directions. The relation clause catches a target-list change that
+  // diverges in the first 40 characters (the heartbeat sweep's five generations, whose subquery is part of the
+  // clause), but it also catches genuinely different statements that read the same relation. The leading text
+  // catches those generations, and catches a `where`-clause change the clause key cannot, but it cannot tell a
+  // re-baselined statement from a neighbour that happens to start the same way. Neither key is a statement
+  // identity; the only thing that is certain is that the row count is not one.
+  if (runStatements.length) {
+    console.log(`  sibling shapes: ${runStatements.length} statement(s) asked about, reported as two signals`);
+    for (const statement of runStatements) {
+      const hits = siblings(after.byId, statement);
+      const head = statement.replace(/\s+/g, " ").trim().slice(0, 60);
+      const byClause = hits.filter((hit) => hit.byClause);
+      const byHead = hits.filter((hit) => hit.byHead);
+      console.log(`    ${head}`);
+      console.log(`      ${byClause.length} row(s) share its relation clause; ${byHead.length} row(s) share its leading 40 characters`);
+      for (const hit of [...hits].sort((a, b) => Number(b.row.calls) - Number(a.row.calls)).slice(0, 8)) {
+        const key = hit.byClause && hit.byHead ? "clause+head" : hit.byClause ? "clause" : "head";
+        console.log(`        ${hit.queryid}  calls=${hit.row.calls}  ${key}  ${hit.row.query.replace(/\s+/g, " ").slice(0, 88)}`);
+      }
+      if (hits.length > 1) {
+        console.log(`      ${hits.length} rows in the group, ${hits.reduce((sum, hit) => sum + Number(hit.row.calls), 0)} calls summed across them`);
+        console.log("      rows matched by clause alone may be different statements on the same relation; the group is a signal, not a verdict");
+        console.log("      a baseline keyed on this view is per-generation, not per-statement: sum the rows or drop the count");
+      }
+    }
+  }
 
   if (mode === "assert") {
     // Read-only by construction. The exit code reports what a run can be blamed for: its own named rows still

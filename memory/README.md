@@ -653,6 +653,38 @@ shape_from_clause_a from pg_stat_activity` landed on one row in two separate scr
 `readme_demo_alpha`, `readme_demo_beta`, `readme_demo_gamma` against one shared relation landed on one row with three
 calls. Literals merge, aliases merge, shared relations merge.
 
+The mirror of that sentence is what broke a baseline in *another* repository, and it is the reason the shared
+instrument reports a statement's siblings. The **expressions** of the target list are inside the hash even though
+their aliases are not: measured on this store against a temp relation, `select a, b` and `select a, b, cc` are two
+rows with two counters, and `select a as zzz, b` adds its call to the first of them. So pi-ed `79b0202` - adding one
+column, `never_attempted`, to the heartbeat sweep's select list - re-baselined that statement's cost with nothing in
+the reading repository's diff to warn about it. home-ops found five rows of the sweep with identical first 70
+characters, 78 calls on the pre-change text and 7 on the new one, and the trap is that summing the siblings is not a
+statement count either: a generation also absorbs calls from other variants of its own shape. A baseline read off
+this view is **per-generation, not per-statement**, and the only place that notices a re-baseline is the sweep
+reading the view. `assert` therefore reports a sibling group for every `--statement` the run passes, matched by
+relation clause (which catches a target-list change) or by the leading 40 characters of the text (which catches a
+`where`-clause change, which the clause key cannot). Neither key is a verdict, and the report says which one fired.
+
+Both keys were kept after one live run showed each of them lying in the opposite direction. The heartbeat sweep is
+`select * from ( ... ) x`, so its relation clause contains the whole subquery and every generation of it differs
+there: the report found five rows for the sweep by leading text and **none** by clause. The coverage statement, a
+flat select, found six rows by clause - two of which are genuinely different statements that read `memory.memory`
+and are not its generations at all. The clause key is a flat-statement heuristic, and the group is a signal.
+
+The same run showed why a name scope is not attribution: `assert --name pi_ed_` reported a leftover that was not
+mine, a home-ops statement whose second alias is `pi_ed_rows_after`, because `pi_ed` is the name of the database and
+a peer will reasonably use it as an identifier. `remove` refused the row - it predates the run - which is the only
+thing standing between a marker like that and a reset of someone else's counter. A marker has to be a name no other
+writer would choose, which is why the run above re-asserted with `pi_ed_prepare_probe`, `stat_probe_`, `merge_probe_`
+and the rest of its own relation names, and reported zero leftovers.
+
+One more way to make an absence check lie, and it is the one home-ops hit: interpolate the run's name into the SQL
+that looks for it, and the checking statement's own stored text carries the name, so it can never report zero about
+itself. Binding the pattern as a parameter (`where query like $1`) makes the checker's text `... where query like $1`
+with no name in it, and `position($1 in query) > 0` versus `like $1` is then irrelevant - the trap is the
+interpolation, not the operator.
+
 Prepared statements are the sharpest version of this, and the one that makes a name-scoped cleanup quietly wrong.
 Measured on this store, against a relation only the run queries:
 
@@ -668,8 +700,9 @@ Measured on this store, against a relation only the run queries:
 
 The consequence for cleanup is the whole point: a name scope can only remove a row the run *created*, and what
 creates a row is the relation in the hash, never the name in the text. `hack/pg-statement-traces.mjs` is the shared
-instrument for that - `snapshot` before, `assert` after (read-only: named leftovers, a moved `stats_reset`, and a
-landing delta that grades a row whose calls grew without naming the run as "likely a merged landing"), and `remove`,
+instrument for that - `snapshot` before, `assert` after (read-only: named leftovers, a moved `stats_reset`, a landing
+delta that grades a row whose calls grew without naming the run as "likely a merged landing", and the sibling groups
+that say when one statement is several rows), and `remove`,
 which will only reset a row whose `queryid` is absent from the before-snapshot. Resetting a row that predates the run
 is not cleanup; it is somebody else's lost baseline.
 
