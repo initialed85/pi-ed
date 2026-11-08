@@ -29,3 +29,11 @@ export interface SiblingHit {
 }
 /** Rows that are the same statement to a reader and different rows to Postgres. */
 export function siblings(rows: Record<string, { calls: number; dbid: string; userid: string; query: string }>, statement: string): SiblingHit[];
+export interface ResetRow {
+  userid?: string | number | null;
+  dbid?: string | number | null;
+  query?: string;
+  calls?: number;
+}
+/** The three reset arguments in declared order, or a refusal that names the reason. */
+export function resetArguments(order: string[], row: ResetRow, queryid: string): string[];

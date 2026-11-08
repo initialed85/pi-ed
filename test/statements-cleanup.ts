@@ -50,12 +50,32 @@ export async function resetArgumentOrder(client: StatementClient): Promise<strin
 /**
  * Removes one tracked statement. `row` must come from a `queryid::text, dbid, userid` select: text on
  * the way out, because a number is a different identity.
+ *
+ * The three ids are refused before they are sent, and the two reasons point in opposite directions. The function is
+ * declared `userid oid DEFAULT 0, dbid oid DEFAULT 0, queryid bigint DEFAULT 0` and **0 means all**: home-ops
+ * measured `reset(0, 17680, 0)` on a scratch database taking 31 rows to 1 with `stats_reset` byte-identical, so a
+ * zero is an entire database's history erased with no witness. It is also `STRICT` (`proisstrict = true` on this
+ * build), so a NULL argument returns success and removes nothing - which is why a missing key is an error here
+ * rather than something the driver gets to turn into NULL.
  */
 export async function targetedReset(client: StatementClient, row: Record<string, unknown>, order: string[] = ["userid", "dbid", "queryid"]): Promise<void> {
   const placeholders = order.map((_, index) => `$${index + 1}`).join(", ");
   const values = order.map((name) => {
-    if (name === "queryid" || name === "dbid" || name === "userid") return String(row[name]);
-    throw new Error(`statements-cleanup: pg_stat_statements_reset has an argument this helper does not know: ${name}`);
+    if (name !== "queryid" && name !== "dbid" && name !== "userid") {
+      throw new Error(`statements-cleanup: pg_stat_statements_reset has an argument this helper does not know: ${name}`);
+    }
+    const raw = row[name];
+    if (raw === undefined || raw === null || String(raw).trim() === "") {
+      throw new Error(`statements-cleanup: refusing to reset, the ${name} of this row is missing (a NULL argument to a STRICT function is a silent no-op)`);
+    }
+    const text = String(raw).trim();
+    if (!/^-?\d+$/.test(text)) {
+      throw new Error(`statements-cleanup: refusing to reset, the ${name} of this row is not an integer: ${JSON.stringify(text)}`);
+    }
+    if (BigInt(text) === 0n) {
+      throw new Error(`statements-cleanup: refusing to reset, the ${name} of this row is 0 and 0 means every ${name} (measured as 31 rows to 1, stats_reset unmoved)`);
+    }
+    return text;
   });
   await client.query(`select pg_stat_statements_reset(${placeholders})`, values);
 }

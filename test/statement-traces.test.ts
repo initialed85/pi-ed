@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { isToolQuery, matchNames, parseArgs, siblings, skeleton } from "../hack/pg-statement-traces.mjs";
+import { isToolQuery, matchNames, parseArgs, resetArguments, siblings, skeleton } from "../hack/pg-statement-traces.mjs";
 
 /**
  * The shared statement-trace tool, tested where it can be tested without a store: at its gates.
@@ -169,6 +169,70 @@ describe("the sibling report: one statement, several rows", () => {
 
   it("reports one row for a shape that has not been re-baselined", () => {
     expect(siblings(rows, "select agent_id from memory.writer_heartbeat where repo = $1").length).toBe(1);
+  });
+});
+
+describe("the reset arguments are validated before they are sent", () => {
+  // Why this gate exists at all, measured by home-ops on this store: `pg_stat_statements_reset` is declared
+  // `userid oid DEFAULT 0, dbid oid DEFAULT 0, queryid bigint DEFAULT 0`, and 0 means *all*. Running
+  // `reset(0, 17680, 0)` against a scratch database took it from 31 tracked rows to 1 (the reset's own row) while
+  // `stats_reset` stayed byte-identical - an entire database's statement history, erased with no witness. The view
+  // itself holds no zero ids (measured: 0 rows with a zero or NULL userid/dbid/queryid), so a zero can only come
+  // from a snapshot file that was edited, truncated, or written by something else. That is precisely when a program
+  // should refuse to trust its own input.
+  const order = ["userid", "dbid", "queryid"];
+  const row = { userid: "10", dbid: "16384", query: "select 1 from probe_x" };
+
+  it("passes a complete triple through in the declared order", () => {
+    expect(resetArguments(order, row, "1234567890123456789")).toEqual(["10", "16384", "1234567890123456789"]);
+    // And it follows the order rather than the shape: this build declares userid first, which is not the order a
+    // person reads the function name in.
+    expect(resetArguments(["queryid", "userid", "dbid"], row, "42")).toEqual(["42", "10", "16384"]);
+  });
+
+  it("refuses a zero in any slot, because zero means every row with that id", () => {
+    for (const bad of [
+      { at: "queryid", args: [order, row, "0"] },
+      { at: "userid", args: [order, { ...row, userid: "0" }, "123"] },
+      { at: "dbid", args: [order, { ...row, dbid: 0 }, "123"] },
+    ]) {
+      const message = (() => {
+        try {
+          (resetArguments as (...a: unknown[]) => string[])(...bad.args);
+          return "";
+        } catch (error) {
+          return (error as Error).message;
+        }
+      })();
+      expect(message, `a zero ${bad.at} must be refused, not sent`).toContain("refusing to reset");
+      expect(message).toContain(bad.at);
+      expect(message).toContain("0 means every");
+    }
+  });
+
+  it("refuses a missing id, which a STRICT function would turn into a silent no-op", () => {
+    // The other direction, and the reason the count is not just `removed += 1` on a successful call: the function
+    // is `proisstrict = true`, so a NULL argument returns NULL and does NOTHING, and the driver sends a missing id
+    // as NULL. The call would succeed and the tool would report rows removed that are all still in the view.
+    for (const bad of [undefined, null, "", "  "]) {
+      expect(() => resetArguments(order, { ...row, userid: bad as string | undefined }, "123"), `userid ${JSON.stringify(bad)}`).toThrowError(/missing/);
+      expect(() => resetArguments(order, { ...row, dbid: bad as string | undefined }, "123"), `dbid ${JSON.stringify(bad)}`).toThrowError(/missing/);
+      expect(() => resetArguments(order, row, bad as string), `queryid ${JSON.stringify(bad)}`).toThrowError(/missing/);
+    }
+  });
+
+  it("refuses an id that is not an integer, including a float that came from a rounded bigint", () => {
+    // `queryid` is bigint and these ids are around 1e19, four orders past 2^53, so a value that went through a
+    // JS number has already lost its low bits and names a row that does not exist.
+    expect(() => resetArguments(order, row, "1.234e+19")).toThrowError(/not an integer/);
+    expect(() => resetArguments(order, { ...row, dbid: "16384.5" }, "123")).toThrowError(/not an integer/);
+    expect(() => resetArguments(order, { ...row, userid: "ten" }, "123")).toThrowError(/not an integer/);
+  });
+
+  it("keeps a negative queryid, which is a normal bigint and not a defect", () => {
+    // Half of this store's queryids are negative bigint values; a guard that reads like "must be positive" would
+    // refuse every one of them.
+    expect(resetArguments(order, row, "-3747469066182624048")).toEqual(["10", "16384", "-3747469066182624048"]);
   });
 });
 

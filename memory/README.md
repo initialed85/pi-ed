@@ -711,22 +711,42 @@ Three rules follow, and the first two are rewrites of crash-scoped caveats into 
 - **`calls` is unsafe for arithmetic in ordinary operation**, not only after a crash. Two agents using the same
   constant-select shape share a counter, and neither sees it.
 - **Absence from the view is weak evidence in both directions, always** - a statement that ran may be folded into a
-  row whose text names a different statement, and a row can also *leave*. The first candidate cause is capacity
-  eviction at `pg_stat_statements.max` (a setting, not a column of the view: `select max from pg_stat_statements`
-  fails with `errorMissingColumn`, which is why this file used to say "the view evicts" without checking). On the
-  numbers it does not fit: home-ops watched a 9-call and a 2-call row disappear with no crash and no reset, and the
-  view held a few hundred rows against a `max` of 5000. The cause that fits is much closer to home - **a peer's
-  name-scoped cleanup**, because a targeted `pg_stat_statements_reset(userid, dbid, queryid)` removes exactly one row
-  and leaves `stats_reset` untouched, which is the whole design of the cleanup helper above. Both agents in this
-  fleet run such a cleanup, so a vanishing row is most likely a peer, not capacity. `test/statistics-view.test.ts`
-  performs the removal deliberately and asserts the pair: the row is gone, `stats_reset` is byte-identical, and the
-  view is nowhere near full.
+  row whose text names a different statement, and a row can also *leave*. Capacity eviction at
+  `pg_stat_statements.max` (a setting, not a column of the view: `select max from pg_stat_statements` fails with
+  `errorMissingColumn`, which is why this file used to say "the view evicts" without checking) is real but does not
+  fit these numbers: 334 rows against a ceiling of 5000, and home-ops watched rows vanish with no crash and no full
+  reset. The cause that fits is much closer to home - **a scoped reset**, because a targeted
+  `pg_stat_statements_reset(userid, dbid, queryid)` removes exactly one row and leaves `stats_reset` untouched, which
+  is the whole design of the cleanup helper above. Both agents in this fleet run such a cleanup, so a vanishing row
+  is most likely a peer, not capacity. `test/statistics-view.test.ts` performs the removal deliberately and asserts
+  the pair: the row is gone, `stats_reset` is byte-identical, and the view is nowhere near full.
+- **A scoped reset can erase more than one row, and `stats_reset` will not show it.** The function is declared
+  `userid oid DEFAULT 0, dbid oid DEFAULT 0, queryid bigint DEFAULT 0`, and **0 means all**. home-ops measured it on
+  a scratch database in this very store: `reset(0, 17680, 0)` took that database from 31 tracked rows to 1 (its own
+  reset row) while `pi_ed`'s 323 rows were untouched and `stats_reset` came back byte-identical. So the window is not
+  proof of a quiet store - it only rules out the *full* reset. The corollary is that this store's stamp equals
+  `pg_postmaster_start_time` (`2026-11-07 19:27:33`, one restart, `restartCount 0`), which tells you nobody has
+  reset everything since the extension loaded and nothing whatsoever about scoped resets. `hack/pg-statement-traces.mjs`
+  now validates all three ids before sending them and refuses any zero, because the value can only arrive from a
+  snapshot file that was edited or truncated - and it counts the rows that are *gone from the view* afterwards rather
+  than the calls that returned success, because the function is `STRICT` (`proisstrict = true`): a NULL argument
+  makes it do nothing and still report success. The reset calls themselves are visible - 15 rows carrying 378 calls
+  whose text contains `pg_stat_statements_reset(` - but the scope of each is a parameter, so the count proves resets
+  happened and never says what they removed.
 - **A row's text is a label, not a record.** Attribute by `queryid`. A probe earns its own counter by being
   structurally distinctive - a different relation, a join, a filter that references a column rather than a constant -
   not by a more creative alias, a more unusual literal, or a `from` clause everybody else already uses. In a shared
   store the practical fence is **a relation only you query**: a temp table named for the run, which is what
   `test/statistics-view.test.ts` now uses, and the reason is cleanup as much as attribution - see the bucket note
   below.
+**A `count(*)` with no `from` is not a count of anything.** It is valid SQL and answers over the implicit one-row
+relation, so `select count(*) || '@@' || (select ...)` reports `1` and reads like an emptied store when the number is
+a fact about the expression, not the data. home-ops shipped that shape in a cost tool as a **hard gate** on the same
+commit that added the feature it was measuring, and it printed `1` for two consecutive runs. The fix is a scalar
+sub-select over the real relation, and the rule generalises past counts: **any number that cannot be `0` is not
+measuring what it claims.** `hack/pg-cost-snapshot.mjs` was grepped on the strength of the finding and has no such
+query - the only `select` in this repo without a `from` is the reset call itself, which is a function and should be one.
+
 `hack/pg-cost-snapshot.mjs` prints `queryid` on every line and marks the merge-prone shapes. The demo below was run
 through it, on the shape this file now recommends, and every row it created was removed afterwards:
 

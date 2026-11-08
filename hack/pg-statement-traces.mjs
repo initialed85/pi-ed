@@ -28,6 +28,14 @@
  *      under a second name lands on the same row and is invisible to the second name. That is why `assert` reports
  *      the landing delta rather than resting on "leftovers 0".
  *
+ *   4. The three ids are validated before the call, and the removal is confirmed after it. The function is declared
+ *      `userid oid DEFAULT 0, dbid oid DEFAULT 0, queryid bigint DEFAULT 0` and 0 means *all*: home-ops measured
+ *      `reset(0, 17680, 0)` against a scratch database taking 31 rows to 1 with `stats_reset` byte-identical, so a
+ *      zero in the queryid slot is an entire database's history erased with no witness. The function is also
+ *      `STRICT` (`proisstrict = true`), so a missing id arrives as NULL, the call returns success, and nothing is
+ *      removed - which is why `remove` prints how many rows are *gone from the view* rather than how many calls
+ *      succeeded, and exits nonzero when the two disagree.
+ *
  * Usage:
  *
  *   ./hack/pg-statement-traces.mjs snapshot --out /tmp/before.json
@@ -138,6 +146,43 @@ async function readArgumentOrder(client) {
 
 export function matchNames(text, names) {
   return names.find((name) => text.includes(name));
+}
+
+/**
+ * The three arguments of a targeted reset, in the order this build declares them, or a refusal.
+ *
+ * Two failure modes live in the same three numbers, and they point in opposite directions.
+ *
+ * `pg_stat_statements_reset` is declared `userid oid DEFAULT 0, dbid oid DEFAULT 0, queryid bigint DEFAULT 0`, and
+ * `0` means *all*: home-ops measured `reset(0, 17680, 0)` on a scratch database taking 31 rows to 1 while
+ * `stats_reset` stayed byte-identical. A scoped reset with a zero in the queryid slot therefore erases an entire
+ * database's statement history with no witness, and the window that would have told you is unmoved. Nothing in the
+ * view has a zero id (measured: 0 rows with `userid = 0 or dbid = 0 or queryid = 0 or is null`), so a zero here can
+ * only come from a snapshot file that was edited, truncated, or written by a different tool - which is exactly when
+ * a program should refuse rather than trust its own input.
+ *
+ * The other direction is subtler, because the function is `STRICT` (`proisstrict = true` on this build): a NULL
+ * argument makes it return NULL and do *nothing*. The driver sends a missing id as NULL, the call succeeds, and a
+ * counter that increments on a successful call would report rows removed that are all still there. So the ids are
+ * validated on the way in, and the removal is confirmed on the way out.
+ */
+export function resetArguments(order, row, queryid) {
+  const source = { userid: row.userid, dbid: row.dbid, queryid };
+  const values = order.map((name) => {
+    const raw = source[name];
+    if (raw === undefined || raw === null || String(raw).trim() === "") {
+      throw new Error(`refusing to reset: the ${name} of this row is missing, and a NULL argument to a STRICT function is a silent no-op`);
+    }
+    const text = String(raw).trim();
+    if (!/^-?\d+$/.test(text)) {
+      throw new Error(`refusing to reset: the ${name} of this row is not an integer (${JSON.stringify(text)})`);
+    }
+    if (BigInt(text) === 0n) {
+      throw new Error(`refusing to reset: the ${name} of this row is 0, and 0 means every ${name} - measured on a scratch database as 31 rows to 1, with stats_reset unmoved`);
+    }
+    return text;
+  });
+  return values;
 }
 
 /**
@@ -331,33 +376,34 @@ async function main() {
   let failed = 0;
   for (const { queryid, row } of removable) {
     try {
-      const ids = await client.query(
-        `select $1::bigint as userid, $2::bigint as dbid, $3::bigint as queryid`,
-        [row.userid, row.dbid, queryid],
-      );
-      const target = ids.rows[0];
+      // Validated before it is sent, because the two ways a bad id can arrive fail in opposite directions: 0 means
+      // "every query in that database" (measured: 31 rows to 1, stats_reset unmoved), and a missing id becomes NULL
+      // in a STRICT function, which does nothing and returns success.
+      const values = resetArguments(order, row, queryid);
       // The declared order, not the remembered one. A swapped userid/dbid is a silent no-op, which is why the
       // removal reports the order it used rather than just the count it removed.
-      await client.query(`select pg_stat_statements_reset($1, $2, $3)`, [
-        target[order[0]],
-        target[order[1]],
-        target[order[2]],
-      ]);
+      await client.query(`select pg_stat_statements_reset($1, $2, $3)`, values);
       removed += 1;
       calls += Number(row.calls);
     } catch (error) {
       failed += 1;
-      console.error(`  remove failed for ${queryid}: ${error.message.split("\n")[0]}`);
+      console.error(`  remove refused for ${queryid}: ${error.message.split("\n")[0]}`);
     }
   }
   const afterRemove = await readSnapshot(client);
   const still = Object.entries(afterRemove.byId).filter(([, row]) => matchNames(row.query, names) && !isToolQuery(row.query));
   const windowNow = String(afterRemove.statsReset) === String(after.statsReset);
+  // A call that succeeds is not a row that is gone. The re-read is the only thing that distinguishes the two, so
+  // the count that gets printed is the one that was measured.
+  const vanished = removable.filter(({ queryid }) => !afterRemove.byId[queryid]).length;
   console.log(`  reset argument order (from pg_proc.proargnames): ${order.join(", ")}`);
-  console.log(`  removed ${removed} row(s) carrying ${calls} call(s); ${still.length} leftover(s); stats_reset ${windowNow ? "unmoved" : "MOVED"}`);
+  console.log(`  called reset on ${removed} row(s) carrying ${calls} call(s); ${vanished} of them are gone from the view; ${still.length} leftover(s); stats_reset ${windowNow ? "unmoved" : "MOVED"}`);
+  if (removed && vanished < removed) {
+    console.log("  a reset that returns success without removing the row is a NULL argument in a STRICT function: the ids are validated on the way in, so this is the view disagreeing, not the call failing");
+  }
   if (merged.length) console.log(`  refused ${merged.length} row(s) that predate this run - a merged counter is not the run's to delete`);
   await client.end();
-  if (failed || still.length || !windowNow) process.exit(1);
+  if (failed || still.length || !windowNow || vanished < removed) process.exit(1);
 }
 
 const isMain = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
