@@ -35,10 +35,15 @@ steps:
             memory: 1024Mi
             cpu: 1000m
     environment:
-      NODE_OPTIONS: --max-old-space-size=512
+      NODE_OPTIONS: --max-old-space-size=768
     commands:
       - node --version
       - npm --version
+      # Not decoration: this is the step reading its own memory ceiling out of the cgroup, because the alternative is
+      # inferring it from an OOM. V8's heap cap is printed next to it so a limit set here and a limit set by the
+      # backend cannot be confused with each other - which is exactly the ambiguity that made the first diagnosis of
+      # this failure inconclusive.
+      - node -e 'const fs=require("fs");const p="/sys/fs/cgroup/memory.max";const raw=fs.existsSync(p)?fs.readFileSync(p,"utf8").trim():fs.readFileSync("/sys/fs/cgroup/memory/memory.limit_in_bytes","utf8").trim();const mb=(v)=>v==="max"?"unlimited":Math.round(Number(v)/1048576)+"Mi";console.log(`cgroup memory limit: ${mb(raw)}  node heap cap: ${Math.round(require("v8").getHeapStatistics().heap_size_limit/1048576)}MB  os.cpus(): ${require("os").cpus().length}  availableParallelism: ${require("os").availableParallelism()}`);'
       # The lockfile is committed, so ci is the honest install: a manifest/lockfile drift fails here
       # instead of producing a tree nobody tested.
       - npm ci
