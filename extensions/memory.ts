@@ -1227,6 +1227,25 @@ export function dreamCursorStatement(sessionId: string): Statement {
   };
 }
 
+/**
+ * How much work the session had already done by the time its last dream ended.
+ *
+ * A resumed session arrives carrying its whole history as the branch, and `dreamed` starts at zero, so the in-memory
+ * gate reads every row the session has ever produced as unsummarized work and asks about it the first time the clock
+ * fires - which is why a bounce alone produced a dream prompt two minutes later on a session that had dreamed an
+ * hour before and done nothing since. The store already knows where the last dream ended, so this is the one query
+ * that makes the two halves agree, and it is the same filter `dreamSpanStatement` uses so the two cannot disagree
+ * about what work means.
+ */
+export function dreamWatermarkStatement(sessionId: string): Statement {
+  return {
+    sql: `select count(*) filter (where coalesce(meta ->> 'dream_turn', 'false') <> 'true') as work_before
+          from memory.event
+          where session_id = $1 and seq <= coalesce((select dream_seq from memory.session where id = $1), 0)`,
+    values: [sessionId],
+  };
+}
+
 /* ------------------------------------------------------------------ dreaming */
 
 /**
@@ -1329,6 +1348,9 @@ export default function memoryExtension(api: ExtensionAPI): void {
   let recorded = 0;
   let workSeen = 0;
   let dreamed = 0;
+  /** Whether the store has been asked where this session's last dream ended. Once per session; a reset session is a
+   *  new question. */
+  let watermarkSeeded = false;
   let sessionOpenedAt = Date.now();
   /** Whether the `/memory` panel is currently above the editor. Pi keeps a widget until something clears it. */
   let panelOpen = false;
@@ -1570,6 +1592,34 @@ export default function memoryExtension(api: ExtensionAPI): void {
     return dreamStartedAt > 0 && Date.now() - dreamStartedAt < DREAM_TURN_TIMEOUT_MS;
   }
 
+  /**
+   * Ask the store how far this session's last dream reached, once, and start the gate from there.
+   *
+   * Called from `session_start` rather than from the gate, and deliberately not awaited there: the clock it is
+   * correcting is ten minutes long, so the answer has plenty of time to land, and a dream that has to wait on a
+   * store that is refusing to connect is a dream that never happens.
+   *
+   * Only ever raises the watermark, never lowers it: a session that has dreamed in this process knows more than the
+   * store does until the flush lands, and a seed that read backwards would re-open a stretch already closed.
+   */
+  async function seedWatermark(sessionId: string): Promise<void> {
+    if (watermarkSeeded) return;
+    watermarkSeeded = true;
+    const db = await database();
+    if (!db) return;
+    try {
+      const seed = dreamWatermarkStatement(sessionId);
+      const result = await db.query(seed.sql, seed.values);
+      const before = Number(result.rows[0]?.work_before ?? 0);
+      if (before > dreamed) dreamed = before;
+    } catch (error) {
+      // A watermark that could not be read is the old behaviour, and the old behaviour is a dream that asks too
+      // often rather than one that never asks. The store's own span check still refuses to write a memory about
+      // nothing, so this is not a correctness path.
+      fault("dream watermark seed", error);
+    }
+  }
+
   async function runDream(ctx: ExtensionContext, trigger: Trigger): Promise<void> {
     if (!cfg.dreams || dreaming()) return;
     collect(ctx);
@@ -1668,6 +1718,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
     recorded = 0;
     workSeen = 0;
     dreamed = 0;
+    watermarkSeeded = false;
     dreamStartedAt = 0;
     dreamTurnEndEntry = undefined;
     // A session that came back is continuing something; ten minutes in is long enough to know what it is continuing.
@@ -1675,7 +1726,13 @@ export default function memoryExtension(api: ExtensionAPI): void {
     // The activity half of the watermark: an agent that opened a session and then never committed anything is the
     // exact shape a broken write path leaves behind.
     attempt("activity stamp", Promise.resolve().then(() => stamp(agentIdentity(ctx, cfg), basename(ctx.cwd ?? process.cwd()), "activity")));
-    if (event.reason === "resume" || event.reason === "startup") scheduleDream(ctx, cfg.resumeDreamMinutes ?? DEFAULTS.resumeDreamMinutes, "resume10m");
+    if (event.reason === "resume" || event.reason === "startup") {
+      // The branch a session comes back with is its whole history, and the gate starts at zero, so without this the
+      // first clock tick asks about every row the session has ever produced. The id is read here, while the context
+      // is certainly alive, because the seed outlives it.
+      attempt("dream watermark seed", seedWatermark(sessionIdOf(ctx)), () => {});
+      scheduleDream(ctx, cfg.resumeDreamMinutes ?? DEFAULTS.resumeDreamMinutes, "resume10m");
+    }
   });
 
   api.on("turn_end", (_event, ctx) => scheduleFlush(ctx));

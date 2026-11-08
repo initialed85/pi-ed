@@ -514,6 +514,19 @@ describe("sql", () => {
     expect(span.values).toEqual(["s1"]);
   });
 
+  it("seeds the gate from where the last dream ended, so a resume does not re-dream its whole history", async () => {
+    const { dreamSpanStatement, dreamWatermarkStatement } = await loadModule();
+    const seed = dreamWatermarkStatement!("s1");
+    // The mirror of the span query: the span counts what is ahead of the cursor, the seed counts what is behind it,
+    // and the two together are the whole history. If the gate starts at zero instead, a resumed session's every row
+    // is unsummarized work and the first clock tick asks about it.
+    expect(seed.sql).toContain("seq <= coalesce((select dream_seq from memory.session where id = $1), 0)");
+    expect(seed.sql).toContain(`count(*) filter (where coalesce(meta ->> 'dream_turn', 'false') <> 'true') as work_before`);
+    expect(seed.values).toEqual(["s1"]);
+    // Same definition of work, or the two halves would disagree about what the gate is counting.
+    expect(seed.sql.match(/dream_turn', 'false'} <> 'true'/g)?.length).toBe(dreamSpanStatement!("s1").sql.match(/dream_turn', 'false'} <> 'true'/g)?.length);
+  });
+
   it("carries the model and the dimension with the vector, and nothing when there is no vector", async () => {
     const { dreamStatement } = await loadModule();
     const vector = new Array(768).fill(0.001);

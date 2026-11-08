@@ -179,6 +179,7 @@ describe("every exported statement", () => {
       "dreamCursorStatement",
       "dreamSpanStatement",
       "dreamStatement",
+      "dreamWatermarkStatement",
       "eventStatement",
       "heartbeatActivityStatement",
       "heartbeatAdvisoryAlertStatement",

@@ -91,6 +91,40 @@ async function ownCount(agentId: string): Promise<number> {
   return Number((await query(statement.sql, statement.values)).rows[0]?.own ?? 0);
 }
 
+/**
+ * A session's history with a dream sitting in the middle of it, which is the only shape that tells the two halves of
+ * the gate apart: the watermark counts what the last dream reached, the span counts what is past it, and the residue
+ * of the dream itself belongs to neither.
+ */
+async function plantHistory(agentId: string, dreamSeq: number, total: number): Promise<string> {
+  const sessionId = `${agentId}-session`;
+  await query(
+    `insert into memory.agent (id, name, notes) values ($1, $1, '{"probe": true}'::jsonb)
+     on conflict (id) do update set notes = excluded.notes`,
+    [agentId],
+  );
+  await query(
+    `insert into memory.session (id, agent_id, source, started_at, last_activity_at, event_count, dream_seq)
+     values ($2, $1, 'probe', now(), now(), $3, $4)
+     on conflict (id) do update set event_count = excluded.event_count, dream_seq = excluded.dream_seq`,
+    [agentId, sessionId, total, dreamSeq],
+  );
+  for (let seq = 1; seq <= total; seq += 1) {
+    // The dream's own three rows: the request, the call, and the harness closing the turn. `source_entry_id` is the
+    // real dedup key (migration 002 replaced the schema's `unique (session_id, seq)` with a unique index on this),
+    // so a probe that wants to be re-runnable has to name its rows the way the writer does.
+    const residue = seq >= dreamSeq - 2 && seq <= dreamSeq;
+    await query(
+      `insert into memory.event (session_id, agent_id, seq, at, kind, tool_name, source_entry_id, meta)
+       values ($1, $2, $3, now(), $4, $5, $6, $7::jsonb)
+       on conflict (session_id, source_entry_id) do nothing`,
+      [sessionId, agentId, seq, residue ? "tool_call" : "assistant", residue ? "memory_dream" : null,
+       `${PROBE}-e${seq}`, JSON.stringify(residue ? { dream_turn: true } : {})],
+    );
+  }
+  return sessionId;
+}
+
 const suite = liveDsn ? describe : describe.skip;
 
 suite("retrieval scope, against the store", () => {
@@ -114,6 +148,7 @@ suite("retrieval scope, against the store", () => {
     // The same discipline as the heartbeat probes: whatever a test invents, the test removes, and everything it
     // invents carries a name that makes a leftover findable in one query.
     await query(`delete from memory.memory where agent_id like $1`, [`${PROBE}%`]);
+    await query(`delete from memory.event where agent_id like $1`, [`${PROBE}%`]);
     await query(`delete from memory.session where agent_id like $1`, [`${PROBE}%`]);
     await query(`delete from memory.agent where id like $1`, [`${PROBE}%`]);
   }
@@ -209,6 +244,33 @@ suite("retrieval scope, against the store", () => {
     const noneRow = (await query(none.sql, none.values)).rows[0] ?? {};
     expect(Number(noneRow.memories)).toBe(0);
     expect(noneRow.without_vector_percent).toBeNull();
+  });
+
+  it("partitions a session's history between the watermark and the span, so a resume starts quiet", async () => {
+    const mod = await import(source);
+    const agent = `${PROBE}-gate`;
+    // Twelve rows, the last dream's own three ending at ten, so the cursor sits at ten and two rows are ahead of it.
+    const sessionId = await plantHistory(agent, 10, 12);
+
+    const seed = mod.dreamWatermarkStatement!(sessionId);
+    const span = mod.dreamSpanStatement!(sessionId);
+    const workBefore = Number((await query(seed.sql, seed.values)).rows[0]?.work_before ?? 0);
+    const spanRow = (await query(span.sql, span.values)).rows[0] ?? { work_events: 0, last_seq: 0 };
+    const workAfter = Number(spanRow.work_events);
+    const total = Number((await query(`select count(*) as n from memory.event where session_id = $1 and coalesce(meta ->> 'dream_turn', 'false') <> 'true'`, [sessionId])).rows[0].n);
+
+    // The two halves have to be the whole history, or the gate is counting something the store cannot see.
+    expect(workBefore).toBe(7);
+    expect(workAfter).toBe(2);
+    expect(workBefore + workAfter).toBe(total);
+
+    // This is the resume case in one line: the branch a session comes back with holds all twelve rows, so the gate
+    // that starts from zero sees ten work rows and asks about them two minutes after the pod came up. Seeded from
+    // the store it sees two, which is under the floor, and the session stays quiet.
+    expect(mod.dreamPending!(total, 0, 4)).toBe(true);
+    expect(mod.dreamPending!(total, workBefore, 4)).toBe(false);
+    // And once real work arrives past the cursor, the gate opens again on its own.
+    expect(mod.dreamPending!(workBefore + 5, workBefore, 4)).toBe(true);
   });
 
   it("tells the agent which kind of absence it is looking at", async () => {
