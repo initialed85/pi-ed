@@ -37,8 +37,12 @@ not a session worth thinking about.
 - **10 minutes after a resume** - a session that came back is usually continuing something, and what it remembered
   on the way out is worth comparing with what it does next.
 
-`dream_seq` is written only after a dream succeeds, which is what makes an interrupted pass resumable rather than
-lost.
+`dream_seq` moves when a dream turn *ends*, not only when it writes. A dream that decided nothing was worth
+remembering has still looked at the stretch and judged it, and a cursor that only advances on a successful write
+re-opens the gate every idle window afterwards - one session on the fleet asked seventeen times about three rows of
+history. The exception is a write the store refused for a transient reason (no connection, or the events it would
+summarise had not landed): there the stretch really is unsummarized, so the gate stays open and the next window tries
+again. Losing a memory is worse than dreaming twice.
 
 **A dream's own rows are not new work.** Dreaming is a turn like any other, so it leaves rows behind: the hidden
 request, the agent's answer, the `memory_dream` call and its result. They are recorded in `event` and tagged
@@ -48,6 +52,17 @@ become a hall of mirrors. The live check caught exactly that (an agent dutifully
 dream" among its subjects, and a memory row whose whole subject list was `none`). Three things hold the line: the gate
 counts work rather than rows, the span a memory is anchored to excludes the residue, and `memory_dream` asks
 `dreamSpanStatement` first so a span with no work in it is refused in words instead of being written.
+
+The residue ends when the harness closes the dream's turn, not when the user next speaks. That distinction cost one
+session 464 rows: it kept working after a dream - a teammate steer, a scheduled prompt, and a resume are not user
+messages - and every row of that work was filed as dreaming, so the store read zero work in the span and the next
+dream correctly refused a stretch that was full of it. `hack/repair-dream-tags.mjs` is the one-off that untagged what
+the old rule had swallowed, and it is the thing to re-run if a session ever reports a span of zero work again.
+
+A second gate sits in front of the first: `minDreamWork` (4 by default) is how much work a stretch has to hold before
+asking about it is worth a turn, enforced at the trigger and again where the row would land. `pre_compaction` is
+exempted from the floor in both places, because there the turn is already spent and the memory is the only version of
+the stretch that survives - a two-row stretch holding one dense decision is exactly what it is for.
 
 ## How retrieval weights
 

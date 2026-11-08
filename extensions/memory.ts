@@ -34,9 +34,12 @@
  * carries a memory whose embedding failed.
  *
  * A dream that decided nothing was worth remembering is a no-op, and a no-op must not leave a mark in the session's
- * context. That is not a rendering question - the dream prompt is already `display: false` - it is a bookkeeping one:
- * the watermark has to advance on any dream turn that ends cleanly, or the next idle window re-asks the same question
- * and the refusals stack up in the context forever. See `closeDreamTurn` and `minDreamWork`.
+ * context. That is not a rendering question - the dream prompt is already `display: false` - it is a bookkeeping one,
+ * and there are two of them. The watermark has to advance on any dream turn that ends cleanly, or the next idle window
+ * re-asks the same question and the refusals stack up in the context forever. And the dream's own rows have to stop
+ * being residue when the turn ends, not when the user next speaks, or every later turn - a teammate steer, a
+ * scheduled prompt, a resume - is tagged as dreaming and the memory system stops being told that work happened at
+ * all. See `closeDreamTurn`, `minDreamWork` and `dreamFloorFor`.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -92,7 +95,9 @@ interface Config {
   resumeDreamMinutes?: number;
   /** How much work a stretch has to contain before a dream is worth asking about it. A pod restart that woke a
    *  settled session, a one-line answer, and nothing else is two or three rows, and prompting over that buys a
-   *  hidden message plus a refusal in the context for a stretch that has nothing in it. */
+   *  hidden message plus a refusal in the context for a stretch that has nothing in it. `pre_compaction` is exempt:
+   *  there the turn is already spent and the memory is the only thing that survives the context, which is exactly
+   *  when a thin stretch holding one dense decision is worth writing down. */
   minDreamWork?: number;
   /** Turn the vectors off without turning dreaming off: memories land unembedded and only the keyword path finds them. */
   embeddings?: boolean;
@@ -262,7 +267,7 @@ function clip(text: string, limit: number): string {
  * dashboard and worthless for remembering what an agent did, and recording them would make the history table about
  * the harness rather than about the work.
  */
-export function rowsFromBranch(entries: unknown[], cfg: Config): Row[] {
+export function rowsFromBranch(entries: unknown[], cfg: Config, dreamTurnEnd?: string): Row[] {
   const skip = new Set(cfg.skip ?? []);
   const limit = cfg.maxTextChars ?? DEFAULTS.maxTextChars;
   const rows: Row[] = [];
@@ -362,15 +367,22 @@ export function rowsFromBranch(entries: unknown[], cfg: Config): Row[] {
   // A dream is a turn like any other and it leaves rows behind: the hidden request, the agent's answer, the
   // `memory_dream` call and its result. Those rows belong in the history - but they are not new work, and without
   // this tag a session that has dreamed once always looks like it has an unsummarized stretch, so it dreams about
-  // dreaming. The boundary is the next user message: everything between a `memory:dream` request and that message is
-  // dream output, including any tool the agent chose to run while answering it. Over-tagging there is the lesser
-  // error; a memory store that re-dreams its own dreams every ten minutes is the bigger one.
+  // dreaming.
+  //
+  // The boundary is the end of the dream turn, which `closeDreamTurn` records as `dreamTurnEnd`. The next user
+  // message is kept as a fallback for a dream that never settled, but it cannot be the rule: a session that goes on
+  // to take a teammate steer, a scheduled prompt or a resume without the user speaking is doing real work that the
+  // tag would describe as residue, and everything after that is invisible to the gate and to the floor. This is not
+  // hypothetical - one session on the fleet had 363 rows tagged as dream residue after its dream, none of which the
+  // memory system was willing to count.
   let inDreamTurn = false;
   for (const row of rows) {
     if (row.kind === "marker" && row.toolName === "memory:dream") inDreamTurn = true;
     else if (row.toolName === "memory_dream") inDreamTurn = true;
     else if (row.kind === "user") inDreamTurn = false;
     if (inDreamTurn) row.meta = { ...row.meta, dream_turn: true };
+    // The boundary row itself is dream output; the turn after it is not.
+    if (dreamTurnEnd && row.sourceEntryId === dreamTurnEnd) inDreamTurn = false;
   }
 
   return rows.filter((row) => !skip.has(row.kind));
@@ -1234,6 +1246,19 @@ export function dreamPending(recorded: number, dreamed: number, minWork = 1): bo
 }
 
 /**
+ * Which floor a trigger asks for.
+ *
+ * `minDreamWork` exists to stop a dream being paid for out of reflex: a scrap of a stretch costs a turn to ask about
+ * and a refusal to answer, and that is the shape the fleet was drowning in. Before compaction the turn is already
+ * spent and the context is about to be thrown away, so a two-row stretch holding one dense decision is precisely the
+ * thing worth writing down - it is the only version of it that survives. Hence the floor is not applied there, and
+ * the store-side check asks the same question rather than forming a second opinion.
+ */
+export function dreamFloorFor(trigger: Trigger, minWork: number): number {
+  return trigger === "pre_compaction" ? 1 : Math.max(1, minWork);
+}
+
+/**
  * The store-side half of the same bar the triggers use, in words an agent can act on.
  *
  * Returns `undefined` when the stretch is worth a memory. This is not a fault path: a stretch that is below the floor
@@ -1293,6 +1318,11 @@ export default function memoryExtension(api: ExtensionAPI): void {
   let flushTimer: NodeJS.Timeout | undefined;
   let dreamTimer: NodeJS.Timeout | undefined;
   let dreamStartedAt = 0;
+  /** The last row of the dream turn, recorded when the harness settles. Rows after it are the next turn's work; see
+   *  the tag loop in `rowsFromBranch`. */
+  let dreamTurnEndEntry: string | undefined;
+  /** The tail row of the branch as `collect()` last walked it, which is what a settling dream turn marks as its end. */
+  let lastBranchRowId: string | undefined;
   /** Set when a dream turn ended with the store refusing the write for a transient reason - no connection, or the
    *  events it would summarize did not land. That is the one case where the gate must stay open. */
   let dreamWriteFaulty = false;
@@ -1399,8 +1429,10 @@ export default function memoryExtension(api: ExtensionAPI): void {
 
   function collect(ctx: ExtensionContext): number {
     const sessionId = sessionIdOf(ctx);
+    const branchRows = rowsFromBranch(ctx.sessionManager.getBranch() as unknown[], cfg, dreamTurnEndEntry);
+    if (branchRows.length) lastBranchRowId = branchRows[branchRows.length - 1].sourceEntryId;
     let fresh = 0;
-    for (const row of rowsFromBranch(ctx.sessionManager.getBranch() as unknown[], cfg)) {
+    for (const row of branchRows) {
       // kind and tool name are part of the key because one entry can produce several rows, and re-walking a branch
       // after a /tree or a resume must not turn one tool call into three.
       const key = `${sessionId}|${row.sourceEntryId}|${row.kind}|${row.toolName ?? ""}`;
@@ -1416,7 +1448,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
     // The gate is about work, so it counts rows that are not themselves the residue of a previous dream. Recomputed
     // from the branch rather than accumulated: a /tree or a resume changes the branch, and a counter that only ever
     // went up would keep saying "there is new work" for a stretch that no longer exists.
-    workSeen = rowsFromBranch(ctx.sessionManager.getBranch() as unknown[], cfg).filter((row) => row.meta.dream_turn !== true).length;
+    workSeen = branchRows.filter((row) => row.meta.dream_turn !== true).length;
     return fresh;
   }
 
@@ -1542,8 +1574,9 @@ export default function memoryExtension(api: ExtensionAPI): void {
     if (!cfg.dreams || dreaming()) return;
     collect(ctx);
     // An unsummarized stretch is the only reason to dream, and it has to be a stretch rather than a scrap: the floor
-    // is what keeps a session that woke up, said one line, and went quiet from being asked to reflect on it.
-    if (!dreamPending(workSeen, dreamed, cfg.minDreamWork ?? DEFAULTS.minDreamWork)) {
+    // is what keeps a session that woke up, said one line, and went quiet from being asked to reflect on it. Before
+    // compaction there is no floor, because the memory is the only thing that survives the turn.
+    if (!dreamPending(workSeen, dreamed, dreamFloorFor(trigger, cfg.minDreamWork ?? DEFAULTS.minDreamWork))) {
       // Silence is what a correctly behaved idle session looks like. The case worth one line of explanation is the
       // one a watcher cannot distinguish from a broken trigger: this session has already dreamed, and the reason it
       // is not dreaming again is that the dreaming itself is not work.
@@ -1588,15 +1621,22 @@ export default function memoryExtension(api: ExtensionAPI): void {
    * and judged it, and a memory that was never worth writing is not lost by not being written. A store that refused
    * for a transient reason is different - there the stretch really is unsummarized, so the gate stays open.
    */
-  function closeDreamTurn(ctx: ExtensionContext): void {
+  function closeDreamTurn(ctx: ExtensionContext, aborted = false): void {
     if (dreamStartedAt === 0) return;
     dreamStartedAt = 0;
     const sessionId = sessionIdOf(ctx);
     collect(ctx);
+    // The dream's rows stop being residue here, whatever the dream decided to do with them. An aborted turn gets the
+    // same boundary - it is still finished - but not the same watermark, because an interrupted stretch was never
+    // judged.
+    dreamTurnEndEntry = lastBranchRowId;
+    if (aborted) return;
     if (dreamWriteFaulty) {
       dreamWriteFaulty = false;
       return;
     }
+    // The write path already closed the stretch; this is the no-op half, and it is the half that used to stay open.
+    if (dreamed >= workSeen) return;
     dreamed = workSeen;
     triggers.delete(sessionId);
     // ...and move the store-side watermark with it, or the next pod restart reads `dream_seq`, finds the same
@@ -1629,6 +1669,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
     workSeen = 0;
     dreamed = 0;
     dreamStartedAt = 0;
+    dreamTurnEndEntry = undefined;
     // A session that came back is continuing something; ten minutes in is long enough to know what it is continuing.
     // `pi -c` reports "startup" rather than "resume", so both are treated as a session that arrived from history.
     // The activity half of the watermark: an agent that opened a session and then never committed anything is the
@@ -1643,7 +1684,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
     scheduleFlush(ctx);
     // The dream turn is over. It has to be closed here, on the same final boundary the idle clock is armed from, or
     // the gate stays open and the next window re-asks about a stretch that was already answered.
-    if (!event.aborted) closeDreamTurn(ctx);
+    closeDreamTurn(ctx, event.aborted);
     // Idle is when an agent has time to think, so this is the ordinary dream trigger. An aborted run is not idle, it
     // is interrupted, and dreaming about an interrupted stretch is how an agent learns to summarize noise.
     if (!event.aborted) scheduleDream(ctx, cfg.idleDreamMinutes ?? DEFAULTS.idleDreamMinutes, "idle10m");
@@ -1822,9 +1863,10 @@ export default function memoryExtension(api: ExtensionAPI): void {
         const spanResult = await client.query(span.sql, span.values);
         const spanRow = spanResult.rows[0] ?? { last_seq: 0, work_events: 0 };
         const workEvents = Number(spanRow.work_events);
-        const floor = Math.max(1, cfg.minDreamWork ?? DEFAULTS.minDreamWork);
-        // The floor again, this time where the row would land. One rule enforced twice is the point: the trigger does
-        // not ask about a scrap, and the store does not remember one.
+        // The floor again, this time where the row would land, and asked of the same trigger so the two halves cannot
+        // disagree: the trigger does not ask about a scrap, the store does not remember one, and compaction is
+        // exempted in both places because that is where a thin stretch is the one worth keeping.
+        const floor = dreamFloorFor(trigger, cfg.minDreamWork ?? DEFAULTS.minDreamWork);
         const refusal = dreamFloorNote(workEvents, floor);
         if (refusal) {
           return {
@@ -1863,7 +1905,8 @@ export default function memoryExtension(api: ExtensionAPI): void {
         const cursor = dreamCursorStatement(sessionId);
         await client.query(cursor.sql, cursor.values);
         await client.query("refresh materialized view memory.subject_index");
-        dreamStartedAt = 0;
+        // The clock is left running on purpose: the agent still has a line to say after the write, and that line is
+        // part of the dream turn. `closeDreamTurn` on `agent_settled` is what ends it and marks the boundary.
         // The gate is in units of work, so this has to be recorded in the same unit. `seen.size` counts every row
         // this process has walked, including the dream's own residue, and a gate that compares work against
         // work-plus-residue drifts towards dreaming every idle window.

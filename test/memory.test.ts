@@ -328,6 +328,30 @@ describe("recording a branch", () => {
     expect(result.meta).toMatchObject({ toolCallId: "call-1", isError: false });
   });
 
+  it("knows that a dream turn ended, and counts the work that came after it", async () => {
+    const { rowsFromBranch } = await loadModule();
+    // The tag used to run until the next user message, and that assumption is what made a session go blind: a
+    // teammate steer, a scheduled prompt or a resume is not a user message, so every turn after a dream was filed as
+    // residue and the memory system stopped being told any work had happened. One session on the fleet had 363 rows
+    // of real work in that state.
+    const afterDream: any[] = [
+      { type: "message", id: "w1", timestamp: "2026-11-08T02:00:00.000Z", message: { role: "user", content: "the work before the dream" } },
+      { type: "custom", id: "d2", customType: "memory:dream", timestamp: "2026-11-08T02:00:10.000Z", content: "You are dreaming." },
+      { type: "message", id: "d3", timestamp: "2026-11-08T02:00:20.000Z", message: { role: "assistant", content: [{ type: "toolCall", name: "memory_dream", arguments: { summary: "shipped" } }] } },
+      { type: "message", id: "d4", timestamp: "2026-11-08T02:00:30.000Z", message: { role: "toolResult", toolName: "memory_dream", toolCallId: "call-9", isError: false, content: [{ type: "text", text: "dream recorded" }] } },
+      { type: "custom", id: "s5", customType: "team-room", timestamp: "2026-11-08T02:10:00.000Z", content: "a steer from a teammate, not a user message" },
+      { type: "message", id: "s6", timestamp: "2026-11-08T02:10:20.000Z", message: { role: "assistant", content: [{ type: "text", text: "did the thing the steer asked for" }] } },
+    ];
+    const blind = rowsFromBranch!(afterDream, {}) as any[];
+    expect(blind.filter((row) => row.meta.dream_turn !== true).map((row) => row.sourceEntryId)).toEqual(["w1"]);
+    // With the boundary the dream turn recorded when the harness settled, the same branch reads honestly: the dream
+    // is still residue, and the work after it is not.
+    const awake = rowsFromBranch!(afterDream, {}, "d4") as any[];
+    const work = awake.filter((row) => row.meta.dream_turn !== true).map((row) => row.sourceEntryId);
+    expect(work).toEqual(["w1", "s5", "s6"]);
+    expect(awake.filter((row) => row.meta.dream_turn === true).map((row) => `${row.kind}:${row.sourceEntryId}`)).toEqual(["marker:d2", "tool_call:d3", "tool_result:d4"]);
+  });
+
   it("records markers and compactions, and skips harness bookkeeping", async () => {
     const { rowsFromBranch } = await loadModule();
     const rows = rowsFromBranch!(branch(), {}) as any[];
@@ -700,6 +724,19 @@ describe("dream gate", () => {
     expect(dreamFloorNote!(0, 0)).toContain("0 non-dream events");
   });
 
+  it("exempts compaction from the floor, because that is where a thin stretch is the one worth keeping", async () => {
+    const { dreamFloorFor, dreamPending } = await loadModule();
+    // The floor exists to stop a dream being paid for out of reflex. Before compaction the turn is already spent and
+    // the context is about to be discarded, so a two-row stretch holding one dense decision - "do not apply the kill
+    // switch, and do not re-report it" - is the memory that matters most and the only version that survives.
+    expect(dreamFloorFor!("pre_compaction", 4)).toBe(1);
+    expect(dreamFloorFor!("idle10m", 4)).toBe(4);
+    expect(dreamFloorFor!("resume10m", 4)).toBe(4);
+    expect(dreamFloorFor!("idle10m", 0)).toBe(1);
+    expect(dreamPending!(2, 0, dreamFloorFor!("pre_compaction", 4))).toBe(true);
+    expect(dreamPending!(2, 0, dreamFloorFor!("idle10m", 4))).toBe(false);
+  });
+
   it("tells the agent that declining an empty stretch is safe, because the watermark closes either way", async () => {
     // The instruction used to end the other way: "a dream that admits it was empty is fine", which is exactly what put
     // four paragraphs of "nothing happened" into a store that other agents then retrieve.
@@ -881,6 +918,53 @@ describe("the extension", () => {
     vi.useRealTimers();
     expect(keen.sentMessages).toHaveLength(1);
     expect(keen.sentMessages[0]?.message).toMatchObject({ customType: "memory:dream", details: { trigger: "idle10m" } });
+  });
+
+  it("dreams a thin stretch before compaction, where the floor would have lost it", async () => {
+    // The pair of "does not dream about a stretch thinner than the floor". Same one-row branch, different trigger: the
+    // context is about to be thrown away and the turn is already paid for, so this is the stretch a memory exists for.
+    vi.useFakeTimers();
+    const { context } = contextFor({ branch: branch().slice(0, 1) });
+    await pi.emit("session_start", { reason: "new" }, context);
+    await pi.emit("session_before_compact", {}, context);
+    vi.useRealTimers();
+    expect(pi.sentMessages).toHaveLength(1);
+    expect(pi.sentMessages[0]?.message).toMatchObject({ customType: "memory:dream", details: { trigger: "pre_compaction" } });
+  });
+
+  it("counts the work a session does after a dream, even when nobody spoke to it", async () => {
+    // The second half of the same blindness: the dream's rows used to be residue until the next user message, and a
+    // session that carries on taking steers and scheduled prompts without one has its real work filed as dreaming.
+    // This is the shape that made a store-side refusal correct-looking and wrong - the span said zero work events
+    // because 363 rows had been tagged as a dream that had ended hours earlier.
+    vi.useFakeTimers();
+    const live = branch();
+    const { context } = contextFor({ branch: live });
+    await pi.emit("session_start", { reason: "new" }, context);
+    await pi.emit("turn_end", { turnIndex: 0, messageEntryId: "e2", toolResultEntryIds: ["e3"] }, context);
+    await pi.emit("agent_settled", { aborted: false }, context);
+    vi.advanceTimersByTime(11 * 60_000);
+    expect(pi.sentMessages).toHaveLength(1);
+    // The dream answers, and the turn settles. Its rows are residue, and the settle marks where they stop.
+    live.push(
+      { type: "custom", id: "d1", parentId: "e6", timestamp: "2026-11-08T01:10:00.000Z", customType: "memory:dream", content: "You are dreaming." },
+      { type: "message", id: "d2", parentId: "d1", timestamp: "2026-11-08T01:10:10.000Z", message: { role: "assistant", content: [{ type: "text", text: "that stretch was already remembered" }] } },
+    );
+    await pi.emit("agent_settled", { aborted: false }, context);
+    // A teammate steers the session, and the agent does four rows of actual work. No user message anywhere.
+    live.push(
+      { type: "custom", id: "s1", parentId: "d2", timestamp: "2026-11-08T01:20:00.000Z", customType: "team-room", content: "the floor also silences a short stretch with a decision in it" },
+      { type: "message", id: "s2", parentId: "s1", timestamp: "2026-11-08T01:20:10.000Z", message: { role: "assistant", content: [{ type: "text", text: "compaction is exempted then" }, { type: "toolCall", name: "edit", arguments: { path: "extensions/memory.ts" } }] } },
+      { type: "message", id: "s3", parentId: "s2", timestamp: "2026-11-08T01:20:20.000Z", message: { role: "toolResult", toolName: "edit", toolCallId: "call-2", isError: false, content: [{ type: "text", text: "ok" }] } },
+      { type: "message", id: "s4", parentId: "s3", timestamp: "2026-11-08T01:20:30.000Z", message: { role: "assistant", content: [{ type: "text", text: "tests next" }] } },
+    );
+    await pi.emit("turn_end", { turnIndex: 1, messageEntryId: "s2", toolResultEntryIds: ["s3"] }, context);
+    await pi.emit("agent_settled", { aborted: false }, context);
+    vi.advanceTimersByTime(11 * 60_000);
+    vi.useRealTimers();
+    // The dream did not swallow the session: four rows of post-dream work are a stretch, and it gets asked about.
+    expect(pi.sentMessages).toHaveLength(2);
+    expect(pi.sentMessages.at(-1)?.message).toMatchObject({ customType: "memory:dream", details: { trigger: "idle10m" } });
   });
 
   it("closes the stretch when a dream wrote nothing, so the next idle window is quiet", async () => {

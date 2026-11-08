@@ -160,8 +160,18 @@ try {
     dreamStart = await waitFor((e) => e.type === "tool_execution_start" && e.toolName === "memory_dream", 240_000, "memory_dream after one nudge");
   }
   void dreamStart;
-  const dream = await waitFor((e) => e.type === "tool_execution_end" && e.toolName === "memory_dream", 90_000, "memory_dream to finish");
+  let dream = await waitFor((e) => e.type === "tool_execution_end" && e.toolName === "memory_dream", 90_000, "memory_dream to finish");
   console.log(`memory_dream isError=${dream.isError}, ${String(dream.result?.content?.[0]?.text ?? "").split("\n")[0]}`);
+  // A call the schema rejected is the model's malformed arguments, not the store refusing a write. The distinction
+  // matters because the rest of this check reads back the row the call was supposed to plant, and failing there
+  // would look like a broken dream path.
+  if (dream.isError && /Validation failed/.test(String(dream.result?.content?.[0]?.text ?? ""))) {
+    console.log("note: the model's memory_dream call failed schema validation; naming the fields and asking once more");
+    send('Call memory_dream again with exactly these string parameters: summary (two to four sentences), subjects (a comma-separated list of three to six labels), feel (one line). Do not nest them in an object.');
+    await waitFor((e) => e.type === "tool_execution_start" && e.toolName === "memory_dream", 240_000, "a second memory_dream call");
+    dream = await waitFor((e) => e.type === "tool_execution_end" && e.toolName === "memory_dream", 90_000, "the second memory_dream to finish");
+    console.log(`memory_dream retry isError=${dream.isError}, ${String(dream.result?.content?.[0]?.text ?? "").split("\n")[0]}`);
+  }
 
   // The extension flushes on a debounce and writes asynchronously, so give it a beat before reading back.
   await new Promise((resolve) => setTimeout(resolve, 3000));
