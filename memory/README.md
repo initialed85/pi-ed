@@ -1104,6 +1104,34 @@ NFS share directly and writes `pi-ed-dump-<utc>.sql` to romulus - is the copy wo
 silently skips a volume that is *detached* when the job fires - labelled, selected, reported as handled,
 `lastBackupAt: none`. Not hypothetical; it happened to `woodpecker-pgdump` on 2026-11-07.
 
+**Coverage is read from the volume, and `lastBackupAt` is the half that cannot be inferred from a label.** This
+volume's own record: `recurring-job-group.longhorn.io/backup-daily: enabled` and `status.lastBackupAt
+2026-11-07T18:00:34Z`, corroborated at byte level by home-ops (`0bc2d1a`, `faf1bf6`) through a read-only in-cluster
+mount of the backup export - `backupstore/volumes/35/9f/pvc-4b1dccc5…`, 52 objects, newest `18:00Z`,
+`backup-10d7529b14bc43ec` at `snapshotSize 247463936`. The label is the weaker of the two readings:
+`recurring-job-group.longhorn.io/default` on a volume is Longhorn's *default-group marker*, not a job, and home-ops
+found ten volumes across the two clusters labelled while the cluster's only recurring job (`backup-daily`,
+`groups: [backup-daily]`, cron `0 18 * * *`) selects a different group. A sweep asks the volume -
+`spec.recurringJobSelector`, `status.lastBackupAt` - and asks the target - `spec.backupTargetURL`, **not** `spec.url`,
+which is empty even on a cluster that backed up eight volumes ninety minutes earlier - and it carries the condition
+type name with its status, because a healthy target reports `type: Unavailable`, `status: "False"`.
+
+**And both copies are on one device.** Measured, not assumed:
+
+| copy | where it actually lives |
+|---|---|
+| the SQL dumps | PV `pvc-0b2861fa…`, `nfs.csi.k8s.io`, `server 192.168.1.25`, `share /storage-hdd`, `subdir pvc-0b2861fa…` |
+| the Longhorn backups | dev backup target `nfs://192.168.1.25:/storage-hdd/longhorn-backup-dev` |
+
+Same host, same export, different subdirectory. So the protection this store actually has is: **Longhorn's two
+replicas** survive a bee node dying (`numberOfReplicas 2`, healthy, on `k3s-bee-2`); **neither copy** survives
+romulus's `storage-hdd` export dying, being unmounted badly, or being `rm -rf`'d - which is also true of the pi session
+histories home-ops keeps on an RWX share of the same export. A `longhorn-csi-plugin` restart cannot strand the dump
+volume (it never touches it) and a Longhorn volume restore would not restore the dumps, so the two copies are not two
+failure domains. Whether that is acceptable - a second backup target on different hardware, or a stated decision that
+one NAS is the floor this store is willing to sit on - is Ed's call, not something a runbook should quietly assume away
+by listing two copies.
+
 So nothing detaches this volume between 17:55Z and 18:10Z. No `kubectl rollout restart deploy/pi-ed-postgres`, no
 scale to zero, no cordon that evicts it. A manifest change that alters the pod template - `shared_preload_libraries`
 for `pg_stat_statements`, an image bump - belongs at some other hour, because Argo rolls the pod whenever the sync
