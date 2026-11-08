@@ -301,3 +301,29 @@ describe("harness", () => {
     expect(painted(new RealText("hello", 0, 0))).toBe("hello");
   });
 });
+
+describe("ci shape", () => {
+  // 2026-11-08: four pi-ed pipelines in a row died with exit 134 and `Ineffective mark-compacts near heap limit`
+  // while every home-ops pipeline passed. No test was broken. Woodpecker's kubernetes backend sized the step pod at
+  // cpu 1 / 512Mi, os.cpus() inside that pod reported the host node's cores, vitest forked per host core, and the
+  // suite's measured peak (~650 MB of vitest main + forks + the npm wrapper) walked straight through the limit. An
+  // OOM and a failing test look identical from a badge, so the two decisions that fixed it are pinned here rather
+  // than left as configuration someone can tidy away.
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+  it("pins the worker count instead of letting it follow the host's cores", () => {
+    const config = readFileSync(path.join(root, "vitest.config.ts"), "utf8");
+    expect(config).toMatch(/maxWorkers:\s*\d+/);
+    expect(config, "os.cpus() reports the node a CI pod landed on, not the quota that pod is limited to").not.toMatch(/maxWorkers:[^\n]*os\.cpus\(/);
+  });
+
+  it("gives the test step a pod big enough for the suite it runs", () => {
+    const ci = readFileSync(path.join(root, ".woodpecker", "ci.yaml"), "utf8");
+    const testStep = ci.slice(ci.indexOf("- name: test"), ci.indexOf("- name: package-shape"));
+    expect(testStep, "the k8s backend only takes resources under backend_options.kubernetes").toContain("backend_options:");
+    const limit = /limits:\s*\n\s*memory:\s*(\d+)Mi/.exec(testStep);
+    expect(limit, "a step whose memory limit is inherited from a backend default is a step that fails as an OOM").toBeTruthy();
+    // Measured peak was ~650 MB. Anything under 1 GiB is a re-run of the same incident waiting to happen.
+    expect(Number(limit![1]), "measured peak RSS of the test step is ~650 MB at node 22").toBeGreaterThanOrEqual(1024);
+  });
+});

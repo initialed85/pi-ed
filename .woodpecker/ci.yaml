@@ -17,6 +17,25 @@
 steps:
   - name: test
     image: docker.io/library/node:22
+    # Woodpecker's kubernetes backend gives a step pod cpu 1 / memory 512Mi by default, and os.cpus() inside that pod
+    # reports the node's cores rather than the cgroup quota - so vitest sizes its worker pool from a machine the step
+    # is not actually running on. Measured on a clean `npm ci` at node 22, subtracting this container's own agent
+    # process: maxWorkers 1 peaks at ~300 MB, 2 at ~390 MB, 4 at ~650 MB. Four beefcake cores meant vitest ran enough
+    # forks to walk through 512 Mi, and four pi-ed pipelines died as `Ineffective mark-compacts near heap limit` with
+    # exit 134 while every home-ops pipeline passed. Nothing was broken; an OOM in CI is indistinguishable from a
+    # failing test unless someone reads the step log. So the worker count is pinned in vitest.config.ts and the pod is
+    # sized with real headroom above that measurement instead of inheriting a default it cannot meet.
+    backend_options:
+      kubernetes:
+        resources:
+          requests:
+            memory: 512Mi
+            cpu: 100m
+          limits:
+            memory: 1024Mi
+            cpu: 1000m
+    environment:
+      NODE_OPTIONS: --max-old-space-size=512
     commands:
       - node --version
       - npm --version
@@ -34,6 +53,18 @@ steps:
   - name: package-shape
     image: docker.io/library/node:22
     depends_on: [test]
+    # Explicit rather than inherited: this step reads package.json and the extension directory, and it fits well
+    # under the default pod, but a step that quietly relies on a backend default is the one that surprises someone
+    # when the default changes.
+    backend_options:
+      kubernetes:
+        resources:
+          requests:
+            memory: 128Mi
+            cpu: 100m
+          limits:
+            memory: 384Mi
+            cpu: 500m
     commands:
       # The two things that decide whether this repository loads in Pi at all, and that fail silently
       # rather than loudly: the pi.extensions discovery field, and not bundling the packages Pi hands
