@@ -672,6 +672,33 @@ there: the report found five rows for the sweep by leading text and **none** by 
 flat select, found six rows by clause - two of which are genuinely different statements that read `memory.memory`
 and are not its generations at all. The clause key is a flat-statement heuristic, and the group is a signal.
 
+**No key recovers a generation family, and that is a measured fact rather than a missing trick.** Replaying
+home-ops' committed 370-row snapshot (`test/fixtures/home-ops-baseline-2026-11-08.json`, the same shape `snapshot`
+emits) against the seven `insert into writer_heartbeat` generations that carry 214 accumulated calls - probing with
+a real member of the family, not an invented statement - the trade-off is a curve, not a choice between two bad
+keys:
+
+| grouping key | recovered of 7 | false positives |
+| --- | --- | --- |
+| exact text (what the hash sees) | 1 | 0 |
+| aliases + qualification stripped | 1 | 0 |
+| - and the column list stripped | 1 | 0 |
+| - and the values list stripped | 1 | 0 |
+| relation clause or leading 40 characters | 5 | 13 |
+| table name only | 7 | 57 |
+
+Every identity-normalised key recovers exactly one, and the normalisation is not the problem: **the seven are seven
+*because* they differ structurally, and the hash is that structure.** Normalising toward the hash walks toward the
+split, not toward the family; the only key that recovers the family is one that asserts nothing about the statement,
+and it is 57/64 wrong. "The same statement to a reader" is a claim about intent and is not computable from the view,
+so the sibling report prints three tiers - `exact`, the row whose stored text *is* the statement; rows sharing its
+clause; rows sharing its leading text - and never adds them.
+
+`exact` has a limit worth knowing before relying on it: the stored text is not the text you sent. The store carries
+`now() - interval $3` where the caller wrote `now() - $3`, so a probe assembled from a builder's output rather than
+read back from the view reports `0 exact` for a row that is genuinely its own. Read the form back; never fabricate
+it.
+
 The same run showed why a name scope is not attribution: `assert --name pi_ed_` reported a leftover that was not
 mine, a home-ops statement whose second alias is `pi_ed_rows_after`, because `pi_ed` is the name of the database and
 a peer will reasonably use it as an identifier. `remove` refused the row - it predates the run - which is the only
@@ -823,6 +850,15 @@ row's identity off its text.** Sending a row's own text back does not guarantee 
 is never complete, `leftovers 0` is never proof, and the landing delta - which rows grew, and whether this run can
 claim them - is the only honest instrument. It is also why the gate is the before-snapshot and not the name: the name
 says what a row looks like, the snapshot says who was there first.
+
+**A snapshot is an anchor for the clock and never a gate for a future run.** home-ops committed a whole-store baseline
+(`maintenance/2026-11-08/pg-stat-statements-baseline.json`, 370 rows, `stats_reset` matching the live store byte for
+byte), and the same file copied here as `test/fixtures/home-ops-baseline-2026-11-08.json` is what refuted their
+generation-grouping claim below. It is a good baseline and a dangerous `--before`: 76 ids present in the current store
+are absent from it, so any run gating on it would be told 76 rows were created by that run, and a `remove` acting on
+that would reset counters it never touched. The gate's whole purpose is knowing what already existed, and a snapshot
+ages by exactly the rows nobody has looked at since it was taken. Re-snapshot before you gate; use an old snapshot to
+check the window and to hold a measurement still.
 
 **Clean up every name a probe wrote, not the name it reported.** This session ended with eight rows of my own still in
 the store, and none of them were a mystery: they were `create temp table wrap_probe_<ts>` and `drop table if exists
@@ -1449,6 +1485,25 @@ silently skips a volume that is *detached* when the job fires - labelled, select
 `lastBackupAt: none`. Not hypothetical, and not a one-off either: `woodpecker-pgdump` carries the `backup-daily` label
 and has **never** produced a backup, because its only writer is a CronJob that runs at 03:00Z and detaches the volume
 between runs. It is silent by configuration, not by failure.
+
+### 2026-11-08: the store came up empty, and why the schema was still there
+
+At 04:40Z the `pi-ed-postgres` pod came up with every table in `memory` empty - `memory`, `event`, `session`, `agent`,
+`writer_heartbeat` all zero rows - while `pg_stat_statements` reported a `stats_reset` equal to
+`pg_postmaster_start_time()`. **Schema present and data absent is the tell**: the initdb ConfigMap mounted at
+`/docker-entrypoint-initdb.d` only runs against an empty data directory. The pod was new (`restarts: 0`, empty
+`lastState`) rather than restarted, on a Longhorn volume still reported `attached`/`healthy`, whose
+`OfflineRebuilding` condition last transitioned at 04:38:32Z - the same minute. The statistics reset was a *symptom* of
+a fresh cluster, not evidence about anyone's cleanup, and it is the case this whole section exists for: every counter
+both repositories had been measuring became history of a window that no longer exists, and only the `stats_reset`
+comparison distinguishes "the numbers moved" from "the window moved".
+
+Both restore points were timestamped 18:00Z the previous evening - the Longhorn copy (`backup-10d7529b14bc43ec`,
+247 MB, Completed) and the `pg_dump`. What turned this from a loss into a setback is a property of the store's design:
+**the memory store is derived**, its source of truth being the pi session files on a separate NFS share, which were
+untouched - so `hack/memory-backfill.mjs` can rebuild it. What is genuinely gone is everything written between the
+last backup and the loss; at 19:27Z the store held 4 agents, 3 sessions, 1,079 memories and 77 heartbeat rows. That
+four-hour gap is the argument for a second dump schedule rather than a cleverer one.
 
 **Coverage is read from the volume, and `lastBackupAt` is the half that cannot be inferred from a label.** This
 volume's own record: `recurring-job-group.longhorn.io/backup-daily: enabled` and `status.lastBackupAt

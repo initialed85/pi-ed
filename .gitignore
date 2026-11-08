@@ -2,3 +2,4 @@ node_modules/
 coverage/
 .vitest-cache/
 *.log
+.pi/auto-resume.json
