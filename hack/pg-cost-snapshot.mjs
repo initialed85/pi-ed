@@ -77,11 +77,35 @@ async function snapshot(db) {
   return { byId, statsReset: info.rows[0]?.stats_reset ?? null, windowMinutes: info.rows[0]?.window_minutes ?? null };
 }
 
+// Redacted, because this script is pointed at the same DSN the extension uses and a diagnostic that prints the DSN
+// prints the password.
+const redactedDsn = dsn.replace(/:\/\/[^:\/]*:[^@]*@/, "://***@");
+
 const client = new pg.Client({ connectionString: dsn, application_name: "pi-ed pg-cost-snapshot" });
-await client.connect();
+try {
+  await client.connect();
+} catch (error) {
+  // Failing before the command runs is the point: a snapshot script that cannot read the view has no baseline, and
+  // reporting "0 statements attributable to the run" from a database it never confirmed is a verdict it has no right
+  // to give. Loud, named, and non-zero.
+  console.error(`pg-cost-snapshot: cannot connect to ${redactedDsn}: ${error.message}`);
+  console.error("  nothing was run and no measurement is claimed.");
+  await client.end().catch(() => undefined);
+  process.exit(1);
+}
 const db = { query: async (sql) => ({ rows: (await client.query(sql)).rows }) };
 
-const before = await snapshot(db);
+let before;
+try {
+  before = await snapshot(db);
+} catch (error) {
+  // Connected is not the same as able to measure: `pg_stat_statements` exists per database, so a correct DSN pointed
+  // at the wrong database fails here rather than printing an attractively empty run.
+  console.error(`pg-cost-snapshot: connected to ${redactedDsn}, but the snapshot query failed: ${error.message}`);
+  console.error("  is pg_stat_statements created in this database? Nothing was run and no measurement is claimed.");
+  await client.end().catch(() => undefined);
+  process.exit(1);
+}
 // The window's age travels with the stamp. A mean from a 40-minute window and a mean from a 3-day window are not the
 // same measurement, and home-ops reads the same view from their own sweep, so both sides report the same quantity.
 console.log(`before: ${before.byId.size} tracked statements, window ${before.windowMinutes ?? "?"} min since stats_reset ${before.statsReset ?? "unknown"}`);
