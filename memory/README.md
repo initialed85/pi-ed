@@ -868,6 +868,36 @@ This is the rename split above seen from the other side, and the two together gi
 together is the analysed structure, not the text you wrote.** Text is how a reader identifies a statement; `queryid` is
 how the view identifies it, and those two are not the same thing.
 
+**The complete list, measured on one temp relation in one session.** The question a probe has to answer is "what can I
+change that makes this statement a new counter", and the answer is shorter than the vocabulary suggests:
+
+| what you change | in the hash? | measured |
+|---|---|---|
+| a select-list alias (`select a as x1` / `as x2`) | **no** | one row, `calls` 1 -> 2, text names the first alias |
+| a `prepare` label (`prepare p1 as Q` / `p2 as Q`) | **no** | one row, keyed by `Q`, text names the first label |
+| a **rangetable / subquery alias** (`... as tok_s1` / `tok_s2`) | **no** | one row, `calls` 1 -> 2, text names `_s1` |
+| a comment (leading, trailing, none) | **no** | one row, `queryid` 1874599377454600515 (home-ops) |
+| a literal constant | **no** | normalised to `$n`, so the text does not keep it either |
+| the **wrapper itself** (`select count(*) from (Q) as t` vs bare `Q`) | **yes** | bare `Q` = `-357508737959858566`, wrapped = `4988011853769026268` |
+| the **inner structure** of a subquery (`(select a, b from t)` vs `(select a from t where a > $1)`) | **yes** | new row `9027602412084077725` |
+| a **relation name** | **yes** | two runs wrapping the *identical* inner got `-1613205842668154079` and `-3114372424334584332` |
+
+So the probe recipe has one sentence in it: **a wrapper keeps your calls off somebody else's counter, and only a
+relation makes the row yours.** The wrapper alone is what home-ops' sweep now uses, and it does achieve its stated
+measurement - `0 shared counters moved` - because the wrapped form is a different key from the bare form. But the
+run token sits in the *alias* slot, which is outside the hash, so two runs of the same sweep are the same statement
+the view's eye: the second run's calls land on the first run's row, its own marker search finds nothing, and its
+name-scoped cleanup cannot see what it did. The result-preserving form that fixes it is one extra column:
+
+```sql
+select t.*, (select count(*) from <per-run marker relation>) as <marker>_n
+  from (<the statement you are validating>) as t
+```
+
+Measured: the inner's rows come back unchanged (`resultRows 2`), the two runs get wholly separate `queryid`s, and the
+marker is in the row text so the run's own cleanup can find it. A cross join works too (`... as t, <marker> m`) and
+changes the result, which is fine for a validation sweep and wrong for a measurement.
+
 **Cleaning a probe up is its own contract.** `pg_stat_statements` is a view over shared memory and is not deletable
 in this build (`cannot delete from view "pg_stat_statements"`), so the only surgical route is
 `pg_stat_statements_reset` with its three-argument form - and this build declares the arguments as **(`userid`,

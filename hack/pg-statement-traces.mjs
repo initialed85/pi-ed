@@ -325,6 +325,10 @@ async function main() {
     // parameters - never stores it. Their sweep prepares through named labels and the name search returned 0 rows
     // while 10 shared counters each grew by one of their calls.
     console.log(`  note: a name matching nothing is also what a name that was never stored looks like. Under the extended protocol a prepare label is not in the row text at all, so this line is not proof of cleanliness for a client that binds parameters.`);
+    // The other half, measured on one temp relation: a select-list alias, a prepare label, and a *subquery* alias are
+    // all outside the hash, so a name in any of those slots cannot make a statement novel and cannot be relied on to
+    // find a run's own landing. Only a relation name is inside the hash.
+    console.log(`  note: a name in an alias slot is outside the hash - select-list, prepare label, and rangetable alias all of them. Only a relation name makes a row this run's.`);
   }
   for (const [queryid, row] of leftovers.slice(0, 10)) console.log(`    ${queryid}  ${row.query.slice(0, 100)}`);
 
