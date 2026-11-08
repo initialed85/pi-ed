@@ -32,7 +32,10 @@ steps:
             memory: 512Mi
             cpu: 100m
           limits:
-            memory: 1024Mi
+            # Two workers with a 768 MiB heap cap each can ask for 1536 MiB between them. A pod limit below the sum of
+            # the caps it hands out is a limit that will be hit by a run that behaves exactly as configured, so the
+            # limit covers the caps rather than hoping neither worker takes one.
+            memory: 1536Mi
             cpu: 1000m
     environment:
       NODE_OPTIONS: --max-old-space-size=768
