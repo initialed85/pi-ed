@@ -737,6 +737,35 @@ reset can only ever reach statements the resetting reader invented. `stat_probe`
 home-ops' markers are `sweep_probe`, and neither reads the other's counters - which is the difference between cleanup
 and "cleanup, plus whatever else was standing in the same shape".
 
+**`queryid` is bigint, and text is the only form of it that survives being read.** The ids in this store are around
+1e19, and 2^53 - the largest integer a JS number represents exactly - is 9.007e15. Measured on a probe run here: all
+five ids it produced fail `String(Number(id)) === id`, so rounding is not an edge case here, it is the default fate of
+any id that passes through a number. The driver is the safe half (node-postgres returns `bigint` as a string); the
+danger is what a reader does next - `Number(id)` in a driver, or an id pasted into source as a numeric literal. The
+consequences, measured by home-ops on this store (`0baf3ec`): `-6049891011141795458` became `-6049891011141796000`,
+`pg_stat_statements_reset(0, dbid, <rounded>)` removed nothing, and the follow-up `where queryid = <rounded>` found no
+row **for an id that never existed**, so every "assert absent" line printed `absent` while the probe rows sat there at
+1 and 2 calls. A cleanup aimed at a corrupted identity passes its own absence check. So: read `queryid::text` out of
+the view, hand it back as a string parameter (cast `$n::bigint` where the position needs a type), and assert absence by
+**name scope** (`where query like '%<run-name>%'` → 0 rows) rather than by the id you meant. This repository encodes it
+as a live test that performs the rounding on purpose and asserts that the row survives, that the corrupted-id lookup
+finds nothing, and that the name-scoped lookup is the one that reports the truth.
+
+**A probe's name scope must cover the relation it created, not only the aliases it used.** The cleanup pass on one of
+the demo runs above removed the six alias-named rows it was looking for and left six more in the view - `create temp
+table readme_fence_…`, `insert into readme_fence_…`, `drop table readme_fence_…` - because they carry the relation
+name, not the alias. Name the relation, and clean by that name.
+
+**A display width is a fence that hides fences.** This script used to print `left(query, 70)`, and that hid the very
+clause doing the fencing: `select count(*) as fence_probe_alpha from homeops_fence_probe_20261108` and the same
+statement with `where agent_id = $1` printed identically while carrying different `queryid`s. A reader comparing the
+printed texts would have concluded the view was inconsistent. Filters had always read the untruncated text; the print
+now matches it, and truncation is opt-in (`--max-text N`), with a capped line saying it is capped.
+
+**`create temp table … on commit drop` under an autocommitting client drops the table inside the transaction that
+created it** (home-ops' first probe died with `relation … does not exist`). This repository's probes create plain temp
+tables and drop them explicitly at the end of the run, which is also what makes the DDL rows above visible to cleanup.
+
 **Rank by mean over recurring statements** is therefore not a style preference, and home-ops' live counter-example is
 the cleanest demonstration of why: ordering this store's view by `total_exec_time` puts `CREATE EXTENSION` at
 143.89 ms on **one call** on top, with the extension script's internals behind it at 10.05 ms mean / 32.25 ms max -

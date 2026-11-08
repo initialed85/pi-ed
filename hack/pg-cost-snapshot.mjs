@@ -25,12 +25,13 @@ const { values: flags, positionals } = parseArgs({
   options: {
     top: { type: "string", default: "6" },
     "include-ddl": { type: "boolean", default: false },
+    "max-text": { type: "string", default: "0" },
     help: { type: "boolean", default: false },
   },
 });
 
 if (flags.help || positionals.length === 0) {
-  console.error("usage: pg-cost-snapshot.mjs [--top N] [--include-ddl] -- <command> [args...]");
+  console.error("usage: pg-cost-snapshot.mjs [--top N] [--include-ddl] [--max-text N] -- <command> [args...]");
   console.error("requires PI_MEMORY_DSN (or PI_LIVE_DSN). Snapshots pg_stat_statements, runs the command, diffs.");
   process.exit(2);
 }
@@ -44,7 +45,7 @@ if (!dsn) {
 // Qualified on purpose, and the reason is the `search_path` asymmetry documented in memory/README.md: this script
 // must still find the extension when the reader's role resolves `public` first.
 const SNAPSHOT = `
-  select queryid, calls, total_exec_time, mean_exec_time, max_exec_time, rows, left(query, 70) as query, query as full_query
+  select queryid, calls, total_exec_time, mean_exec_time, max_exec_time, rows, query, query as full_query
   from pg_stat_statements
   where queryid is not null
 `;
@@ -59,11 +60,15 @@ const RESET = `select stats_reset, round(extract(epoch from (now() - stats_reset
 //
 //   - the view stores a parameterised query with its literals replaced (`extract($1 from ...)`), so a signature that
 //     spans a literal - `epoch`, `60.0`, `1` - matches the script's source and not the row the view holds; and
-//   - the printed query text is deliberately truncated for readability, so a signature near the end of a statement is
-//     invisible to a filter that reads the same column it prints.
+//   - a signature that sits near the END of a statement is invisible to a filter reading a column the script also
+//     truncates. This script used to print `left(query, 70)`, and home-ops measured what that cost (`0baf3ec`):
+//     `select count(*) as fence_probe_alpha from homeops_fence_probe_20261108` and the same statement with
+//     `where agent_id = $1` printed identically while carrying different `queryid`s - a reader comparing the printed
+//     texts would conclude the view was being inconsistent. The filter had always read the untruncated text; the print
+//     has now caught up. Truncation is opt-in via `--max-text N`, and a capped line says it is capped.
 //
-// Hence: the filter reads the untruncated `full_query`, and the signature is the table clause, which is both late in
-// the statement and never sent as a bind parameter.
+// Hence: filters read `full_query` (identical to `query` now), and the signature is the table clause, which is both
+// late in the statement and never sent as a bind parameter.
 const SELF = ["from pg_stat_statements"];
 const isSelf = (text) => {
   const oneLine = String(text ?? "").replace(/\s+/g, " ").trim();
@@ -186,11 +191,15 @@ for (const [queryid, row] of after.byId) {
 
 rows.sort((a, b) => b.totalMs - a.totalMs);
 const top = Number(flags.top) || 6;
+// Off by default on purpose: the clause that decides whether two probes share a counter is usually the last one, and a
+// display width is exactly what hides it. Cap it knowingly, and the line says it is capped.
+const maxText = Number(flags["max-text"]) || 0;
+const show = (text) => (maxText && text.length > maxText ? `${text.slice(0, maxText)} […]` : text);
 console.log(`\nduring the run (${rows.length} distinct statements, deltas not totals):`);
 for (const row of rows.slice(0, top)) {
   console.log(
     `  ${row.totalMs.toFixed(2)} ms total | ${row.perCall.toFixed(2)} ms per call | ${row.calls} call(s) | ` +
-      `${row.rowsOut} row(s) | queryid ${row.queryid} | ${row.text}` +
+      `${row.rowsOut} row(s) | queryid ${row.queryid} | ${show(row.text)}` +
       (row.merged ? "  [merge-prone: alias and literals are not in the hash, so anything structurally identical shares this counter]" : "") +
       (row.split ? "  [split-prone shape: a column added to the table, or a rename, gives this identical text a new queryid and a counter starting at 1]" : ""),
   );

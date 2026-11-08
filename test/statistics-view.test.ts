@@ -238,4 +238,38 @@ describe.skipIf(!liveDsn)("pg_stat_statements contract", () => {
       expect(gone).toHaveLength(0);
       expect(String((await query(`select stats_reset from pg_stat_statements_info`))[0].stats_reset)).toBe(statsResetAtBefore);
     });
+
+    it("cannot clean a probe by a queryid it rounded on the way in", async () => {
+      // `queryid` is bigint, and this store's are around 1e19 - four orders of magnitude past 2^53, the largest integer
+      // a JS number holds exactly. An id that passes through a number is a different id, and the failure is not an
+      // error: the reset removes nothing, and every "assert absent by id" line then prints `absent` about an id that
+      // never existed. Measured first by home-ops on this store (home-ops `0baf3ec`): -6049891011141795458 arrived as
+      // -6049891011141796000, the probe rows sat there at 1 and 2 calls, and the cleanup reported itself clean.
+      const rows = await probeRows();
+      expect(rows.length).toBeGreaterThan(0);
+      const target = rows[0];
+      const asText = String(target.queryid);
+
+      // The driver is the safe half: node-postgres hands `bigint` back as a string, so the corruption is what a reader
+      // does with the id, not what the database sent.
+      expect(typeof target.queryid, "the driver returns bigint as text; a number here is already the bug").toBe("string");
+      expect(await query(`select queryid::text as t from pg_stat_statements where queryid = $1`, [asText])).toHaveLength(1);
+
+      // The mistake, made on purpose.
+      const rounded = Number(asText);
+      expect(String(rounded)).not.toBe(asText);
+      await targetedReset({ ...target, queryid: rounded });
+
+      // The row survives, because the reset was aimed at an identity that does not exist.
+      const survived = await query(`select calls from pg_stat_statements where queryid = $1`, [asText]);
+      expect(survived, "a reset aimed at a rounded id must not remove the row it was aiming at").toHaveLength(1);
+
+      // And this is the line that would have reported success: absence checked against the rounded id.
+      const absentByCorruptedId = await query(`select queryid from pg_stat_statements where queryid = $1`, [String(rounded)]);
+      expect(absentByCorruptedId, "absence by a rounded id is a check against an id that never existed").toHaveLength(0);
+
+      // The check that cannot lie is the name scope: the probe is still in the store, and says so.
+      const byName = await query(`select queryid from pg_stat_statements where query like $1`, [like(`%${PROBE}_%`)]);
+      expect(byName.length, "the probe is still there - name scope is what reports it").toBeGreaterThan(0);
+    });
   });
