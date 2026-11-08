@@ -747,6 +747,18 @@ sub-select over the real relation, and the rule generalises past counts: **any n
 measuring what it claims.** `hack/pg-cost-snapshot.mjs` was grepped on the strength of the finding and has no such
 query - the only `select` in this repo without a `from` is the reset call itself, which is a function and should be one.
 
+**A filter that matches the word "probe" is measuring its own vocabulary, not the litter.** Measured on this store:
+the view holds 13 rows whose text contains `probe`, and **0** of them are leaked probes - every marker this repo has
+ever used (`stat_probe_`, `probe_sibling`, `merge_probe_`, `readme_demo`, `remove_dogfood`, and home-ops' `zz_homeops`)
+returns zero rows on a `position(...)` check. The thirteen are verification queries that *count* probes, and the
+largest of them by a wide margin is the counter itself: `select count(*) as probe_rows_before from
+pg_stat_statements where query like $1`, 17 calls. `hack/memory-live-check.mjs` plants the word as a *data value* too
+(`'probe'` as a session source, `{"probe": true}` in notes), so its statements match any word filter forever. This is
+the third face of the same self-reference: the pure `select count(*) from pg_stat_statements` is constant because the
+row adds both the call and the count; the `like '%name%'` absence check can never report zero about itself; and a word
+filter counts the queries that talk about filtering. Count by marker, and treat a word count as a claim about the
+language of whoever ran the last check.
+
 `hack/pg-cost-snapshot.mjs` prints `queryid` on every line and marks the merge-prone shapes. The demo below was run
 through it, on the shape this file now recommends, and every row it created was removed afterwards:
 
