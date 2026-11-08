@@ -824,6 +824,16 @@ is never complete, `leftovers 0` is never proof, and the landing delta - which r
 claim them - is the only honest instrument. It is also why the gate is the before-snapshot and not the name: the name
 says what a row looks like, the snapshot says who was there first.
 
+**Clean up every name a probe wrote, not the name it reported.** This session ended with eight rows of my own still in
+the store, and none of them were a mystery: they were `create temp table wrap_probe_<ts>` and `drop table if exists
+wrap_probe_<ts>` from `/tmp` scripts whose cleanup loop filtered on the **token** (`zz_pied_wrap_<ts>`) and never on
+the **relation** (`wrap_probe_<ts>`). The DDL rows carry the relation name and no token at all, so a scope that reads
+like a complete cleanup reported zero while leaving a trail - and one of the eight was from a script that had *crashed*
+before its own cleanup line, which is the exact case the namespace pre-clean exists for. Two rules follow, and both are
+the same rule as `preCleanOwnLitter` seen from the other end: a probe's cleanup scope is every identifier it wrote,
+including the ones in its DDL, and a scratch script should use the namespaces the suite already declares rather than
+inventing one per file. The store went 444 -> 437 rows across the removal, `stats_reset` unmoved throughout.
+
 **Disclosure, in the form home-ops asked for.** Those probes added roughly seven calls to the shared `n` row above
 (3 -> 10) and two rows of my own that I could remove by `queryid` (`select $1 as zz_pied_wildXcard`, and the
 `position_hits` counter). Calls on a shared shape are not removable without deleting other writers' history, so they
