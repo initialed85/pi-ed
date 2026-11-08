@@ -23,6 +23,12 @@
  *    whose agent id was the literal `'heartbeat-probe-demo'` is stored as `values ($1, $2, ...)`, and
  *    `query like '%heartbeat-probe-demo%'` finds nothing. Name scopes are built from identifiers:
  *    relation names, aliases, prepared-statement labels.
+ *  - **And an identifier is weaker than that list suggests.** It is in the row's *text* but not in its
+ *    *hash*, so a name only ever finds the row that first saw the shape - `prepare X as Q` is keyed by
+ *    `Q`, and the second writer to run `Q` is invisible to their own name and present in the first
+ *    writer's counter. The relation is the only identifier that reliably creates a row, which is why
+ *    live probes fence themselves with a private relation and the shared `hack/pg-statement-traces.mjs`
+ *    reports a landing delta instead of trusting "leftovers 0".
  */
 /**
  * The narrowest thing these helpers need: something that can run a query and hand rows back. Typed

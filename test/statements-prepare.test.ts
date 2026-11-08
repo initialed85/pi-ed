@@ -284,19 +284,74 @@ describe.skipIf(!liveDsn)("every exported statement, prepared against the real s
     expect(unreachable, "every exported builder must be reachable by the sweep's argument shapes").toEqual([]);
   });
 
+  it("keys a prepared statement to its inner statement, and labels it with whatever submitted first", async () => {
+    // The mechanism behind every warning in this file, measured here so it stops being folklore.
+    //
+    // A `prepare X as Q` that is never executed is not tracked at all. Once it is executed, the row is keyed by the
+    // hash of *Q* - the inner statement - and the text stored on that row is whatever was submitted first, which is
+    // the whole `prepare X as Q` string. So the label is not in the hash, the alias is not in the hash, and the name
+    // a name-scoped cleanup can see is only the first thing that ever ran the shape.
+    //
+    // This is why a shared store cannot be cleaned by name. It is also why home-ops saw a row
+    // `prepare pi_ed_prepare_probe_13_vectorCoverageStatement as select count(*)::int ...` accumulating calls while
+    // nothing in this suite executes anything: the row was keyed by the inner SELECT, and the label was merely its
+    // first-seen text.
+    const rel = `stat_probe_preparekey_${Date.now()}`;
+    const inner = `select count(*)::int as n from ${rel}`;
+    const client = new Client(liveDsn);
+    await client.connect();
+    const rows = async () =>
+      (
+        await client.query(
+          `select queryid::text as queryid, calls::int as calls, query from pg_stat_statements where query like $1`,
+          [`%${rel}%`],
+        )
+      ).rows;
+
+    try {
+      await client.query(`create temp table ${rel} (n int)`);
+      await client.query(`prepare ${rel}_p as ${inner}`);
+      await client.query(`execute ${rel}_p`);
+      const created = await rows();
+      const prepareRow = created.find((row) => row.query.startsWith("prepare "));
+      expect(prepareRow).toBeDefined();
+      expect(prepareRow!.calls).toBe(1);
+
+      // The same inner statement, submitted directly: it lands on the prepare's row, because the hash is the inner
+      // statement's and the row is not the prepare's.
+      await client.query(inner);
+      const direct = await rows();
+      const stillKeyed = direct.find((row) => row.queryid === prepareRow!.queryid)!;
+      expect(stillKeyed.calls).toBe(2);
+      expect(stillKeyed.query).toBe(prepareRow!.query); // and the text still says `prepare ...`, not what just ran
+
+      // A third submission, with a different alias on the same shape: the alias is outside the hash too.
+      await client.query(`select count(*)::int as ${rel}_alias from ${rel}`);
+      const aliased = await rows();
+      expect(aliased.find((row) => row.queryid === prepareRow!.queryid)!.calls).toBe(3);
+      expect(aliased.filter((row) => row.query.includes(`as ${rel}_alias`)).length).toBe(0);
+    } finally {
+      // The temporary relation dies with the session; the trace of it does not, and this is the case where a name
+      // scope genuinely works - the relation is the run's own, and the relation is in the hash.
+      const swept = await cleanStatementTraces(client, `%${rel}%`);
+      expect(swept.leftovers).toBe(0);
+      await client.end();
+    }
+  });
+
   it("leaves no statement in the view labelled with its own probe names", async () => {
     // This test runs `prepare` and `deallocate` against a store other agents read, so it owes the view back what it
-    // labelled with its own names. Measured on this store, and it is the reason the wording is "labelled":
+    // labelled with its own names. The wording is "labelled" because that is the only thing a run can prove:
     //
-    //   `prepare <label> as select count(*)::int as trace_alpha from memory.memory` + two executes created no row at
-    //   all. It added 2 calls to the row already stored as `select count(*)::int as n from memory.memory`, because
-    //   structure - not the label, not the alias - decides the counter.
+    //   A prepare that is never executed is not tracked at all, and a prepare that is executed is tracked under the
+    //   hash of its INNER statement. So the run's own statements split into two kinds. The ones whose structure was
+    //   novel get a row carrying the run's name, and those are the run's to remove. The ones that merged into a
+    //   pre-existing row leave no name-scoped trace, and removing the row they landed on would erase another
+    //   writer's history with it - in a shared store that is not cleanup, it is somebody else's lost baseline.
     //
-    // So a run's own statements split into two kinds. The ones whose structure was novel get a row carrying the run's
-    // name, and those are the run's to remove. The ones that merged into a pre-existing row leave no name-scoped
-    // trace, and removing the row they landed on would erase another writer's history with it - in a shared store that
-    // is not cleanup, it is somebody else's lost baseline. This asserts the first kind is gone and says nothing about
-    // the second, which is the honest version of "clean up everything you ran".
+    // So this asserts the first kind is gone and says nothing about the second, which is the honest version of
+    // "clean up everything you ran". The shared `hack/pg-statement-traces.mjs` tool reports the second kind as a
+    // landing delta rather than pretending it is absent.
     const client = new Client(liveDsn);
     await client.connect();
     try {

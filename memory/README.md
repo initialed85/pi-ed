@@ -378,7 +378,10 @@ Both halves are free against the statistics window, which is worth saying before
 assumption that it pollutes the view. Measured on both sides: a `PREPARE` that is never executed leaves **no row at
 all** in `pg_stat_statements` - the probe labels were absent afterwards and `stats_reset` was unmoved. Validation that
 parses, resolves and type-checks against the real schema costs nothing observable; it is `EXECUTE` that writes, and
-that is the half the sweep does only against names it can clean up.
+that is the half the sweep does only against names it can clean up. When it does execute, the row is keyed by the hash
+of the **inner** statement, not of the label, and the text stored is whatever was submitted first - so a row can
+appear in the view wearing a prepare's label while the calls on it belong to a different shape entirely. That is the
+mechanism behind `hack/pg-statement-traces.mjs` refusing to reset any row that predates the run it is auditing.
 
 Which leaves a rule wider than SQL:
 
@@ -650,6 +653,26 @@ shape_from_clause_a from pg_stat_activity` landed on one row in two separate scr
 `readme_demo_alpha`, `readme_demo_beta`, `readme_demo_gamma` against one shared relation landed on one row with three
 calls. Literals merge, aliases merge, shared relations merge.
 
+Prepared statements are the sharpest version of this, and the one that makes a name-scoped cleanup quietly wrong.
+Measured on this store, against a relation only the run queries:
+
+- `prepare X as Q` that is never executed is **not tracked at all** - which is why the validation sweep in
+  `test/statements-prepare.test.ts` is free against a shared view.
+- Once `Q` is executed, the row is keyed by the hash of **`Q`**, not of the `prepare` text, and the text stored on it
+  is whatever was submitted first - the whole `prepare X as Q` string. So the label is outside the hash, the alias is
+  outside the hash, and the name a name-scope can see is only the first thing that ever ran the shape.
+- Executing the same `Q` directly, or under a second label, or under a third alias, adds calls to that one row. The
+  row home-ops watched accumulating - `prepare pi_ed_prepare_probe_13_vectorCoverageStatement as select count(*)::int
+  ...` - was that: a row keyed by an inner SELECT, wearing a label as its first-seen text. The current sweep never
+  executes, so it creates no such row; the calls came from experiments that did.
+
+The consequence for cleanup is the whole point: a name scope can only remove a row the run *created*, and what
+creates a row is the relation in the hash, never the name in the text. `hack/pg-statement-traces.mjs` is the shared
+instrument for that - `snapshot` before, `assert` after (read-only: named leftovers, a moved `stats_reset`, and a
+landing delta that grades a row whose calls grew without naming the run as "likely a merged landing"), and `remove`,
+which will only reset a row whose `queryid` is absent from the before-snapshot. Resetting a row that predates the run
+is not cleanup; it is somebody else's lost baseline.
+
 Three rules follow, and the first two are rewrites of crash-scoped caveats into ordinary-operation ones:
 
 - **`calls` is unsafe for arithmetic in ordinary operation**, not only after a crash. Two agents using the same
@@ -671,7 +694,6 @@ Three rules follow, and the first two are rewrites of crash-scoped caveats into 
   store the practical fence is **a relation only you query**: a temp table named for the run, which is what
   `test/statistics-view.test.ts` now uses, and the reason is cleanup as much as attribution - see the bucket note
   below.
-
 `hack/pg-cost-snapshot.mjs` prints `queryid` on every line and marks the merge-prone shapes. The demo below was run
 through it, on the shape this file now recommends, and every row it created was removed afterwards:
 

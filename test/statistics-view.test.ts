@@ -274,8 +274,11 @@ describe.skipIf(!liveDsn)("pg_stat_statements contract", () => {
       // *constants*, so a run name that lives in a value is invisible to `query like '%run-name%'` - and the counter
       // it lands on is the shared one for that shape, which belongs to every writer that uses it.
       //
-      // Identifiers are different. The relation name, the alias, and the prepared-statement label all survive in the
-      // stored text, which is why the fence recipe and the cleanup recipe both work off them.
+      // Identifiers are different - but only partly. The relation name, the alias, and the prepared-statement label
+      // all survive in the stored text, which is why the fence recipe and the cleanup recipe work off them. What
+      // `test/statements-prepare.test.ts` measures is the limit: the identifier is in the row's *text* and not in its
+      // *hash*, so a name finds only the row that first saw the shape, and a run that merged into an older row is
+      // invisible to its own name.
       const stamp = Date.now();
       const marker = `stat_probe_literal_${stamp}`;
       const alias = `stat_probe_litalias_${stamp}`;
