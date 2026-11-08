@@ -670,6 +670,22 @@ export function heartbeatAdvisoryAlertStatement(): Statement {
  * the column says which one it used. Comments are kept out of this statement's text on purpose: Postgres comments
  * start with a pair of hyphens or a slash-star, never a pair of slashes, and a JavaScript-ism inside a SQL string is
  * a syntax error the typechecker cannot see.
+ *
+ * `never_attempted` is a new *column* rather than a new severity, and that distinction is the whole point of it. The
+ * home-ops severity contract says an existing severity's meaning is never narrowed and a new condition is named at
+ * birth, so the page condition above is left exactly as written - and it does fire on a writer that was seen active
+ * for longer than the window without ever committing anything. This repository's own live test inserts that shape:
+ * `heartbeat-probe-stale`, a row with `last_activity_at` and nothing else, and it comes back `severity = 'page'`
+ * with `flushes = 0`, `failures = 0`, `spool_rows = 0`.
+ *
+ * What those three zeros mean is pinned by the writer's own code: `flush()` returns before it touches the store when
+ * the batch is empty, so `flushes` counts committed batches that carried at least one row. A row with no committed
+ * batch, no refusal and nothing stranded is therefore not evidence of a broken writer - it is the absence of any
+ * evidence that this writer ever had something to send, which the store cannot distinguish from a session that had
+ * nothing worth recording. `minutes_without_commit` on such a row is measured from arrival, so it answers "how long
+ * since we saw it", not "how long has it failed". The column exists so a reader can name that condition as its own
+ * severity - `unattempted`, advisory, ageable on `last_activity_at` - instead of re-deriving it from three columns in
+ * a shell script that nobody else can read, and without redefining `page` for anything already deduplicating on it.
  */
 export function heartbeatSweepStatement(): Statement {
   const page = `(last_flush_at is null and last_activity_at < now() - interval '${HEARTBEAT_ALERT_WINDOW}')
@@ -687,6 +703,7 @@ export function heartbeatSweepStatement(): Statement {
               flushes,
               failures,
               spool_rows,
+              (flushes = 0 and failures = 0 and spool_rows = 0 and last_flush_at is null) as never_attempted,
               spool_since,
               round(extract(epoch from (now() - spool_since)) / 86400.0, 1) as spool_days,
               last_error,

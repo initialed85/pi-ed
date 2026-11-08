@@ -19,11 +19,22 @@
  *    leaves no name-scoped trace. Resetting that row would erase another writer's history along with
  *    yours, so cleanup covers the rows carrying your name and reports the rest rather than deleting
  *    them.
+ *  - **A name that appears only in a value is not a name.** The view normalises constants - an `insert`
+ *    whose agent id was the literal `'heartbeat-probe-demo'` is stored as `values ($1, $2, ...)`, and
+ *    `query like '%heartbeat-probe-demo%'` finds nothing. Name scopes are built from identifiers:
+ *    relation names, aliases, prepared-statement labels.
  */
-import type { Client } from "pg";
+/**
+ * The narrowest thing these helpers need: something that can run a query and hand rows back. Typed
+ * structurally rather than as `pg.Client` so a test file that models its own client double - and a
+ * future `hack/` script that uses a pooled client - can both pass it in.
+ */
+export interface StatementClient {
+  query: (sql: string, values?: unknown[]) => Promise<{ rows: Record<string, any>[]; rowCount?: number | null }>;
+}
 
 /** The argument names this build declares, in declared order. */
-export async function resetArgumentOrder(client: Client): Promise<string[]> {
+export async function resetArgumentOrder(client: StatementClient): Promise<string[]> {
   const result = await client.query(`select proargnames from pg_proc where proname = 'pg_stat_statements_reset'`);
   const names = (result.rows[0]?.proargnames ?? []) as string[];
   if (!names.length) throw new Error("statements-cleanup: pg_stat_statements_reset was not found in pg_proc");
@@ -34,7 +45,7 @@ export async function resetArgumentOrder(client: Client): Promise<string[]> {
  * Removes one tracked statement. `row` must come from a `queryid::text, dbid, userid` select: text on
  * the way out, because a number is a different identity.
  */
-export async function targetedReset(client: Client, row: Record<string, unknown>, order: string[] = ["userid", "dbid", "queryid"]): Promise<void> {
+export async function targetedReset(client: StatementClient, row: Record<string, unknown>, order: string[] = ["userid", "dbid", "queryid"]): Promise<void> {
   const placeholders = order.map((_, index) => `$${index + 1}`).join(", ");
   const values = order.map((name) => {
     if (name === "queryid" || name === "dbid" || name === "userid") return String(row[name]);
@@ -49,7 +60,7 @@ export async function targetedReset(client: Client, row: Record<string, unknown>
  * construction the number the view was willing to attribute to this run's name.
  */
 export async function cleanStatementTraces(
-  client: Client,
+  client: StatementClient,
   pattern: string,
 ): Promise<{ rows: number; calls: number; leftovers: number }> {
   const order = await resetArgumentOrder(client);

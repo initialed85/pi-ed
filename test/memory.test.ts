@@ -251,6 +251,25 @@ describe("the writer's heartbeat", () => {
     expect(heartbeatReadStatement!("a1").values).toEqual(["a1"]);
   });
 
+  it("carries the never-attempted discriminator without touching what page means", async () => {
+    const { heartbeatSweepStatement, heartbeatPageAlertStatement } = await loadModule();
+    const sweep = heartbeatSweepStatement!();
+    expect(sweep.sql).toContain("as never_attempted");
+    expect(sweep.sql).toContain("flushes = 0 and failures = 0 and spool_rows = 0 and last_flush_at is null");
+
+    // The contract, asserted as text. home-ops deduplicates on (agent_id, severity), so a page row that quietly
+    // stopped being a page row is a severity rename wearing a column addition. The page condition in the sweep has to
+    // stay the condition the near-real-time alert statement exports, clause for clause.
+    const page = heartbeatPageAlertStatement!().sql;
+    for (const fragment of [
+      `last_flush_at is null and last_activity_at < now() - interval '2 hours'`,
+      `last_flush_at is not null and last_activity_at - last_flush_at > interval '2 hours'`,
+    ]) {
+      expect(page, `the page condition lost a clause: ${fragment}`).toContain(fragment);
+      expect(sweep.sql, `the sweep's page half no longer matches the alert statement: ${fragment}`).toContain(fragment);
+    }
+  });
+
   it("gives each kind of stamp its own clock", async () => {
     const { heartbeatKey } = await loadModule();
     // One clock per agent would let the session_start stamp suppress the first flush stamp, and the table would then

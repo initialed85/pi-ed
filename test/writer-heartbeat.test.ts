@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { cleanStatementTraces } from "./statements-cleanup.ts";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -51,6 +52,13 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
   afterAll(async () => {
     if (client) {
       await query(`delete from memory.writer_heartbeat where agent_id like 'heartbeat-probe%'`);
+      // The rows are this suite's to delete; the tracked statements are only partly its to remove. Everything it ran
+      // against `memory.writer_heartbeat` carries a `heartbeat-probe` name in its text, so the view labels those rows
+      // and they can be given back. The sweep SELECTs it ran name no probe, and their structures merge into rows
+      // other writers have already counted - those are left alone, because resetting a merged row would erase another
+      // writer's history with it (memory/README.md, "a statement that merged is not yours to remove").
+      const traces = await cleanStatementTraces(client, `%heartbeat-probe%`);
+      expect(traces.leftovers, "a statement this file named must not survive the file that ran it").toBe(0);
       await client.end();
       client = undefined;
     }
@@ -230,6 +238,41 @@ suite("the writer heartbeat, against the store someone would alert on", () => {
     expect(Number(found?.spool_days)).toBeGreaterThanOrEqual(2.9);
     // Measured against the last commit: activity ran a full day ahead of it.
     expect(Number(found?.minutes_without_commit)).toBeGreaterThanOrEqual(1439);
+  });
+
+  it("separates a writer that never had anything accepted from one that is failing", async () => {
+    const { heartbeatSweepStatement } = await loadModule();
+    // The overnight case, in its purest form: a writer registered, was seen active five days ago, and has no commit,
+    // no refusal and no spool. The store cannot tell "nothing worth recording happened" from "the writer never tried",
+    // and today that ambiguity arrives in the page half.
+    await query(`insert into memory.writer_heartbeat (agent_id, repo, last_activity_at) values ('heartbeat-probe-never', 'pi-ed', now() - interval '5 days')`);
+
+    const swept = (await query(heartbeatSweepStatement!().sql)).rows;
+    const byId = new Map(swept.map((row) => [String(row.agent_id), row]));
+
+    // Never attempted. `severity` is deliberately NOT changed here: home-ops deduplicates on (agent_id, severity), so
+    // narrowing `page` would silently re-classify history. The column is the new condition's name, and the reader
+    // decides whether to birth a severity from it.
+    const never = byId.get("heartbeat-probe-never");
+    expect(never?.severity, "a writer that has been active for five days without committing is a page today").toBe("page");
+    expect(never?.never_attempted).toBe(true);
+    expect(Number(never?.flushes)).toBe(0);
+    expect(Number(never?.failures)).toBe(0);
+    expect(Number(never?.spool_rows)).toBe(0);
+    // And its number is measured from arrival, which is why the column has to travel with it: 7,200 "minutes without
+    // commit" here is "how long since we saw it", not "how long it has been failing".
+    expect(Number(never?.minutes_without_commit)).toBeGreaterThan(7_000);
+
+    // The three-hour version the earlier tests built, same reading.
+    expect(byId.get("heartbeat-probe-stale")?.never_attempted).toBe(true);
+
+    // Attempted, and provably so: a committed batch, a refusal, or a backlog each defeat the discriminator.
+    expect(byId.get("heartbeat-probe-stranded")?.never_attempted).toBe(false);
+    expect(byId.get("heartbeat-probe-old-failure")?.never_attempted).toBe(false);
+    expect(byId.get("heartbeat-probe-live")?.never_attempted).toBe(false);
+
+    // The column is not a filter: it does not drop anything from the sweep.
+    expect(swept.length).toBeGreaterThanOrEqual(5);
   });
 
   it("names an identity-drift pair from the store instead of leaving it as an inference", async () => {

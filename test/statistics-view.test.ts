@@ -267,4 +267,29 @@ describe.skipIf(!liveDsn)("pg_stat_statements contract", () => {
       const byName = await query(`select queryid from pg_stat_statements where query like $1`, [like(`%${PROBE}_%`)]);
       expect(byName.length, "the probe is still there - name scope is what reports it").toBeGreaterThan(0);
     });
+
+    it("name-scopes a probe by an identifier, because the view replaces literal values with placeholders", async () => {
+      // Measured while cleaning up after a demo: an insert whose agent id was a literal string left no trace findable
+      // by that string, because the stored text is `values ($1, $2, now() - interval $3)`. The view normalises
+      // *constants*, so a run name that lives in a value is invisible to `query like '%run-name%'` - and the counter
+      // it lands on is the shared one for that shape, which belongs to every writer that uses it.
+      //
+      // Identifiers are different. The relation name, the alias, and the prepared-statement label all survive in the
+      // stored text, which is why the fence recipe and the cleanup recipe both work off them.
+      const stamp = Date.now();
+      const marker = `stat_probe_literal_${stamp}`;
+      const alias = `stat_probe_litalias_${stamp}`;
+      await query(`select count(*)::int as ${alias}, '${marker}' as marker_value from pg_stat_statements`);
+
+      // The name that was passed as a value: gone from the stored text.
+      expect(await query(`select queryid from pg_stat_statements where query like $1`, [like(`%${marker}%`)]),
+        "a literal run name is replaced by $n, so name scope cannot find it").toHaveLength(0);
+
+      // The name that was an identifier: present, and therefore removable by this suite's own afterAll sweep.
+      const found = await query(
+        `select queryid::text as queryid, dbid::text as dbid, userid::text as userid from pg_stat_statements where query like $1`,
+        [like(`%${alias}%`)],
+      );
+      expect(found, "an identifier in the statement text is what a name-scoped cleanup can actually see").toHaveLength(1);
+    });
   });

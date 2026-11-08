@@ -756,6 +756,16 @@ the demo runs above removed the six alias-named rows it was looking for and left
 table readme_fence_…`, `insert into readme_fence_…`, `drop table readme_fence_…` - because they carry the relation
 name, not the alias. Name the relation, and clean by that name.
 
+**Name scope works on identifiers, not on values.** The view normalises constants, and this was measured the hard way on
+a demo run: `insert into memory.writer_heartbeat (agent_id, repo, last_activity_at) values ('heartbeat-probe-demo',
+'pi-ed', now() - interval '5 days')` is stored as `values ($1, $2, now() - interval $3)`, and
+`where query like '%heartbeat-probe-demo%'` returns nothing - the cleanup reported "0 rows removed, 0 leftovers" for a
+run that had definitely written to the store. A run whose name appears only in a *value* therefore has no name-scoped
+trace, and the counter it lands on is the shared one for that shape, which is not its to reset. Relation names, aliases
+and prepared-statement labels are *identifiers*, and they survive in the stored text - which is why the fence recipe
+and the cleanup recipe both work off them rather than off data. One live statement asserts both halves of the
+distinction: a unique alias and a unique literal in the same `select`, and only the alias is findable afterwards.
+
 **A statement that merged is not yours to remove, and cleanup should say so out loud.** "Clean every statement you
 ran" has a limit the view imposes. Measured here: `prepare pi_ed_trace_probe_<run> as select count(*)::int as
 trace_alpha from memory.memory` plus two executes created **no row**, and instead added 2 calls to the row already
@@ -1002,6 +1012,7 @@ select * from (
               flushes,
               failures,
               spool_rows,
+              (flushes = 0 and failures = 0 and spool_rows = 0 and last_flush_at is null) as never_attempted,
               spool_since,
               round(extract(epoch from (now() - spool_since)) / 86400.0, 1) as spool_days,
               last_error,
@@ -1016,6 +1027,39 @@ select * from (
           ) as flagged
           order by (severity = 'page') desc, last_activity_at desc nulls last;
 ```
+
+### "Registered, never attempted" is a reading, and the column that makes it nameable
+
+The page half has two shapes, and only one of them is falsifiable from the store. `last_flush_at is not null and
+last_activity_at - last_flush_at > interval '2 hours'` is a writer whose turns kept arriving while its commits did not:
+healthy writers flush on a debounce measured in seconds, so a two-hour gap between the two watermarks cannot come from
+a session that ended cleanly. The other shape, `last_flush_at is null and last_activity_at < now() - interval '2
+hours'`, says something weaker: this writer has been seen active and has never committed anything. That is a real
+finding when there was something to commit, and it is nothing at all when there was not.
+
+The store can get closer than it did, because `flush()` returns before it touches Postgres when the batch is empty -
+so `flushes` counts committed batches that carried at least one row, and `failures` counts refusals the store itself
+saw. The sweep therefore exports the discriminator as a column rather than as a new severity:
+
+```sql
+(flushes = 0 and failures = 0 and spool_rows = 0 and last_flush_at is null) as never_attempted
+```
+
+`true` means the store has no evidence this writer ever had anything accepted or refused, and nothing stranded: the
+absence of a watermark, not the presence of a failure. `minutes_without_commit` on such a row is measured from
+arrival, so it answers "how long since we saw it", not "how long has it been failing", and the two have to travel
+ together for a reader to tell them apart.
+
+It is a column and not a severity change on purpose, and this repository's own live test is the measurement of why:
+`heartbeat-probe-stale` is a row with nothing but `last_activity_at` three hours old, and it comes back
+`severity = 'page'` with `flushes = 0`, `failures = 0`, `spool_rows = 0`. The fleet contract is that an existing
+severity's meaning is never narrowed and a new condition is named at birth, because the dedup key is (`agent_id`,
+severity) - so quietly removing those rows from `page` would reclassify history that is already open. `memory.test.ts`
+asserts the page condition is still the alert statement's condition clause for clause, which is the guard against a
+future "improvement" that narrows it while looking like a column addition. If a carrier lands and never-attempted ids
+page in practice, the birth is a new severity - `unattempted`, advisory, aged on `last_activity_at` - keyed on this
+column, and only afterwards does anyone decide whether `page` should widen.
+
 
 ### Windows that match how often someone actually looks
 
