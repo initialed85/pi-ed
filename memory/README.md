@@ -781,12 +781,26 @@ the view holds 13 rows whose text contains `probe`, and **0** of them are leaked
 ever used (`stat_probe_`, `probe_sibling`, `merge_probe_`, `readme_demo`, `remove_dogfood`, and home-ops' `zz_homeops`)
 returns zero rows on a `position(...)` check. The thirteen are verification queries that *count* probes, and the
 largest of them by a wide margin is the counter itself: `select count(*) as probe_rows_before from
-pg_stat_statements where query like $1`, 17 calls. `hack/memory-live-check.mjs` plants the word as a *data value* too
-(`'probe'` as a session source, `{"probe": true}` in notes), so its statements match any word filter forever. This is
-the third face of the same self-reference: the pure `select count(*) from pg_stat_statements` is constant because the
-row adds both the call and the count; the `like '%name%'` absence check can never report zero about itself; and a word
-filter counts the queries that talk about filtering. Count by marker, and treat a word count as a claim about the
-language of whoever ran the last check.
+pg_stat_statements where query like $1`, 17 calls. **The data values are not the problem, and I had that backwards.**
+`hack/memory-live-check.mjs` plants `'probe'` as a session source and `{"probe": true}` in notes, and neither reaches
+the stored text: a literal is normalised to `$n` before the hash, so the view sees `select $1 as ...` and
+`insert into ... values ($1, $2)`. Verified here, one statement, one name, one literal:
+
+```sql
+select 'zz_probe_literal_check' as probe_value_marker, count(*) as probe_rows from pg_stat_statements
+  where position('zz_probe_literal_check' in query) > 0;
+-- rows carrying the literal: 0     rows carrying the alias: this one, and every future one
+```
+
+The literal vanished and the alias stayed, in the same statement. So the durable residue is **the vocabulary of the
+names the tooling chooses**, not the words it stores: `probe_rows_before`, `rows_like_probe_shape`, `probes_left`,
+`all_probe` - thirteen identifiers, and the one place a word filter is genuinely wrong is a name. This is the third
+face of the same self-reference: the pure `select count(*) from pg_stat_statements` is constant because the row adds
+both the call and the count; the `like '%name%'` absence check can never report zero about itself; and a word filter
+counts the queries that talk about filtering. Count by marker, and treat a word count as a claim about the language of
+whoever ran the last check. **The rule for a marker, from home-ops: no alias, CTE, or temp relation may carry the word
+you are searching for** - their `zz_rows` alias made a leftover count read 0 all day and then 1 forever, and the
+check that reported it was the row that broke it.
 
 `hack/pg-cost-snapshot.mjs` prints `queryid` on every line and marks the merge-prone shapes. The demo below was run
 through it, on the shape this file now recommends, and every row it created was removed afterwards:
