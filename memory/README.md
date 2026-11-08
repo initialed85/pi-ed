@@ -756,6 +756,17 @@ the demo runs above removed the six alias-named rows it was looking for and left
 table readme_fence_…`, `insert into readme_fence_…`, `drop table readme_fence_…` - because they carry the relation
 name, not the alias. Name the relation, and clean by that name.
 
+**A statement that merged is not yours to remove, and cleanup should say so out loud.** "Clean every statement you
+ran" has a limit the view imposes. Measured here: `prepare pi_ed_trace_probe_<run> as select count(*)::int as
+trace_alpha from memory.memory` plus two executes created **no row**, and instead added 2 calls to the row already
+stored as `select count(*)::int as n from memory.memory` - the label and the alias are outside the hash, so the run was
+attributed to somebody else's counter and left nothing name-scoped behind. In a shared store, resetting that row is not
+cleanup, it is deleting another writer's history along with yours. So `test/statements-cleanup.ts` removes the rows the
+view is willing to label with the run's name, reports the count, and asserts a second sweep finds nothing - and it says
+nothing about the merged remainder, because the honest claim is "nothing labelled with my name survives", not "the view
+is as I left it". The way to keep the two kinds small is the fence recipe above: probe a private relation with a novel
+aggregate argument, and almost everything the run does stays attributable to it.
+
 **A display width is a fence that hides fences.** This script used to print `left(query, 70)`, and that hid the very
 clause doing the fencing: `select count(*) as fence_probe_alpha from homeops_fence_probe_20261108` and the same
 statement with `where agent_id = $1` printed identically while carrying different `queryid`s. A reader comparing the

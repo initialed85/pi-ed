@@ -3,6 +3,10 @@ import { existsSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { cleanStatementTraces } from "./statements-cleanup.ts";
+
+/** The prefix every `prepare` label in this file carries, so cleanup can find what this file named. */
+const PREPARE_LABEL = "pi_ed_prepare_probe";
 
 /**
  * Every statement this extension exports has to be something Postgres accepts, and the way to check that without
@@ -166,10 +170,17 @@ describe("every exported statement", () => {
 describe.skipIf(!liveDsn)("every exported statement, prepared against the real store", () => {
   let pg: typeof import("pg");
   let Client: new (dsn: string) => import("pg").Client;
+  let statsResetAtStart: string;
 
   beforeAll(async () => {
     pg = await import("pg");
     Client = pg.Client;
+    // Recorded before anything this file runs, so the cleanup test can prove it never moved the shared window.
+    const seed = new Client(liveDsn);
+    await seed.connect();
+    const info = await seed.query(`select stats_reset::text as stats_reset from pg_stat_statements_info`);
+    statsResetAtStart = info.rows[0].stats_reset;
+    await seed.end();
   });
 
   it("is accepted by Postgres without executing anything", async () => {
@@ -181,7 +192,7 @@ describe.skipIf(!liveDsn)("every exported statement, prepared against the real s
     let prepared = 0;
     try {
       for (const { name, spec } of specs) {
-        const label = `pi_ed_prepare_probe_${prepared}_${name.replace(/[^a-z0-9_]/gi, "")}`;
+        const label = `${PREPARE_LABEL}_${prepared}_${name.replace(/[^a-z0-9_]/gi, "")}`;
         try {
           await client.query(`prepare ${label} as ${spec.sql}`);
           await client.query(`deallocate ${label}`);
@@ -206,5 +217,37 @@ describe.skipIf(!liveDsn)("every exported statement, prepared against the real s
     // same statement list.
     expect(rejected).toEqual([]);
     expect(prepared).toBeGreaterThanOrEqual(18);
+  });
+
+  it("leaves no statement in the view labelled with its own probe names", async () => {
+    // This test runs `prepare` and `deallocate` against a store other agents read, so it owes the view back what it
+    // labelled with its own names. Measured on this store, and it is the reason the wording is "labelled":
+    //
+    //   `prepare <label> as select count(*)::int as trace_alpha from memory.memory` + two executes created no row at
+    //   all. It added 2 calls to the row already stored as `select count(*)::int as n from memory.memory`, because
+    //   structure - not the label, not the alias - decides the counter.
+    //
+    // So a run's own statements split into two kinds. The ones whose structure was novel get a row carrying the run's
+    // name, and those are the run's to remove. The ones that merged into a pre-existing row leave no name-scoped
+    // trace, and removing the row they landed on would erase another writer's history with it - in a shared store that
+    // is not cleanup, it is somebody else's lost baseline. This asserts the first kind is gone and says nothing about
+    // the second, which is the honest version of "clean up everything you ran".
+    const client = new Client(liveDsn);
+    await client.connect();
+    try {
+      const swept = await cleanStatementTraces(client, `%${PREPARE_LABEL}%`);
+      expect(swept.leftovers, "a probe label this file invented must not survive the file that made it").toBe(0);
+
+      // Idempotence: a second sweep finding nothing is what distinguishes cleanup from a lucky count.
+      const again = await cleanStatementTraces(client, `%${PREPARE_LABEL}%`);
+      expect(again.rows).toBe(0);
+      expect(again.leftovers).toBe(0);
+
+      // And the shared window is untouched by all of it: this suite has no claim on anybody else's bucket.
+      const statsReset = await client.query(`select stats_reset::text as stats_reset from pg_stat_statements_info`);
+      expect(String(statsReset.rows[0].stats_reset)).toBe(statsResetAtStart);
+    } finally {
+      await client.end();
+    }
   });
 });

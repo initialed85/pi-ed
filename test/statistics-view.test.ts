@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { targetedReset as resetTracked } from "./statements-cleanup.ts";
 
 /**
  * The rules of the statistics view, measured against the store rather than recited.
@@ -63,16 +64,10 @@ const probeRows = async () =>
 const bucketRows = async () =>
   query(`select queryid, dbid, userid from pg_stat_statements where query like $1`, [like(`%${bucket}%`)]);
 
-/** Removes one tracked statement, in the argument order *this build* declares. */
+/** Removes one tracked statement, in the argument order *this build* declares. The helper is shared with
+ * `statements-prepare.test.ts`, which needs the same cleanup for the labels its own sweep creates. */
 const targetedReset = async (row: Record<string, unknown>) => {
-  const placeholders = resetArgs.map((_, index) => `$${index + 1}`).join(", ");
-  const values = resetArgs.map((name) => {
-    if (name === "queryid") return String(row.queryid);
-    if (name === "dbid") return String(row.dbid);
-    if (name === "userid") return String(row.userid);
-    throw new Error(`pg_stat_statements_reset has an argument this test does not know: ${name}`);
-  });
-  await query(`select pg_stat_statements_reset(${placeholders})`, values);
+  await resetTracked(client, row, resetArgs);
 };
 
 describe.skipIf(!liveDsn)("pg_stat_statements contract", () => {
