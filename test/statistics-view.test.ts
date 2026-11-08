@@ -25,6 +25,12 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const liveDsn = process.env.PI_LIVE_DSN ?? "";
 const PROBE = "stat_probe";
+// A relation unique to this run, created once as a temp table. Three probes that differ only in their alias MUST land
+// on one row - that is the finding this file exists to assert - and a shared store makes that finding expensive: a
+// merged bucket is a counter other agents' statements can join, and `pg_stat_statements_reset` clears a whole bucket,
+// not one variant. Probing a relation nobody else queries keeps the collision inside this run, where cleaning it up
+// cannot reach across a boundary.
+const bucket = `probe_bucket_${Date.now()}`;
 // `_` is a one-character wildcard in LIKE, so every pattern below escapes it. Left unescaped, `stat_probe` matches
 // any statement shaped like `statXprobe`, which is a test that passes for the wrong reason.
 const like = (fragment: string) => fragment.replace(/_/g, "\\_");
@@ -42,10 +48,20 @@ let query: (sql: string, values?: unknown[]) => Promise<Record<string, unknown>[
 let resetArgs: string[];
 let statsResetAtBefore = "";
 
+/*
+ * Statements carrying this file's own probe name. The name scope is what makes the cleanup safe rather than merely
+ * convenient: a targeted reset clears a whole merged bucket, so it must only ever be aimed at a name another agent
+ * could not have written. `stat_probe` belongs to this file; home-ops' markers are `sweep_probe`, and neither reads
+ * the other's counters.
+ */
 const probeRows = async () =>
   query(`select queryid, dbid, userid, calls, total_exec_time, query from pg_stat_statements where query like $1 order by queryid`, [
-    like(`select $1 as ${PROBE}%`),
+    like(`%${PROBE}_%`),
   ]);
+
+/** Every statement this file ran against its own temp relation, including the DDL that created it. */
+const bucketRows = async () =>
+  query(`select queryid, dbid, userid from pg_stat_statements where query like $1`, [like(`%${bucket}%`)]);
 
 /** Removes one tracked statement, in the argument order *this build* declares. */
 const targetedReset = async (row: Record<string, unknown>) => {
@@ -76,13 +92,19 @@ describe.skipIf(!liveDsn)("pg_stat_statements contract", () => {
 
       statsResetAtBefore = String((await query(`select stats_reset from pg_stat_statements_info`))[0].stats_reset);
 
+      // Session-scoped, so it dies with the client. Temp relations are resolved to their own OID, which is what makes
+      // a probe against one structurally unreachable from any other reader's statement.
+      await query(`create temp table ${bucket} (agent_id text, repo text)`);
+
       // A previous run's probes, cleared through the only route that exists: the view is not deletable in this
       // version, so the targeted reset is the cleanup - and it doubles as the first measurement below.
       for (const row of await probeRows()) await targetedReset(row);
     });
 
     afterAll(async () => {
+      await query(`drop table if exists ${bucket}`);
       for (const row of await probeRows()) await targetedReset(row);
+      for (const row of await bucketRows()) await targetedReset(row);
       const stamp = String((await query(`select stats_reset from pg_stat_statements_info`))[0].stats_reset);
       // The window a *different* reader is measuring against is shared state. Nothing in this file may move it.
       expect(stamp).toBe(statsResetAtBefore);
@@ -96,17 +118,17 @@ describe.skipIf(!liveDsn)("pg_stat_statements contract", () => {
       expect(resetArgs).toEqual(["userid", "dbid", "queryid"]);
     });
 
-    it("holds one counter for three constant selects that only differ in their alias", async () => {
+    it("holds one counter for three probes that differ only in their alias", async () => {
       for (const [literal, alias] of [
         [7001, "alpha"],
         [7002, "beta"],
         [7003, "gamma"],
       ]) {
-        await query(`select ${literal} as ${PROBE}_${alias}`);
+        await query(`select ${literal} as ${PROBE}_${alias} from ${bucket}`);
       }
 
       const rows = await probeRows();
-      const merged = rows.filter((row) => /^select \$1 as stat_probe_/.test(String(row.query)));
+      const merged = rows.filter((row) => /^select \$1 as stat_probe_/.test(String(row.query)) && !/ where /.test(String(row.query)));
       expect(merged, "three structurally identical probes must land on one row - that is the finding").toHaveLength(1);
       expect(Number(merged[0].calls)).toBeGreaterThanOrEqual(3);
 
@@ -122,20 +144,20 @@ describe.skipIf(!liveDsn)("pg_stat_statements contract", () => {
     });
 
     it("separates statements that differ in structure and merges ones that differ in literals", async () => {
-      await query(`select 7011 as ${PROBE}_shape_unused from pg_database where false`);
+      await query(`select 7011 as ${PROBE}_shape_unused from ${bucket} where false`);
       const every = await probeRows();
-      // The shape probe's text starts with the constant probe's text, so a prefix pattern matches both rows and a
-      // comparison against "the constant row" would silently compare the shape row with itself. Structure is what
-      // separates them, so the partition is done on structure.
-      const shaped = every.filter((row) => / from /i.test(String(row.query)));
-      const constants = every.filter((row) => !/ from /i.test(String(row.query)));
+      // Both families now carry a table clause, so the partition cannot be "has a FROM" - a shared table clause
+      // merges just as happily as a bare one, which is the half of the lesson a table clause alone does not teach.
+      // The partition is the filter clause, which is the structure that actually separated them.
+      const shaped = every.filter((row) => / where \$2$/.test(String(row.query)));
+      const constants = every.filter((row) => !/ where /.test(String(row.query)));
       expect(shaped).toHaveLength(1);
       expect(constants).toHaveLength(1);
       expect(String(shaped[0].queryid)).not.toBe(String(constants[0].queryid));
 
-      // Same structure, different literal: one row, one counter, two calls. This is why a probe needs a table
-      // clause or a distinctive structure rather than a more creative alias.
-      await query(`select 7012 as ${PROBE}_shape_unused from pg_database where true`);
+      // Same structure, different literal: one row, one counter, two calls. What separates a probe is structure - a
+      // filter, a join, a relation only this reader queries - not a distinct literal and not a more creative alias.
+      await query(`select 7012 as ${PROBE}_shape_unused from ${bucket} where true`);
       const again = await query(`select queryid, calls from pg_stat_statements where query like $1`, [like(`%${PROBE}_shape_unused%`)]);
       expect(again).toHaveLength(1);
       expect(Number(again[0].calls)).toBe(2);

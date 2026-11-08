@@ -622,9 +622,13 @@ The part that makes it a trap rather than a curiosity: **both sides computed the
 *any* `select <constant> as <anything>` in a shared store lands on one row, whatever it is named, and my earlier
 "two of four marker statements vanished" note was this merge rather than anything being lost.
 
-Structure does separate them. `select 7011 as stat_probe_shape_unused from pg_database where false` gets its own
-`queryid`, distinct from the constant row above; running it again as `... where true` adds a call to *that same row*
-rather than creating a second one. Literals merge, structure separates.
+Structure does separate them - and only structure. What has been measured separating: a bare constant select versus a
+select with a `from` and a `where`. What has been measured **not** separating: a more creative alias, a different
+literal, and - the half that reads like advice until you run it - **a table clause on a relation other readers also
+query**. `select count(*) as sweep_probe_shape from pg_stat_activity` and `select count(*) as
+shape_from_clause_a from pg_stat_activity` landed on one row in two separate scratch stores, and three probes named
+`readme_demo_alpha`, `readme_demo_beta`, `readme_demo_gamma` against one shared relation landed on one row with three
+calls. Literals merge, aliases merge, shared relations merge.
 
 Three rules follow, and the first two are rewrites of crash-scoped caveats into ordinary-operation ones:
 
@@ -633,21 +637,36 @@ Three rules follow, and the first two are rewrites of crash-scoped caveats into 
 - **Absence from the view is weak evidence in both directions, always** - a statement that ran may be folded into a
   row whose text names a different statement, and a row can also be evicted (`max = 5000`, and home-ops watched a
   9-call and a 2-call row disappear with no crash and no reset).
-- **A row's text is a label, not a record.** Attribute by `queryid`. A probe statement earns its own counter by being
-  structurally distinctive - a table clause, a join, a filter - not by having a more creative alias.
+- **A row's text is a label, not a record.** Attribute by `queryid`. A probe earns its own counter by being
+  structurally distinctive - a different relation, a join, a filter that references a column rather than a constant -
+  not by a more creative alias, a more unusual literal, or a `from` clause everybody else already uses. In a shared
+  store the practical fence is **a relation only you query**: a temp table named for the run, which is what
+  `test/statistics-view.test.ts` now uses, and the reason is cleanup as much as attribution - see the bucket note
+  below.
 
-`hack/pg-cost-snapshot.mjs` prints `queryid` on every line and marks the merge-prone shapes:
+`hack/pg-cost-snapshot.mjs` prints `queryid` on every line and marks the merge-prone shapes. The demo below was run
+through it, on the shape this file now recommends, and every row it created was removed afterwards:
 
+```text
+before: 243 tracked statements, window 270.2 min since stats_reset
+
+  0.01 ms total | 0.01 ms per call | 3 call(s) | 1 row(s) | queryid -908891960061494335 | select $1 as readme_demo_alpha from readme_demo_bucket_1794095894426  [merge-prone: alias and literals are not in the hash, so anything structurally identical shares this counter]
+  0.01 ms total | 0.01 ms per call | 1 call(s) | 1 row(s) | queryid 4515918211241393326 | select count(*) as readme_demo_count from readme_demo_bucket_1794095894426  [merge-prone: alias and literals are not in the hash, so anything structurally identical shares this counter]
+  0.00 ms total | 0.00 ms per call | 2 call(s) | 0 row(s) | queryid -3295388679701045428 | select $1 as readme_demo_shape_unused from readme_demo_bucket_1794095894426 where $2  [merge-prone: alias and literals are not in the hash, so anything structurally identical shares this counter]
 ```
-during the run (3 distinct statements, deltas not totals):
-  0.02 ms total | 0.02 ms per call | 1 call(s) | 1 row(s) | queryid -7526065195108227228 | select count(*) as readme_demo_count from memory.agent
-  0.01 ms total | 0.00 ms per call | 3 call(s) | 3 row(s) | queryid 6865378226349601843 | select $1 as readme_demo_alpha  [merge-prone shape: this text is one variant, the counter is shared]
-  0.01 ms total | 0.00 ms per call | 2 call(s) | 4 row(s) | queryid 7869201947645579313 | select $1 as readme_demo_shape_unused from pg_database where $2
-```
 
-That block is real output from a run of three constant selects named `readme_demo_alpha`, `readme_demo_beta` and
-`readme_demo_gamma`. The row that reports them is named `readme_demo_alpha` because it arrived first, and the same
-`queryid 6865378226349601843` that carried home-ops' `m_alpha` probe in their scratch store carried it.
+Read the first line with the trap in mind: three statements were executed - `readme_demo_alpha`, `readme_demo_beta`,
+`readme_demo_gamma` - all three against one relation, and **the relation did not separate them**. One row, three calls,
+text naming only the variant that arrived first. That is why the earlier version of this example used a bare
+`select 7401 as readme_demo_alpha` and why home-ops was right to object to it: a worked example that demonstrates the
+trap while reading like the recommendation is worse than no example. The fixed version demonstrates the trap *and* the
+fence in the same run - the third line is a different structure (a filter clause) and it got its own row.
+
+Note what the demo's two runs also show. The same statement text against two run-unique temp tables produced two
+different `queryid`s (`-908891960061494335` here, `-5413042537995390208` in the run before it), because the resolved
+relation is inside the hash. Cross-store comparison by `queryid` is sound for statements whose relations agree
+structurally, and unsound for anything reading a table whose column list differs - which is the `select *` split below
+seen from the other end.
 
 and warns when the view shrank between its two snapshots without anyone resetting it, because a missing "before" row
 makes that run's delta a lower bound rather than a measurement. The same script now also flags the *other* direction of
@@ -706,6 +725,17 @@ response saying the cleanup did not happen. In the declared order it removes the
 - and leaves `stats_reset` and the window's length untouched, which is what makes it safe: a probe can be removed
 without disturbing the window another reader is measuring against. Both halves are asserted live, including the
 no-op, and the live file refuses to finish unless the stamp it started with is the stamp it ends with.
+
+**Surgical about the window, blunt about the bucket.** One targeted call clears *every* variant that merged into that
+`queryid`, and there is no way to remove one variant alone - home-ops measured it as three statements' counts vanishing
+from a single call. In a shared store that turns cleanup into a scope question: a reset aimed at your probe's row also
+takes whoever else happened to write the same shape, and nobody can reconstruct their counts afterwards. Two rules
+follow, and both are structural rather than careful. (1) **Probe a relation only you query**, so a merged bucket is
+yours by construction - `test/statistics-view.test.ts` creates a temp table named for the run and cleans every
+statement carrying that name, its own `create`/`alter`/`drop` included. (2) **Name-scope the marker you reset on**, so a
+reset can only ever reach statements the resetting reader invented. `stat_probe` belongs to this repository's suite,
+home-ops' markers are `sweep_probe`, and neither reads the other's counters - which is the difference between cleanup
+and "cleanup, plus whatever else was standing in the same shape".
 
 **Rank by mean over recurring statements** is therefore not a style preference, and home-ops' live counter-example is
 the cleanest demonstration of why: ordering this store's view by `total_exec_time` puts `CREATE EXTENSION` at

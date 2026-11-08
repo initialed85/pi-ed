@@ -121,7 +121,15 @@ const includeDdl = flags["includeDdl"] === true;
 // directly, because the script prints text as a label and the label is not a record of what the counter counted.
 // Deltas stay correct - they are keyed on `queryid` - so the fix is to name the queryid and flag the shapes where the
 // label is least trustworthy.
-const MERGE_PRONE = /^select( distinct)? (\$\d+|\d+|'[^']*'|"[^"]*"|[a-z_]+\(\))(( as [a-z_0-9]+)?(, ?|$))+$/i;
+//
+// Detection is on the *target list*, not on the end of the statement, because a table clause does not rescue a probe.
+// Measured in `test/statistics-view.test.ts` and again in home-ops' scratch stores: three probes against the same
+// relation, differing only in alias, land on one row; two `select count(*) as <alias> from <same table>` land on one
+// row. What separates statements is structure - a filter, a join, a relation only this reader queries - and a shared
+// table clause is as merge-prone as no table clause at all. A function call counts as a single-item target list for
+// the same reason: `select count(*) as sweep_probe_shape from pg_stat_activity` and `select count(*) as
+// shape_from_clause_a from pg_stat_activity` were measured on one row in two separate scratch stores.
+const MERGE_PRONE = /^select( distinct)? (\$\d+|\d+|'[^']*'|"[^"]*"|[a-z_]+\([^)]*\))(::[a-z_ ]+)?( as [a-z_0-9]+)?\b/i;
 const mergeProne = (text) => MERGE_PRONE.test(String(text).replace(/\s+/g, " ").trim());
 
 // The opposite failure, measured in `test/statistics-view.test.ts`: a statement whose text never changes can still
@@ -159,7 +167,7 @@ for (const row of rows.slice(0, top)) {
   console.log(
     `  ${row.totalMs.toFixed(2)} ms total | ${row.perCall.toFixed(2)} ms per call | ${row.calls} call(s) | ` +
       `${row.rowsOut} row(s) | queryid ${row.queryid} | ${row.text}` +
-      (row.merged ? "  [merge-prone shape: this text is one variant, the counter is shared]" : "") +
+      (row.merged ? "  [merge-prone: alias and literals are not in the hash, so anything structurally identical shares this counter]" : "") +
       (row.split ? "  [split-prone shape: a column added to the table, or a rename, gives this identical text a new queryid and a counter starting at 1]" : ""),
   );
 }
