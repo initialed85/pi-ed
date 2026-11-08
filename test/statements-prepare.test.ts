@@ -1,4 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -51,10 +53,36 @@ async function loadModule(): Promise<Record<string, unknown>> {
   return (await import(source)) as Record<string, unknown>;
 }
 
+/**
+ * Where this file's sweeps are allowed to write.
+ *
+ * Set before the source is imported for the first time, because the extension reads `PI_MEMORY_SPOOL` once, at module
+ * load. Left unset, the sweep below writes to `~/.pi/agent/memory-spool.jsonl` - the real fallback queue of whoever is
+ * running the tests - which is what happened on 2026-11-08: the file ended up with 1,014 lines of one-character JSON
+ * strings, none of them a row, in place of whatever backlog had been there.
+ */
+const scratch = path.join(os.tmpdir(), `pi-ed-statements-prepare-${process.pid}`);
+const scratchSpool = path.join(scratch, "spool.jsonl");
+process.env.PI_MEMORY_SPOOL = scratchSpool;
+process.env.PI_MEMORY_CONFIG = path.join(scratch, "memory.json");
+
+afterAll(() => rmSync(scratch, { recursive: true, force: true }));
+
+/**
+ * Not statement builders, and not safe to call with a fixture argument.
+ *
+ * `writeSpool` and `rewriteSpool` iterate their argument. Handed a string - which is what `argShapes[7]` is - a string
+ * iterates one character at a time, and each character is a valid JSON value, so the call succeeds and appends
+ * `"a"\n"g"\n"e"\n...` to the spool. Measured on the pre-fix source: `writeSpool("agent-id")` produced 8 junk lines and
+ * `readSpool` replayed 0 rows. A sweep over every export wants the SQL factories, not the ones with a file handle.
+ */
+const NON_SQL_EXPORTS = new Set(["readSpool", "writeSpool", "rewriteSpool"]);
+
 function collect(mod: Record<string, unknown>): Array<{ name: string; spec: Statement }> {
   const out: Array<{ name: string; spec: Statement }> = [];
   for (const [name, value] of Object.entries(mod)) {
     if (typeof value !== "function") continue;
+    if (NON_SQL_EXPORTS.has(name)) continue;
     if ((value as { constructor?: { name?: string } }).constructor?.name === "AsyncFunction") continue;
     for (const args of argShapes) {
       let result: unknown;
@@ -123,6 +151,15 @@ describe("every exported statement", () => {
       .map(({ name, spec }) => ({ name, params: highestParam(spec.sql), values: spec.values.length }))
       .filter((row) => row.params !== row.values);
     expect(mismatched).toEqual([]);
+  });
+
+  it("leaves the spool it was handed alone", async () => {
+    // A sweep that calls every export with fixture arguments is a sweep that can reach a file handle. Run the sweep,
+    // then look at the file it would have written to.
+    collect(await loadModule());
+    // Built eagerly on purpose: the point of the assertion is the content, and "absent" and "empty" are the same claim.
+    const written = existsSync(scratchSpool) ? readFileSync(scratchSpool, "utf8") : "";
+    expect(written).toBe("");
   });
 });
 

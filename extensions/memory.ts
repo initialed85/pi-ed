@@ -388,7 +388,7 @@ export function readSpool(limit = 2_000): { rows: Row[]; unreadable: boolean } {
     if (!line.trim()) continue;
     try {
       const parsed = JSON.parse(line) as Row;
-      if (parsed?.sourceEntryId && parsed.kind) rows.push(parsed);
+      if (isSpoolRow(parsed)) rows.push(parsed);
     } catch {
       // A torn line is a lost row, not a corrupted queue.
     }
@@ -397,22 +397,50 @@ export function readSpool(limit = 2_000): { rows: Row[]; unreadable: boolean } {
   return { rows, unreadable: false };
 }
 
-export function writeSpool(rows: Row[]): void {
-  if (!rows.length) return;
-  try {
-    mkdirSync(dirname(SPOOL), { recursive: true });
-    for (const row of rows) appendFileSync(SPOOL, `${JSON.stringify(row)}\n`, "utf8");
-  } catch {
-    // The record is best-effort by design; there is nowhere more honest to report this than by dropping it.
-  }
+/**
+ * A row the spool can actually replay.
+ *
+ * `readSpool` already refuses anything that is not shaped like a row, so an writer-side guard is the difference
+ * between a backlog that is late and a backlog that is gone: a file full of lines that parse but carry no
+ * `sourceEntryId` reports itself as a queue of 1,014 entries and replays as zero, which is the one outcome this
+ * design is supposed to make impossible.
+ */
+export function isSpoolRow(value: unknown): value is Row {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  return typeof row.sourceEntryId === "string" && row.sourceEntryId.length > 0 && typeof row.kind === "string" && row.kind.length > 0;
 }
 
-export function rewriteSpool(remaining: Row[]): void {
+/** Append rows to the spool. Returns how many were actually written, which is how a caller can tell "late" from "gone". */
+export function writeSpool(rows: Row[]): number {
+  // A caller that hands this a non-array - which is exactly what a test that sweeps every export can do - gets a zero back
+  // rather than an exception in the code path that runs when the store is already down.
+  const usable = (Array.isArray(rows) ? rows : []).filter(isSpoolRow);
+  if (!usable.length) return 0;
   try {
-    writeFileSync(SPOOL, remaining.map((row) => JSON.stringify(row)).join(""), "utf8");
+    mkdirSync(dirname(SPOOL), { recursive: true });
+    for (const row of usable) appendFileSync(SPOOL, `${JSON.stringify(row)}\n`, "utf8");
+  } catch {
+    // The record is best-effort by design; there is nowhere more honest to report this than by dropping it.
+    return 0;
+  }
+  return usable.length;
+}
+
+/** Rewrite the spool to exactly these rows (the replay-succeeded path). Returns how many were written. */
+export function rewriteSpool(remaining: Row[]): number {
+  const usable = (Array.isArray(remaining) ? remaining : []).filter(isSpoolRow);
+  try {
+    // The directory, not just the file: `writeSpool` created it as a side effect, so a rewrite that ran first - a
+    // replay that succeeded on a machine that had never spooled before - failed with ENOENT and reported zero rows
+    // written, which is the failure this function exists to prevent.
+    mkdirSync(dirname(SPOOL), { recursive: true });
+    writeFileSync(SPOOL, usable.map((row) => `${JSON.stringify(row)}\n`).join(""), "utf8");
   } catch {
     // Same as writeSpool.
+    return 0;
   }
+  return usable.length;
 }
 
 /* ------------------------------------------------------------------ SQL */

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -591,6 +591,37 @@ describe("the spool", () => {
     mod.rewriteSpool!([read.rows[1]!]);
     expect(mod.readSpool!().rows.map((row: any) => row.sourceEntryId)).toEqual(["e2"]);
   });
+
+  it("keeps more than one row when it rewrites the queue", async () => {
+    // `rewriteSpool` used to join rows with "", which put both JSON objects on a single line. `readSpool` splits on
+    // newlines, so the pair read back as one torn line and neither row survived - a queue that reported itself as
+    // holding rows and replayed as nothing. Measured against the pre-fix source: `readSpool` returned 0 of 2.
+    const mod = await loadModule();
+    const rows = [
+      { sourceEntryId: "e1", kind: "user", at: "2026-11-08T01:00:00.000Z", sessionId: "s1", meta: {}, text: "first" },
+      { sourceEntryId: "e2", kind: "assistant", at: "2026-11-08T01:00:05.000Z", sessionId: "s1", meta: {}, text: "second" },
+    ];
+    expect(mod.rewriteSpool!(rows)).toBe(2);
+    expect(mod.readSpool!().rows.map((row: any) => row.sourceEntryId)).toEqual(["e1", "e2"]);
+  });
+
+  it("refuses to spool something that is not a row, and says how much it wrote", async () => {
+    // The spool exists so a failed write is late rather than lost. A queue full of lines that parse but carry no
+    // `sourceEntryId` is the other outcome - it looks like a backlog and replays as nothing - so the writer side
+    // checks the shape too. Iterating a string is how that class of file got made in the first place: `for (const row
+    // of "agent-id")` is eight perfectly good JSON values, and the call that produced them reported success.
+    const mod = await loadModule();
+    mod.rewriteSpool!([]);
+    expect(mod.writeSpool!("agent-id" as unknown as never)).toBe(0);
+    expect(mod.writeSpool!(["agent-id"] as unknown as never)).toBe(0);
+    expect(mod.writeSpool!([{ kind: "user", text: "no source id" } as never])).toBe(0);
+    // Absent and empty are the same claim here, and the queue is empty either way.
+    expect(existsSync(spoolPath) ? readFileSync(spoolPath, "utf8") : "").toBe("");
+
+    const valid = { sourceEntryId: "e1", kind: "user", at: "2026-11-08T01:00:00.000Z", sessionId: "s1", meta: {}, text: "real" };
+    expect(mod.writeSpool!([valid as never, "x" as never, null as never])).toBe(1);
+    expect(mod.readSpool!().rows.map((row: any) => row.sourceEntryId)).toEqual(["e1"]);
+  });
 });
 
 describe("dream gate", () => {
@@ -799,8 +830,13 @@ describe("the extension", () => {
 
     const checked: string[] = [];
     const offenders: string[] = [];
+    // The spool helpers are exported for tests, and they iterate their argument: calling them with a fixture string is
+    // how a sweep over every export wrote 1,014 one-character JSON lines into the real ~/.pi/agent/memory-spool.jsonl
+    // on 2026-11-08. This guard reads SQL text, so it has no business calling anything with a file handle.
+    const nonSql = new Set(["readSpool", "writeSpool", "rewriteSpool"]);
     for (const [name, value] of Object.entries(mod)) {
       if (typeof value !== "function") continue;
+      if (nonSql.has(name)) continue;
       // An async export is not a statement builder, and calling one with a half-matching argument shape produces a
       // rejected promise that surfaces as an unhandled rejection somewhere else in the run. This guard reads SQL text,
       // so it does not want the ones that reach for the network.
