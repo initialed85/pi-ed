@@ -1,0 +1,17 @@
+# The UI image build (ui/Dockerfile) copies package.json, the lockfile and ui/. Everything else in this repository is
+# either a Pi extension the UI does not import, a test the image must not ship, or a scratch directory that would leak
+# into the image layer. `node_modules` is excluded because the image installs its own tree with `npm ci`, and copying
+# a local one instead is how a laptop's tree ends up in production.
+node_modules
+.git
+.gitignore
+.pi
+.slopyphus
+test
+extensions
+memory
+hack
+*.log
+.ctx.mjs
+.*.mjs
+.*.cjs

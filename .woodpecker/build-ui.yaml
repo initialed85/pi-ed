@@ -1,0 +1,114 @@
+# Build, publish and deploy the memory reading room's image.
+#
+# A separate lane from `ci.yaml`, for the reason slopyphus uses the same split for: `ci.yaml` is the gate (does this
+# repository still behave?), this file is the publish (does a container get built and a Deployment moved). They run as
+# two pipelines on the same push, and neither depends on the other's verdict being the same as its own.
+#
+# Shape (the same contract as initialed85/rooter and initialed85/slopyphus):
+#   1. `test-ui` runs the reading room's own tests, offline. The suite is small and it is the one whose failures
+#      actually describe this image; running the whole repository suite here would be the gate's job done twice, and a
+#      publish lane that fails for a reason unrelated to what it publishes trains people to ignore it.
+#   2. `build-and-push` is a `docker:cli` pod. It has no docker socket of its own, so `DOCKER_HOST` points at one CI
+#      node's dockerd (`docker-beefcake-ci-1` Service -> 192.168.1.213:2375, published by home-ops
+#      `clusters/dev/applications/woodpecker/files/enable-docker-tcp.sh`). Pinning one node keeps the `npm ci` layer of
+#      this image warm, which is most of its build time.
+#   3. `deploy-home-ops` is `initialed85/wp-kustomize-deploy` (source in home-ops
+#      `ci/woodpecker/plugins/kustomize-deploy/`): it stamps this build's sha into
+#      `clusters/dev/applications/memory-ui/kustomization.yaml` and pushes, so Argo CD rolls the Deployment. Git is the
+#      deploy record and `git revert` is the rollback.
+#
+# Tags: `:$CI_COMMIT_SHA` is the immutable one and the one the manifest pins; `:latest` is the convenience tag.
+#
+# Credentials are native Kubernetes Secrets in the `woodpecker` namespace, mapped to env by
+# `backend_options.kubernetes.secrets` (`WOODPECKER_BACKEND_K8S_ALLOW_NATIVE_SECRETS=true` is set on the agent):
+# `dockerhub` (user + PAT) and `home-ops-deploy-key` (write access to the home-ops repo only). No secret text lives
+# in this repository.
+#
+# The path filter is the difference between this lane and the gate. A docs-only commit to the extensions must not
+# rebuild an image, because rebuilding it stamps a new sha into home-ops and Argo rolls the Deployment, which restarts
+# a pod for a change that cannot affect it. The include list is exactly the Dockerfile's build context.
+steps:
+  - name: test-ui
+    image: docker.io/library/node:22
+    backend_options:
+      kubernetes:
+        resources:
+          requests:
+            memory: 256Mi
+            cpu: 100m
+          limits:
+            # The same ceiling discipline as ci.yaml, sized for one small test file instead of the whole suite: vitest
+            # sizes its worker pool off the node's cores, and this step is not running on a beefcake node's whole box.
+            memory: 768Mi
+            cpu: 500m
+    commands:
+      - npm ci --no-audit --no-fund
+      # `node --check` is not a substitute for the tests and is not meant to be. It is the cheapest possible answer to
+      # "is this file even parseable", which is the failure that would otherwise surface as a pod in CrashLoopBackOff.
+      - node --check ui/server.mjs
+      - node --check ui/public/app.js
+      # No PI_LIVE_DSN here on purpose: the live half of this suite reads the real store, and a publish lane that can
+      # only pass when the cluster is healthy is a publish lane that cannot publish a fix for the cluster.
+      - npx vitest run test/memory-ui.test.ts
+
+  - name: build-and-push
+    image: docker.io/library/docker:cli
+    privileged: true
+    depends_on: [test-ui]
+    environment:
+      DOCKER_HOST: tcp://docker-beefcake-ci-1:2375
+      IMAGE: docker.io/initialed85/memory-ui
+    backend_options:
+      kubernetes:
+        secrets:
+          - name: dockerhub
+            key: username
+            target:
+              env: DOCKERHUB_USER
+          - name: dockerhub
+            key: token
+            target:
+              env: DOCKERHUB_TOKEN
+    commands:
+      - docker info --format 'daemon={{.Name}} images_before={{.Images}}'
+      - echo "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USER" --password-stdin
+      # The context is the repository root and the Dockerfile lives in `ui/`, because the image needs the lockfile and
+      # `ui/` in the same context. Inverting it (context `ui/`) would need the lockfile copied into `ui/` and then two
+      # files to keep in step.
+      - docker build --pull --progress=plain --platform=linux/amd64 -t "$IMAGE:$CI_COMMIT_SHA" -t "$IMAGE:latest" -f ui/Dockerfile .
+      - docker push "$IMAGE:$CI_COMMIT_SHA"
+      - docker push "$IMAGE:latest"
+      - docker inspect --format 'digests={{.RepoDigests}}' "$IMAGE:$CI_COMMIT_SHA"
+      - docker system df
+
+  - name: deploy-home-ops
+    depends_on: [build-and-push]
+    image: docker.io/initialed85/wp-kustomize-deploy:latest
+    settings:
+      # Spelled exactly as `kustomization.yaml`'s `images:` names it, with the `docker.io/` prefix: the transformer
+      # matches the name string, not a normalised reference, and a name that matches nothing deploys nothing while
+      # Argo reports the app as synced.
+      image: docker.io/initialed85/memory-ui
+      dir: clusters/dev/applications/memory-ui
+    backend_options:
+      kubernetes:
+        secrets:
+          - name: home-ops-deploy-key
+            key: id_ed25519
+            target:
+              env: PLUGIN_DEPLOY_KEY
+          - name: home-ops-deploy-key
+            key: known_hosts
+            target:
+              env: PLUGIN_KNOWN_HOSTS
+
+when:
+  - event: push
+    branch: master
+    path:
+      include:
+        - ui/**
+        - package.json
+        - package-lock.json
+        - .dockerignore
+  - event: manual

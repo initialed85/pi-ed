@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>memory · reading room</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <h1>memory <span>reading room</span></h1>
+        <p id="summary" class="summary">loading…</p>
+      </div>
+      <div class="who">
+        <span id="who"></span>
+        <span id="store" class="store"></span>
+      </div>
+    </header>
+
+    <nav id="tabs" class="tabs" aria-label="view">
+      <button data-view="memories" class="on">memories</button>
+      <button data-view="graph">graph</button>
+      <button data-view="edges">edge list</button>
+      <button data-view="events">events</button>
+    </nav>
+
+    <section class="controls">
+      <input id="q" type="search" placeholder="search the store…" autocomplete="off" />
+      <select id="mode" title="search mode">
+        <option value="vector">vector</option>
+        <option value="text">text</option>
+      </select>
+      <select id="agent" title="agent"></select>
+      <select id="kind" title="edge kind"></select>
+      <select id="limit" title="row limit">
+        <option>25</option>
+        <option selected>100</option>
+        <option>250</option>
+        <option>500</option>
+      </select>
+      <button id="go">run</button>
+      <span id="status" class="status"></span>
+    </section>
+
+    <main>
+      <div id="table" class="pane"></div>
+      <div id="graph" class="pane hidden">
+        <svg id="canvas" tabindex="0" aria-label="memory graph"></svg>
+        <div class="legend" id="legend"></div>
+        <div class="graph-help">drag a node · scroll to zoom · drag the canvas to pan · click for detail</div>
+      </div>
+      <aside id="detail" class="detail hidden"></aside>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

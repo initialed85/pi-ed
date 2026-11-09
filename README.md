@@ -313,6 +313,40 @@ is safe to leave in the package before the store exists.
 | Reads | the session branch, the session id, `session.dream_seq`, and `agent.name` for cross-agent attribution |
 | Live check | `hack/memory-live-check.mjs` — a real Pi session against the real store; needs the DSN, spends model tokens, and deletes what it wrote, including when it fails halfway |
 
+#### the graph that forms on its own (`memory.edge`)
+
+Every memory already says what it is about, which memories it was dreamed from, and which subjects it shares. None of
+that is a relationship the store can query: what is missing is the other end. `memory.edge` is the typed edge table
+that supplies it — `memory_about`, `dreamed_from`, `shares_subject`, four `room_*` kinds over the team-room messages,
+and `wakes` between a schedule job and the run it fired — each with `via` (the event, subject or job the link came
+from) and `asserted_by` (who claimed it).
+
+Two rules that took an incident to learn. Edges are derived from a `join`, never from a hand-curated list, so a
+backfill and the write path cannot drift: `hack/backfill-edges.mjs` and the extension's real-time statements share one
+derivation, which is what `test/edges.test.ts` asserts. And derived edges are written **after** the event transaction
+commits, never inside it — a graph fault must not spool valid events, because an incomplete graph is a second opinion
+that failed while an incomplete event log is the memory system breaking.
+
+The live store holds ~32k edges (31,755 `memory_about`, 145 `wakes`, 139 `room_*`, 128 `shares_subject`, 79
+`dreamed_from`), derived from a backfill that ran once. Migration `005_edges.sql` ships `memory.graph_edges`, a view
+that resolves each endpoint's type and display name, because an edge whose ends are integers is a graph nobody can
+read without a second query.
+
+| | |
+| --- | --- |
+| Migration | `memory/schema/005_edges.sql` (create-only: rerunnable, and it must be — a `do` block is not idempotent) |
+| Backfill | `hack/backfill-edges.mjs` (`--check` derives without inserting; `--apply` runs in one transaction and rolls back on any failure) |
+| Kinds | `memory_about` · `dreamed_from` · `shares_subject` · `room_reply` · `room_ask` · `room_delegate` · `room_update` · `wakes` |
+| Tests | `test/edges.test.ts` — kind parity between extension and migration, statement shape, edges provably written after the commit, and the derivations reconciled against a live store |
+
+#### the reading room (`ui/`)
+
+A read-only web UI for all of the above — the memories, the events a span is made of, and the graph as a draggable
+force-directed picture — at `https://memory.dev.initialed85.cc`, gated by the same Google sign-in as every other dev
+service. Node plus `pg` on the back, vanilla JavaScript and SVG on the front, no framework. `home-ops`
+`clusters/dev/applications/memory-ui/README.md` covers the gate and the read-only enforcement; `ui/README.md` covers
+running it locally.
+
 
 ### `searxng.ts` — web search through my own SearXNG
 
