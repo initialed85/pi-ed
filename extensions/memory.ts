@@ -1281,7 +1281,8 @@ export function dreamStatement(options: {
           )
           insert into memory.memory (agent_id, session_id, trigger, span_first_event, span_last_event, summary, subjects, feel, detail, embedding, embedding_model, embedding_dim)
           select $2, $1, $3, span.first_id, span.last_id, $4, $5, $6, $7::jsonb, $8::vector, $9, $10
-          from span`,
+          from span
+          returning id`,
     // The cast on the vector is what makes a parameter a pgvector value rather than a string Postgres has to guess
     // about, and `embedding_model`/`embedding_dim` travel with it: when the embedder changes, old rows keep saying
     // which model produced them instead of silently becoming wrong.
@@ -1339,6 +1340,201 @@ export function dreamWatermarkStatement(sessionId: string): Statement {
           from memory.event
           where session_id = $1 and seq <= coalesce((select dream_seq from memory.session where id = $1), 0)`,
     values: [sessionId],
+  };
+}
+
+/* --------------------------------------------------------------------- edges */
+
+/**
+ * The edge vocabulary, in one place.
+ *
+ * `memory/schema/005_edges.sql` carries the same list in a CHECK constraint. They are written twice on purpose - one
+ * is what the store will accept, the other is what this code will try to write - and `test/edges.test.ts` asserts the
+ * two sets are equal, because a kind the writer invents and the schema refuses turns into a failed flush.
+ */
+export const EDGE_KINDS = [
+  "memory_about",
+  "dreamed_from",
+  "shares_subject",
+  "room_reply",
+  "room_ask",
+  "room_delegate",
+  "room_update",
+  "wakes",
+] as const;
+
+const EDGE_ON_CONFLICT = "on conflict on constraint edge_distinct do nothing";
+
+/**
+ * Which events a memory is about.
+ *
+ * Membership is derived from sequence numbers inside the memory's own session, not from the numeric gap between
+ * `span_first_event` and `span_last_event`. Those are ids from a global sequence, so the gap counts every other
+ * agent's rows that happen to fall between them: 32,097 real memberships read as 2,851,945 on the live store.
+ * Dream residue is excluded because it is not part of the stretch the memory claims to summarise.
+ */
+export function memorySpanEdgesStatement(memoryId: string): Statement {
+  return {
+    sql: `insert into memory.edge (kind, asserted_by, "at", src_memory, dst_event, meta)
+          select 'memory_about', m.agent_id, m.created_at, m.id, e.id,
+                 jsonb_build_object('seq_from', f.seq, 'seq_to', l.seq)
+          from memory.memory m
+          join memory.event f on f.id = m.span_first_event
+          join memory.event l on l.id = m.span_last_event
+          join memory.event e on e.session_id = m.session_id and e.seq between f.seq and l.seq
+          where m.id = $1 and m.span_first_event is not null and m.span_last_event is not null
+            and coalesce(e.meta ->> 'dream_turn', 'false') <> 'true'
+          ${EDGE_ON_CONFLICT}`,
+    values: [memoryId],
+  };
+}
+
+/**
+ * Which `memory_dream` call produced a memory.
+ *
+ * Matched on the summary the call asked for, which is verbatim in the call's recorded input. That is a real join
+ * rather than a guess from timestamps: 79 of 81 memories already link this way, with no new write path needed.
+ */
+export function dreamCallEdgeStatement(memoryId: string): Statement {
+  return {
+    sql: `insert into memory.edge (kind, asserted_by, "at", src_memory, dst_event, meta)
+          select 'dreamed_from', m.agent_id, m.created_at, m.id, c.id,
+                 jsonb_build_object('matched_on', 'summary', 'trigger', m.trigger)
+          from memory.memory m
+          join memory.event c
+            on c.kind = 'tool_call' and c.tool_name = 'memory_dream'
+           and c.session_id = m.session_id
+           and c.meta -> 'input' ->> 'summary' = m.summary
+          where m.id = $1
+          ${EDGE_ON_CONFLICT}`,
+    values: [memoryId],
+  };
+}
+
+/**
+ * Which memories are about the same thing.
+ *
+ * Labels are canonicalised through `subject_merge` first, or the index would link "memory dreaming" to "memory
+ * dreaming (again)" and miss the pair that matters. Bounded to the twenty most recent matches: a popular subject can
+ * match hundreds of memories, and a graph where one node has four hundred edges is a blob.
+ */
+export function subjectEdgesStatement(memoryId: string): Statement {
+  return {
+    sql: `with own as (select agent_id from memory.memory where id = $1),
+          own_labels as (
+            select coalesce(
+                     (select sm.canonical from memory.subject_merge sm where sm.label = s.subject order by sm.applied_at desc limit 1),
+                     s.subject
+                   ) as subject
+            from memory.memory m
+            cross join lateral unnest(m.subjects) as s (subject)
+            where m.id = $1
+          ),
+          matches as (
+            select o.id as other_id, o.agent_id, o.created_at,
+                   count(*) as shared,
+                   array_agg(l.subject order by l.subject) as subjects
+            from memory.memory o
+            cross join lateral unnest(o.subjects) as os (subject)
+            join own_labels l on l.subject = coalesce(
+              (select sm.canonical from memory.subject_merge sm where sm.label = os.subject order by sm.applied_at desc limit 1),
+              os.subject
+            )
+            where o.id <> $1
+            group by 1, 2, 3
+          )
+          insert into memory.edge (kind, asserted_by, "at", src_memory, dst_memory, weight, meta)
+          select 'shares_subject', own.agent_id, now(), $1::uuid, p.other_id, p.shared,
+                 jsonb_build_object('subjects', p.subjects, 'same_agent', p.agent_id = own.agent_id)
+          from matches p, own
+          order by p.created_at desc
+          limit 20
+          ${EDGE_ON_CONFLICT}`,
+    values: [memoryId],
+  };
+}
+
+/**
+ * Who a team-room message was aimed at, for the rows this flush just wrote.
+ *
+ * Three ways to know, in order of how direct they are: the call said so (`input.agent`), the message arrived as a
+ * wake in somebody else's session holding the text verbatim, or the message opens with an @-mention. The middle one
+ * is the interesting one - it works on rows written months ago that recorded no recipient at all, and it is also the
+ * one that can lag, because the arrival is written by the recipient's pod rather than this one.
+ *
+ * That lag is not a bug to chase per message. `hack/backfill-edges.mjs --apply` derives the same edges from the whole
+ * store and is idempotent, so the reconciler is a re-run rather than a retry loop.
+ */
+export function messageEdgesStatement(sessionId: string, sourceEntryIds: string[]): Statement {
+  return {
+    sql: `with room as (
+            select e.id, e.agent_id, e."at", e.meta -> 'input' as input,
+                   e.meta -> 'input' ->> 'action' as action
+            from memory.event e
+            where e.session_id = $1 and e.source_entry_id = any($2::text[])
+              and e.kind = 'tool_call' and e.tool_name = 'team_room'
+              and e.meta -> 'input' ->> 'action' in ('reply', 'ask', 'delegate', 'update')
+          ),
+          named as (
+            select r.*,
+                   nullif(r.input ->> 'agent', '') as meta_agent,
+                   case when coalesce(r.input ->> 'text', '') ~ '^@'
+                        then split_part(regexp_replace(r.input ->> 'text', '^@', ''), ' ', 1)
+                   end as mention,
+                   (select w.agent_id from memory.event w
+                     where w.tool_name = 'pi-team-room-wake' and w.agent_id <> r.agent_id
+                       and length(coalesce(r.input ->> 'text', '')) > 40
+                       and position(left(r.input ->> 'text', 120) in w."text") > 0
+                     order by w."at" limit 1) as arrival_agent,
+                   (select w.id from memory.event w
+                     where w.tool_name = 'pi-team-room-wake' and w.agent_id <> r.agent_id
+                       and length(coalesce(r.input ->> 'text', '')) > 40
+                       and position(left(r.input ->> 'text', 120) in w."text") > 0
+                     order by w."at" limit 1) as arrival_event
+            from room r
+          )
+          insert into memory.edge (kind, asserted_by, "at", src_event, dst_event, dst_agent, meta)
+          select 'room_' || n.action, n.agent_id, n."at", n.id, n.arrival_event,
+                 coalesce(n.meta_agent, n.arrival_agent, n.mention),
+                 jsonb_build_object('action', n.action, 'target', n.input ->> 'target',
+                                    'messageId', n.input ->> 'messageId',
+                                    'evidence', case
+                                      when n.meta_agent is not null then 'metadata'
+                                      when n.arrival_agent is not null then 'arrival_text'
+                                      when n.mention is not null then 'mention'
+                                    end)
+          from named n
+          where coalesce(n.meta_agent, n.arrival_agent, n.mention) is not null
+          ${EDGE_ON_CONFLICT}`,
+    values: [sessionId, sourceEntryIds],
+  };
+}
+
+/**
+ * Who delivered a wake, for the rows this flush just wrote.
+ *
+ * The wake marker names its sender in its own text (`ocr: …`, `[Code-owner delegation from ocr]`), so the delivering
+ * agent is recoverable from what is already stored. Requiring the parsed name to be a registered agent is what keeps
+ * a bad regex from becoming a relationship: every name this recovered across 145 wake rows is a real one.
+ */
+export function wakeEdgesStatement(sessionId: string, sourceEntryIds: string[]): Statement {
+  return {
+    sql: `insert into memory.edge (kind, asserted_by, "at", src_event, dst_agent, meta)
+          select 'wakes', e.agent_id, e."at", e.id, p.sender,
+                 jsonb_build_object('parsed_from', 'wake_text')
+          from memory.event e
+          join lateral (
+            select coalesce(
+              (regexp_match(e."text", '\\n\\s*([a-z][a-z0-9-]+):'))[1],
+              (regexp_match(e."text", 'delegation from ([a-z][a-z0-9-]+)'))[1]
+            ) as sender
+          ) as p on true
+          where e.session_id = $1 and e.source_entry_id = any($2::text[])
+            and e.tool_name = 'pi-team-room-wake'
+            and p.sender is not null
+            and exists (select 1 from memory.agent a where a.id = p.sender)
+          ${EDGE_ON_CONFLICT}`,
+    values: [sessionId, sourceEntryIds],
   };
 }
 
@@ -1615,6 +1811,29 @@ export default function memoryExtension(api: ExtensionAPI): void {
       }
       await client.query(`update memory.session set event_count = (select count(*) from memory.event where session_id = $1) where id = $1`, [sessionId]);
       await client.query("commit");
+      // Edges after the commit, in their own implicit transactions, deliberately outside the batch that wrote the
+      // events. An edge is derived: it is a second opinion about rows that are already the record. Inside the same
+      // transaction it could abort a flush and spool events that were written perfectly well, which would let a
+      // graph problem damage the history it is supposed to describe.
+      const entriesBySession = new Map<string, string[]>();
+      for (const row of all) {
+        const rowSession = row.sessionId ?? sessionId;
+        if (!row.sourceEntryId) continue;
+        const list = entriesBySession.get(rowSession) ?? [];
+        list.push(row.sourceEntryId);
+        entriesBySession.set(rowSession, list);
+      }
+      for (const [rowSession, entryIds] of entriesBySession) {
+        for (const edge of [messageEdgesStatement(rowSession, entryIds), wakeEdgesStatement(rowSession, entryIds)]) {
+          try {
+            await client.query(edge.sql, edge.values);
+          } catch (error) {
+            // Reported, not fatal, and not written into `lastError`: that field means "these events are not in the
+            // store" and spools the batch on the strength of it. Here the events are in the store.
+            ui(ctx).notify(`memory: events written, edges incomplete (${describeStoreError(error instanceof Error ? error.message : String(error))})`, "warning");
+          }
+        }
+      }
       written += all.length;
       lastError = "";
       lastFlushAt = Date.now();
@@ -2054,7 +2273,21 @@ export default function memoryExtension(api: ExtensionAPI): void {
           model: embedded.ok ? embedded.model : undefined,
           detail,
         });
-        await client.query(dream.sql, dream.values);
+        const dreamResult = await client.query(dream.sql, dream.values);
+        const memoryId = dreamResult.rows[0]?.id as string | undefined;
+        // The memory is the artefact; its edges are what makes it navigable. Each is a separate statement for the same
+        // reason the flush keeps them outside the event transaction: an incomplete graph is a gap to mention, not a
+        // reason to pretend the dream did not happen.
+        let edgesIncomplete = "";
+        if (memoryId) {
+          for (const edge of [memorySpanEdgesStatement(memoryId), dreamCallEdgeStatement(memoryId), subjectEdgesStatement(memoryId)]) {
+            try {
+              await client.query(edge.sql, edge.values);
+            } catch (error) {
+              edgesIncomplete = describeStoreError(error instanceof Error ? error.message : String(error));
+            }
+          }
+        }
         const cursor = dreamCursorStatement(sessionId);
         await client.query(cursor.sql, cursor.values);
         await client.query("refresh materialized view memory.subject_index");
@@ -2068,8 +2301,8 @@ export default function memoryExtension(api: ExtensionAPI): void {
         const vectorNote = embedded.ok ? `vector from ${embedded.model} (${embedded.tokens} tokens, ${embedded.chunks} chunk(s))` : `no vector (${embedded.error})`;
         ui(ctx).notify(`memory: dream written (${subjects.join(", ") || "no subjects"}, ${vectorNote})`, "info");
         return {
-          content: [{ type: "text", text: `dream recorded for session ${sessionId} (${trigger}); subjects: ${subjects.join(", ") || "none"}; ${vectorNote}` }],
-          details: { subjects, trigger, embedded: embedded.ok, embed: embedded.ok ? { tokens: embedded.tokens, chunks: embedded.chunks, model: embedded.model } : embedded.error },
+          content: [{ type: "text", text: `dream recorded for session ${sessionId} (${trigger}); subjects: ${subjects.join(", ") || "none"}; ${vectorNote}${edgesIncomplete ? `; edges incomplete: ${edgesIncomplete}` : ""}` }],
+          details: { subjects, trigger, embedded: embedded.ok, embed: embedded.ok ? { tokens: embedded.tokens, chunks: embedded.chunks, model: embedded.model } : embedded.error, memoryId: memoryId ?? null, edgesIncomplete: edgesIncomplete || null },
         };
       } catch (error) {
         const message = describeStoreError(error instanceof Error ? error.message : String(error));

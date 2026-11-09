@@ -176,6 +176,7 @@ describe("every exported statement", () => {
     const builders = Object.keys(mod).filter((name) => name.endsWith("Statement")).sort();
     expect(builders).toEqual([
       "agentStatement",
+      "dreamCallEdgeStatement",
       "dreamCursorStatement",
       "dreamSpanStatement",
       "dreamStatement",
@@ -189,12 +190,16 @@ describe("every exported statement", () => {
       "heartbeatReadStatement",
       "heartbeatSweepStatement",
       "identityPairStatement",
+      "memorySpanEdgesStatement",
+      "messageEdgesStatement",
       "ownRowCountStatement",
       "sessionStatement",
       "storeReadingSanityStatement",
       "storeShapeCountsStatement",
+      "subjectEdgesStatement",
       "subjectsStatement",
       "vectorCoverageStatement",
+      "wakeEdgesStatement",
     ]);
 
     // One builder assembles its value tuples in a loop, so no static extraction can reach its SQL and it is the one

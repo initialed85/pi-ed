@@ -1297,7 +1297,10 @@ describe("the extension", () => {
 
   it("names the schema in every statement it hands to another reader", async () => {
     const mod = await loadModule();
-    const tables = ["memory", "event", "session", "agent", "writer_heartbeat", "subject_index"];
+    // The list must grow with the schema. Before `edge` was added here, `insert into memory.edge` left the word
+    // `memory` behind after subtraction and the guard reported a perfectly qualified statement as an offender - the
+    // failure mode where a guard starts lying about clean code, which is worse than not having the guard.
+    const tables = ["memory", "event", "session", "agent", "writer_heartbeat", "subject_index", "edge", "graph_edges", "graph_degree", "subject_merge"];
     // Detection is by subtraction: delete every properly qualified reference (`memory.memory`, `memory.event`,
     // `memory.writer_heartbeat.flushes`) and whatever table name is left over was written unqualified. A pattern keyed
     // on `from`/`join` alone misses the column-qualifier form (`failures = writer_heartbeat.failures + 1`), which this
@@ -1354,7 +1357,11 @@ describe("the extension", () => {
       if (typeof sql !== "string") continue;
       checked.push(name);
       if (exempt.has(name)) continue;
-      const bad = sql.replace(/\s+/g, " ").replace(qualified, " ").match(leftover);
+      // Single-quoted text is payload, not a relation. `meta ->> 'agent'` names a JSON key that happens to spell a
+      // table name, and counting it as an unqualified reference is how a guard ends up objecting to correct SQL, so
+      // quoted literals are blanked first. The exemption is narrow on purpose: only quoted text, never identifiers.
+      const body = sql.replace(/'[^']*'/g, "''");
+      const bad = body.replace(/\s+/g, " ").replace(qualified, " ").match(leftover);
       if (bad) offenders.push(`${name}: ${[...new Set(bad)].join(", ")}`);
     }
 
