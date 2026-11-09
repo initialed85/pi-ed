@@ -485,6 +485,56 @@ describe("recording a branch", () => {
     expect(rows.some((row) => row.sourceEntryId === "e6")).toBe(false);
   });
 
+  it("carries an extension's details into the store, scrubbed like everything else beside it", async () => {
+    const { rowsFromBranch } = await loadModule();
+    // The finding worth stating plainly: `details` is the harness's own field for metadata an extension attaches to a
+    // message, the schedule and team-room extensions both use it, and this extension was copying it into `meta`
+    // verbatim - the one write path in this file where the redactor was never applied. A job's note, a relayed
+    // authorisation quote, a wake's message ids all arrived untouched while the identical words in the message body
+    // beside them were being scrubbed.
+    const detailed: any[] = [
+      {
+        type: "custom", id: "c1", customType: "schedule:fire", timestamp: "2026-11-08T18:00:00.000Z",
+        content: "the job prompt arrived here", details: { jobId: 12, occurrence: "2026-11-09T02:00:00+08:00", tz: "Australia/Perth", note: "read the runbook first" },
+      },
+      {
+        type: "custom", id: "c2", customType: "teamroom:delegated", timestamp: "2026-11-08T18:01:00.000Z",
+        content: "a wake from a teammate", details: { messageIds: ["m-1"], from: "camry", kinds: ["delegation"], authorization: "token: hunter2hunter2hunter2", rotation: "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" },
+      },
+    ];
+    const rows = rowsFromBranch!(detailed, {}) as any[];
+    const fired = rows.find((row) => row.sourceEntryId === "c1")!;
+    expect(fired.meta.details).toEqual({ jobId: 12, occurrence: "2026-11-09T02:00:00+08:00", tz: "Australia/Perth", note: "read the runbook first" });
+    const wake = rows.find((row) => row.sourceEntryId === "c2")!;
+    expect(wake.meta.details.from).toBe("camry");
+    expect(wake.meta.details.messageIds).toEqual(["m-1"]);
+    // The whole pair goes, not just the value: `key-value` matches the key name too, which is the right shape for
+    // this - a field called `authorization` whose value was scrubbed still tells a reader what was there.
+    expect(wake.meta.details.authorization).toBe("[redacted:key-value]");
+    expect(wake.meta.details.rotation).toBe("[redacted:github-token]");
+    expect(wake.meta.redacted).toEqual(expect.arrayContaining(["key-value", "github-token"]));
+    // Not merely "the field was scrubbed" - the secret is nowhere in the row at all, which is the property that
+    // actually matters when someone greps the store.
+    expect(JSON.stringify(wake)).not.toMatch(/hunter2|ghp_/);
+  });
+
+  it("bounds details by leaf and by total, and keeps the key names when the total is blown", async () => {
+    const { redactDetails } = await loadModule();
+    expect(redactDetails({ jobId: 3, note: "short" }, []).details).toEqual({ jobId: 3, note: "short" });
+    expect(redactDetails({ jobId: 3, note: "short" }, []).truncated).toBeUndefined();
+    expect(redactDetails(undefined, []).details).toBeUndefined();
+    // Numbers and booleans survive untouched: a jobId is a number in the schedule extension today and coercing it to
+    // a string would make the equality the repair queries fail.
+    expect(redactDetails({ jobId: 12, occurred: true }, []).details).toEqual({ jobId: 12, occurred: true });
+    const leaf = redactDetails({ note: "x".repeat(500) }, [], { total: 2_000, leaf: 40 });
+    expect((leaf.details as Record<string, unknown>).note).toBe(`${"x".repeat(40)}…`);
+    // Over the total the payload is reduced to which keys arrived, not thrown away: "this wake carried messageIds and
+    // kinds" is a fact about the event even when none of the values were worth keeping.
+    const huge = redactDetails({ jobId: 3, note: "y".repeat(5_000), tz: "Australia/Perth" }, [], { total: 200, leaf: 200 });
+    expect(huge.truncated).toBe(true);
+    expect(huge.details).toEqual({ keys: ["jobId", "note", "tz"] });
+  });
+
   it("knows that a dream's own rows are not new work", async () => {
     const { rowsFromBranch, dreamPending } = await loadModule();
     const dreamBranch: any[] = [

@@ -94,6 +94,14 @@ interface Config {
   flushMs?: number;
   /** Long outputs are stored clipped rather than dropped: the head is usually the informative part. */
   maxTextChars?: number;
+  /** Budgets for an extension's `details` payload, which the harness defines as opaque metadata and therefore puts
+   *  no ceiling on. Three extensions in this fleet use it - a schedule job's identity, a dream trigger, a teammate
+   *  wake's message ids - and nothing stops a fourth from putting a whole prompt in one. A leaf cap keeps each value
+   *  short, a total cap keeps the whole payload smaller than the text it travels with, and a payload over the total
+   *  is reduced to its key names rather than dropped, because which metadata arrived is itself a fact worth keeping.
+   *  See `redactDetails`. */
+  maxDetailsChars?: number;
+  maxDetailsValueChars?: number;
   /** Extra patterns to redact, on top of the built-in credential shapes. */
   neverStore?: string[];
   /** Skip whole kinds, e.g. a repository that does not want tool output recorded at all. */
@@ -125,6 +133,10 @@ const DEFAULTS = {
   dreams: true,
   flushMs: 4_000,
   maxTextChars: 12_000,
+  // `details` is unbounded by contract - every extension invents its own shape - so it gets its own budget rather
+  // than borrowing the one meant for transcript text.
+  maxDetailsChars: 2_000,
+  maxDetailsValueChars: 200,
   idleDreamMinutes: 10,
   resumeDreamMinutes: 10,
   minDreamWork: 4,
@@ -138,7 +150,7 @@ const DEFAULTS = {
   embedTimeoutMs: 30_000,
   ownWeight: 1,
   otherWeight: 0.65,
-} satisfies Required<Pick<Config, "dreams" | "flushMs" | "maxTextChars" | "idleDreamMinutes" | "resumeDreamMinutes" | "minDreamWork" | "embeddings" | "embedUrl" | "embedModel" | "embedMaxChars" | "embedTimeoutMs" | "ownWeight" | "otherWeight">>;
+} satisfies Required<Pick<Config, "dreams" | "flushMs" | "maxTextChars" | "maxDetailsChars" | "maxDetailsValueChars" | "idleDreamMinutes" | "resumeDreamMinutes" | "minDreamWork" | "embeddings" | "embedUrl" | "embedModel" | "embedMaxChars" | "embedTimeoutMs" | "ownWeight" | "otherWeight">>;
 
 function readConfigFile(path: string): Partial<Config> {
   if (!existsSync(path)) return {};
@@ -230,6 +242,65 @@ export function redact(input: string, extraPatterns: string[] = []): Redaction {
     }
   }
   return { text, hits };
+}
+
+/**
+ * Redact and bound an extension's `details` payload before it is stored.
+ *
+ * Every other field written from a transcript passes through `redact`. `details` does not, because the harness treats
+ * it as opaque metadata and this extension was copying it verbatim into `meta`. That is a side door around the only
+ * secrecy mechanism the store has: a schedule job's `note`, a teammate's message ids, a wake's relayed authorisation
+ * quote - all of it reaches Postgres untouched while the identical words in the message body were being scrubbed. So
+ * the payload is walked, not copied, and every string leaf meets the same rules as the text beside it.
+ *
+ * It is also bounded, because `details` has no agreed shape and no agreed size: three extensions in this fleet use
+ * it, and nothing stops a fourth from putting a whole prompt in one. A leaf cap plus a total cap keeps the metadata
+ * queryable - which is the point of storing it - without letting it become the largest thing in the row. When the
+ * total is exceeded the keys are kept and the values dropped, because "this wake carried messageIds and kinds" is
+ * worth knowing even when the values were not worth keeping.
+ */
+export function redactDetails(
+  value: unknown,
+  extraPatterns: string[] = [],
+  limits: { total: number; leaf: number } = { total: DEFAULTS.maxDetailsChars, leaf: DEFAULTS.maxDetailsValueChars },
+): { details?: Record<string, unknown>; truncated?: boolean; redacted?: string[] } {
+  if (value === null || value === undefined) return {};
+  const hits = new Set<string>();
+  const walk = (input: unknown, depth: number): unknown => {
+    if (depth > 4) return "[depth]";
+    if (typeof input === "string") {
+      const { text, hits: found } = redact(input, extraPatterns);
+      for (const name of found) hits.add(name);
+      return text.length > limits.leaf ? `${text.slice(0, limits.leaf)}…` : text;
+    }
+    if (typeof input === "number" || typeof input === "boolean") return input;
+    if (Array.isArray(input)) return input.slice(0, 24).map((item) => walk(item, depth + 1));
+    if (typeof input === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [key, item] of Object.entries(input as Record<string, unknown>).slice(0, 24)) {
+        out[key] = walk(item, depth + 1);
+      }
+      return out;
+    }
+    return String(input).slice(0, limits.leaf);
+  };
+  const shaped = walk(value, 0);
+  const redactedHits = hits.size ? [...hits] : undefined;
+  const shapedAsRecord = (typeof shaped === "object" && shaped !== null && !Array.isArray(shaped))
+    ? (shaped as Record<string, unknown>)
+    : { value: shaped as unknown };
+  if (JSON.stringify(shapedAsRecord).length > limits.total) {
+    // Presence is still worth knowing even when the values are not worth keeping.
+    const shrunk: { details: Record<string, unknown>; truncated: boolean; redacted?: string[] } = {
+      details: { keys: Object.keys(shapedAsRecord) },
+      truncated: true,
+    };
+    if (redactedHits) shrunk.redacted = redactedHits;
+    return shrunk;
+  }
+  const kept: { details?: Record<string, unknown>; truncated?: boolean; redacted?: string[] } = { details: shapedAsRecord };
+  if (redactedHits) kept.redacted = redactedHits;
+  return kept;
 }
 
 /* ------------------------------------------------------------------ what a recorded turn looks like */
@@ -368,7 +439,9 @@ export function rowsFromBranch(entries: unknown[], cfg: Config, dreamTurnEnd?: s
         at,
         toolName: typeof entry.customType === "string" ? entry.customType : undefined,
         text: clip(redact(textOf((entry as { content?: unknown }).content), cfg.neverStore).text, limit),
-        meta: { customType: entry.customType },
+        // `details` travels beside the content and is the one payload in this function that would otherwise reach
+        // Postgres without ever meeting the redactor, so it is walked rather than copied - see `redactDetails`.
+        meta: { customType: entry.customType, ...redactDetails((entry as { details?: unknown }).details, cfg.neverStore) },
       });
       continue;
     }
