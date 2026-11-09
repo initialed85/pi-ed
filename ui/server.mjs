@@ -321,6 +321,12 @@ async function handle(request, response) {
   const who = identity(request.headers);
 
   if (url.pathname === "/healthz") {
+    // Reachable means reachable *for reading*, and with no DSN there is nothing to be reachable to. Answering 500 from
+    // a driver's complaint about a connection string nobody supplied would file a configuration state in the same
+    // drawer as a store outage, which is the one distinction a readiness probe exists to draw.
+    if (!DSN) {
+      return json(response, 503, { ok: false, error: "not configured", detail: "PI_MEMORY_DSN is unset, so there is no store to read." });
+    }
     try {
       const r = await readOnce("select 1 as ok");
       return json(response, 200, { ok: true, rows: r.rows.length, identity: who });

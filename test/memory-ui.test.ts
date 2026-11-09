@@ -131,13 +131,34 @@ describe("the identity gate", () => {
       expect(sent.status, path).toBe(401);
       expect(JSON.parse(sent.body).error, path).toBe("no identity");
     }
+    // 401 rather than the 503 an unconfigured store would earn: the ordering is the point. Being outside the gate is
+    // the more urgent fact about a request, and an unconfigured store is not information a caller who was never
+    // let in needs from us.
+    if (!liveDsn) {
+      const configured = await call("/api/summary", { "x-auth-request-email": "someone@example.com" });
+      expect(configured.status).toBe(503);
+      expect(JSON.parse(configured.body).error).toBe("not configured");
+    }
   });
 
   it("still serves the page and the health check without one", async () => {
     // The page itself holds no memories, and a health check you cannot run from a port-forward is a health check you
     // do not run.
     expect((await call("/")).status).toBe(200);
-    expect((await call("/healthz")).status).toBe(200);
+    // What the health check SAYS depends on whether there is a store to be healthy about. This is the assertion the CI
+    // lane wrote for me: it runs with no DSN, expected 200, and got a 500 manufactured by a driver complaining about a
+    // connection string nobody supplied. "Not configured" and "the store is broken" are different facts, and a probe
+    // that cannot tell them apart is a probe that reports a config error as an outage.
+    const health = await call("/healthz");
+    const payload = JSON.parse(health.body);
+    if (liveDsn) {
+      expect(health.status).toBe(200);
+      expect(payload.ok).toBe(true);
+    } else {
+      expect(health.status).toBe(503);
+      expect(payload.ok).toBe(false);
+      expect(payload.error).toBe("not configured");
+    }
   });
 });
 
