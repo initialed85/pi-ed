@@ -37,8 +37,10 @@ steps:
             memory: 256Mi
             cpu: 100m
           limits:
-            # The same ceiling discipline as ci.yaml, sized for one small test file instead of the whole suite: vitest
-            # sizes its worker pool off the node's cores, and this step is not running on a beefcake node's whole box.
+            # The same ceiling discipline as ci.yaml, sized for this lane's two UI test files instead of the whole
+            # suite: vitest sizes its worker pool off the node's cores, and this step is not running on a beefcake
+            # node's whole box. Measured on this machine with both files: 474 MiB summed across node processes, 161 MiB
+            # for the largest single one - jsdom is the reason either number is worth writing down.
             memory: 768Mi
             cpu: 500m
     commands:
@@ -46,10 +48,15 @@ steps:
       # `node --check` is not a substitute for the tests and is not meant to be. It is the cheapest possible answer to
       # "is this file even parseable", which is the failure that would otherwise surface as a pod in CrashLoopBackOff.
       - node --check ui/server.mjs
-      - node --check ui/public/app.js
+      - node --check ui/public/app.mjs
       # No PI_LIVE_DSN here on purpose: the live half of this suite reads the real store, and a publish lane that can
       # only pass when the cluster is healthy is a publish lane that cannot publish a fix for the cluster.
-      - npx vitest run test/memory-ui.test.ts
+      #
+      # The client test is in this lane and not only in the gate because this is the lane that publishes the client.
+      # The defect that shipped - tables rendering as `[object HTMLTableRowElement]` - was invisible to every test the
+      # gate had, because all of them were server tests; a browser is the only place that class of bug is visible, and
+      # jsdom is the cheapest thing that counts as one.
+      - npx vitest run test/memory-ui.test.ts test/memory-ui-client.test.ts
 
   - name: build-and-push
     image: docker.io/library/docker:cli

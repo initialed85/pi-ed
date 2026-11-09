@@ -75,7 +75,19 @@ more code than it saves.
 ```sh
 npx vitest run test/memory-ui.test.ts                                    # offline
 PI_LIVE_DSN="$DSN" npx vitest run test/memory-ui.test.ts                 # + read-only enforcement, live endpoints
+npx vitest run test/memory-ui-client.test.ts                             # the client, mounted in jsdom
 ```
+
+The client test is not a nicety. The first version of this UI shipped with tables that rendered as
+`[object HTMLTableRowElement]` and a detail pane that rendered as `[object HTMLParagraphElement],[object
+HTMLTableElement]`, and every test in the repository was green while it did so, because every test in the repository is
+a server test. `test/memory-ui-client.test.ts` mounts the real `ui/public/index.html`, runs the real client against a
+canned store, and asserts the blunt thing: a row is a row, and the string `[object ` appears nowhere in the rendered
+document. `jsdom` rather than a hand-rolled DOM, because the whole defect was about how the real `Element.append`
+treats a non-node and a stub would have been a second implementation of the thing under test.
+
+That is also why `app.mjs` exports `boot()` instead of fetching at import time: a module that contacts the store the
+instant it is loaded cannot be mounted by anything that wants to render it.
 
 The live half is skipped by default and is deliberately skipped in the publish lane: a publish lane that can only pass
 when the cluster is healthy is a publish lane that cannot publish a fix for the cluster.

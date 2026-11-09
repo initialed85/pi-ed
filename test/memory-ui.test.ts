@@ -164,7 +164,7 @@ describe("the identity gate", () => {
 
 describe("the static handler", () => {
   it("serves the three files the page needs", async () => {
-    for (const path of ["/", "/app.js", "/styles.css"]) {
+    for (const path of ["/", "/app.mjs", "/styles.css"]) {
       const sent = await call(path);
       expect(sent.status, path).toBe(200);
       expect(sent.headers["content-type"], path).toContain("text/");

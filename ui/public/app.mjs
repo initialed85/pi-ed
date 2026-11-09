@@ -27,15 +27,35 @@ const TYPE_COLOURS = { memory: "#f0b429", event: "#7f8ea3", agent: "#4fb3a5" };
 const state = { view: "memories", rows: [], nodes: [], edges: [], facets: null, selected: null, sim: null };
 
 const $ = (id) => document.getElementById(id);
-const el = (tag, attrs = {}, text) => {
+
+/**
+ * Build an element: tag, attributes, then any number of children - strings, numbers, elements, or arrays of them.
+ *
+ * Children are *appended*, never assigned. The first version of this helper took one `text` argument and did
+ * `node.textContent = text`, which is innocuous until a caller hands it an element: JavaScript stringifies the node,
+ * the browser prints `[object HTMLTableRowElement]` where a table row should be, and every table in the reading room
+ * renders as two lines of nonsense - which is precisely what it did, on Ed's screen, minutes after shipping. A helper
+ * that cannot tell a node from a string is the defect, so the helper is gone: `addChildren` appends nodes, wraps
+ * everything else in a text node, and flattens arrays so a caller cannot accidentally pass a list as one child.
+ */
+const el = (tag, attrs = {}, ...children) => {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
     if (k === "class") node.className = v;
-    else node.setAttribute(k, v);
+    else if (v !== null && v !== undefined) node.setAttribute(k, String(v));
   }
-  if (text !== undefined) node.textContent = text;
+  addChildren(node, children);
   return node;
 };
+
+function addChildren(node, values) {
+  for (const value of values) {
+    if (value === null || value === undefined || value === "") continue;
+    if (Array.isArray(value)) addChildren(node, value);
+    else if (typeof value === "object" && value.nodeType) node.append(value);
+    else node.append(document.createTextNode(String(value)));
+  }
+}
 
 async function api(path, params = {}) {
   const url = new URL(path, location.origin);
@@ -454,10 +474,11 @@ async function openNode(id) {
     const payload = await api("/api/edges", params);
     state.nodes = payload.nodes;
     state.edges = payload.edges;
-    renderDetail(el("h2", {}, `${type} · ${truncate(value, 60)}`), [
+    renderDetail(
+      el("h2", {}, `${type} · ${truncate(value, 60)}`),
       el("p", { class: "feel" }, `${payload.edges.length} edges · graph reseeded from this node`),
       edgeTable(payload),
-    ]);
+    );
     if (state.view === "graph") drawGraph();
   } catch (error) {
     status(String(error.message ?? error), true);
@@ -553,7 +574,10 @@ function renderDetail(...nodes) {
   detail.replaceChildren();
   const close = el("button", { class: "close" }, "close");
   close.addEventListener("click", () => { detail.classList.add("hidden"); state.selected = null; });
-  detail.append(close, ...nodes);
+  // addChildren, not `append(...nodes)`: `Element.append` accepts nodes only, so a caller who passes an array gets
+  // the array stringified into a text node - which is how the detail pane came to print
+  // `[object HTMLParagraphElement],[object HTMLTableElement]` instead of a paragraph and a table.
+  addChildren(detail, [close, ...nodes]);
   detail.classList.remove("hidden");
 }
 
@@ -564,17 +588,32 @@ function show(which) {
   $("graph").classList.toggle("hidden", which !== "graph");
 }
 
-for (const button of $("tabs").querySelectorAll("button")) {
-  button.addEventListener("click", () => {
-    for (const other of $("tabs").querySelectorAll("button")) other.classList.toggle("on", other === button);
-    state.view = button.dataset.view;
-    $("detail").classList.add("hidden");
-    run();
-  });
+/**
+ * Wire the page and fetch the first view. Exported rather than run at import: a module that contacts a store the
+ * moment it is loaded cannot be imported by anything else, including the test that wants to render it against a
+ * canned store. The page calls this; nothing else does.
+ */
+export function boot() {
+  for (const button of $("tabs").querySelectorAll("button")) {
+    button.addEventListener("click", () => {
+      for (const other of $("tabs").querySelectorAll("button")) other.classList.toggle("on", other === button);
+      state.view = button.dataset.view;
+      $("detail").classList.add("hidden");
+      run();
+    });
+  }
+  $("go").addEventListener("click", run);
+  $("q").addEventListener("keydown", (event) => { if (event.key === "Enter") run(); });
+  for (const id of ["agent", "kind", "limit", "mode"]) $(id).addEventListener("change", run);
+
+  loadChrome()
+    .then(run)
+    .catch((error) => status(`${error.message ?? error} — the store or the auth gate is not reachable from here`, true));
 }
-$("go").addEventListener("click", run);
-$("q").addEventListener("keydown", (event) => { if (event.key === "Enter") run(); });
-for (const id of ["agent", "kind", "limit", "mode"]) $(id).addEventListener("change", run);
+
+// The render helpers are exported for the same reason a database function is: they are the part most worth testing,
+// and `[object Object]` on a screen is not something a server-side test can ever see.
+export { el, head, body, chips, kv, renderDetail, truncate };
 
 function fmt(n) { return Number(n ?? 0).toLocaleString("en-GB"); }
 function truncate(text, max) {
@@ -594,7 +633,3 @@ function ago(iso) {
   if (minutes < 60 * 24) return `${Math.round(minutes / 60)}h ago`;
   return `${Math.round(minutes / (60 * 24))}d ago`;
 }
-
-loadChrome()
-  .then(run)
-  .catch((error) => status(`${error.message ?? error} — the store or the auth gate is not reachable from here`, true));

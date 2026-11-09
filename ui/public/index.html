@@ -53,6 +53,11 @@
       <aside id="detail" class="detail hidden"></aside>
     </main>
 
-    <script type="module" src="/app.js"></script>
+    <!-- Loaded as a module and booted by name: a module that contacts the store the instant it is imported cannot be
+         rendered in a test, and this client had never been rendered in a test until it was broken on screen. -->
+    <script type="module">
+      import { boot } from "/app.mjs";
+      boot();
+    </script>
   </body>
 </html>
