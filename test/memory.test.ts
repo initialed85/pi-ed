@@ -427,6 +427,56 @@ describe("recording a branch", () => {
     expect((rowsFromBranch!(unsettled, {}) as any[]).filter((row) => row.meta.dream_turn === true).map((row) => row.sourceEntryId)).toEqual(["d1", "d2"]);
   });
 
+  it("closes a dream at its settling turn and re-opens only for a dream row that arrives later", async () => {
+    const { rowsFromBranch } = await loadModule();
+    // The rule the offline repair has to mirror, in one branch. Residue is not "everything a dream touched"; it is a
+    // union of short turns - the prompt plus the turn it closes, and then each `memory_dream` row plus the turn it
+    // re-arms. Everything between those windows is work, and this is where the two implementations fell out: the
+    // tagger closes and re-arms row by row, while the repair looked for one boundary per dream and, finding a stray
+    // `memory_dream` result 248 rows on, treated a whole day of editing as the dream's own.
+    const branchWithLateDream: any[] = [
+      { type: "custom", id: "p1", customType: "memory:dream", timestamp: "2026-11-08T09:00:00.000Z", content: "You are dreaming." },
+      { type: "message", id: "a2", timestamp: "2026-11-08T09:00:05.000Z", message: { role: "assistant", content: [{ type: "text", text: "declining: the stretch was thin" }] } },
+      { type: "custom", id: "s3", customType: "turn-stats", timestamp: "2026-11-08T09:00:07.000Z", content: "settled" },
+      // Real work, in its own settled turns, with no dream in any of it.
+      { type: "message", id: "w4", timestamp: "2026-11-08T09:05:00.000Z", message: { role: "assistant", content: [{ type: "toolCall", name: "bash", arguments: { command: "npm run check" } }] } },
+      { type: "message", id: "w5", timestamp: "2026-11-08T09:05:10.000Z", message: { role: "toolResult", toolName: "bash", toolCallId: "call-1", isError: false, content: [{ type: "text", text: "431 passed" }] } },
+      { type: "custom", id: "s6", customType: "turn-stats", timestamp: "2026-11-08T09:05:12.000Z", content: "settled" },
+      // A dream row arriving late re-arms the tag for its own turn and nothing wider.
+      { type: "message", id: "d7", timestamp: "2026-11-08T10:30:00.000Z", message: { role: "assistant", content: [{ type: "toolCall", name: "memory_dream", arguments: { summary: "the check passed" } }] } },
+      { type: "message", id: "d8", timestamp: "2026-11-08T10:30:05.000Z", message: { role: "toolResult", toolName: "memory_dream", toolCallId: "call-2", isError: false, content: [{ type: "text", text: "dream recorded" }] } },
+      { type: "custom", id: "s9", customType: "turn-stats", timestamp: "2026-11-08T10:30:07.000Z", content: "settled" },
+      { type: "message", id: "w10", timestamp: "2026-11-08T10:35:00.000Z", message: { role: "assistant", content: [{ type: "toolCall", name: "bash", arguments: { command: "git push" } }] } },
+    ];
+    const residue = (rowsFromBranch!(branchWithLateDream, {}) as any[])
+      .filter((row) => row.meta.dream_turn === true).map((row) => row.sourceEntryId);
+    expect(residue).toEqual(["p1", "a2", "s3", "d7", "d8", "s9"]);
+    // The work between the two dreams is visible to the gate. Four rows, which is over the floor of four, so a later
+    // dream is asked about real editing rather than told the session did nothing for ninety minutes.
+    expect((rowsFromBranch!(branchWithLateDream, {}) as any[])
+      .filter((row) => row.meta.dream_turn !== true).map((row) => row.sourceEntryId)).toEqual(["w4", "w5", "s6", "w10"]);
+  });
+
+  it("treats research done inside a dream turn as residue, and that is a decision rather than an oversight", async () => {
+    const { rowsFromBranch } = await loadModule();
+    // The finding worth being blunt about: a dream turn that researches before calling the tool hides that research
+    // from the work count. It was measured rather than assumed, and on this fleet it amounts to one tagged tool call
+    // in total, because the agents call the tool on the row after the prompt. Splitting machinery from work sounds
+    // tidy and buys nothing at that size, while costing the guard its point: the prose a model writes about whether
+    // anything was worth remembering is by far the commonest row in a dream turn, and counting it as work lets a dream
+    // satisfy the floor with dreaming alone. So this behaviour is pinned as intended, not left as a latent bug.
+    const researchDream: any[] = [
+      { type: "custom", id: "p1", customType: "memory:dream", timestamp: "2026-11-08T11:00:00.000Z", content: "You are dreaming." },
+      { type: "message", id: "q2", timestamp: "2026-11-08T11:00:10.000Z", message: { role: "assistant", content: [{ type: "toolCall", name: "web_search", arguments: { query: "pgvector hnsw m" } }] } },
+      { type: "message", id: "q3", timestamp: "2026-11-08T11:00:20.000Z", message: { role: "toolResult", toolName: "web_search", toolCallId: "call-1", isError: false, content: [{ type: "text", text: "results" }] } },
+      { type: "message", id: "d4", timestamp: "2026-11-08T11:00:30.000Z", message: { role: "assistant", content: [{ type: "toolCall", name: "memory_dream", arguments: { summary: "hnsw m is the default" } }] } },
+      { type: "message", id: "d5", timestamp: "2026-11-08T11:00:35.000Z", message: { role: "toolResult", toolName: "memory_dream", toolCallId: "call-2", isError: false, content: [{ type: "text", text: "dream recorded" }] } },
+      { type: "custom", id: "s6", customType: "turn-stats", timestamp: "2026-11-08T11:00:37.000Z", content: "settled" },
+    ];
+    const rows = rowsFromBranch!(researchDream, {}) as any[];
+    expect(rows.filter((row) => row.meta.dream_turn === true).map((row) => row.sourceEntryId)).toEqual(["p1", "q2", "q3", "d4", "d5", "s6"]);
+  });
+
   it("records markers and compactions, and skips harness bookkeeping", async () => {
     const { rowsFromBranch } = await loadModule();
     const rows = rowsFromBranch!(branch(), {}) as any[];
