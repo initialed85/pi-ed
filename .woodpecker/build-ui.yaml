@@ -26,7 +26,8 @@
 #
 # The path filter is the difference between this lane and the gate. A docs-only commit to the extensions must not
 # rebuild an image, because rebuilding it stamps a new sha into home-ops and Argo rolls the Deployment, which restarts
-# a pod for a change that cannot affect it. The include list is exactly the Dockerfile's build context.
+# a pod for a change that cannot affect it. The include list is the Dockerfile's build context plus the two test files
+# this lane runs as its gate - see the comment on the filter for why those belong there too.
 steps:
   - name: test-ui
     image: docker.io/library/node:22
@@ -122,6 +123,15 @@ when:
     path:
       include:
         - ui/**
+        # The tests this lane runs as its gate. Leaving them out is what bit this lane on 2026-11-09: the push that
+        # fixed the reading room selected `build-ui`, the follow-up housekeeping push auto-cancelled it (Woodpecker
+        # cancels a running pipeline on the same branch when a newer push arrives), and the follow-up touched only
+        # `.gitignore` - which is not in this list - so the lane never ran again and the fix sat in master undeployed.
+        # A gate that watches a test file only when some other file changed is not a gate. The cost is honest: a
+        # test-only change now rebuilds an image and rolls the pod, which is also what it means for the deployed
+        # image to always be the one these tests just validated at this commit.
+        - test/memory-ui.test.ts
+        - test/memory-ui-client.test.ts
         - package.json
         - package-lock.json
         - .dockerignore
