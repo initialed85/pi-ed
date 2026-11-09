@@ -3,3 +3,8 @@ coverage/
 .vitest-cache/
 *.log
 .pi/auto-resume.json
+
+# Pi session artifacts: uploads and images the agent was shown. They belong to the session, not
+# to the repository, and `git add -A` will otherwise commit a screenshot of someone’s screen into a public repo -
+# which is exactly what happened in cdfbaa5.
+.slopyphus/
