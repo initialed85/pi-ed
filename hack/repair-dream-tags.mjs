@@ -37,6 +37,9 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const APPLY = process.argv.includes("--apply");
+// Ask for the boundary count on its own. Without it the only time the invariant is visible is when the windows above
+// found nothing, and a guard whose universe is four rows looks identical on screen to a fleet with no damage at all.
+const CHECK = process.argv.includes("--check");
 
 // A row is over-tagged when a `turn-stats` sits between it and the nearest dream prompt behind it *and* nothing
 // re-armed after that boundary. That second clause is the difference between this check and a naive one: a dream row
@@ -45,29 +48,56 @@ const APPLY = process.argv.includes("--apply");
 // rule cannot quietly agree with itself.
 const INVARIANT = `
   with tagged as (
-    select e.session_id, e.seq, e.tool_name,
+    select e.session_id, e.seq, e.tool_name, e.kind,
+           -- The last thing that could have armed the tag, and the last human message that could have cleared it. A
+           -- user turn disarms before any tagging, so an armer behind one is void: without this clause a session that
+           -- dreamed once looks permanently mid-dream.
+           (select coalesce(max(u.seq), -1) from memory.event u
+              where u.session_id = e.session_id and u.seq < e.seq and u.kind = 'user') as last_user,
            (select max(m.seq) from memory.event m
               where m.session_id = e.session_id and m.seq < e.seq
-                and m.kind = 'marker' and m.meta ->> 'customType' = 'memory:dream') as nearest_prompt,
-           (select max(s.seq) from memory.event s
-              where s.session_id = e.session_id and s.seq < e.seq
-                and s.meta ->> 'customType' = 'turn-stats') as nearest_boundary
+                and m.kind = 'marker'
+                and (m.tool_name = 'memory:dream' or m.meta ->> 'customType' = 'memory:dream')) as nearest_prompt,
+           (select max(d.seq) from memory.event d
+              where d.session_id = e.session_id and d.seq < e.seq
+                and d.tool_name = 'memory_dream' and d.kind <> 'marker') as nearest_dream_row,
+           -- A dream row arms the window and is then tagged by its own arming, in that order, so for such a row the
+           -- armer is the row itself. Omit this and the check looks back to the *previous* dream, finds the
+           -- turn-stats that legitimately closed it, and reports a correct tag as damage - which is exactly how a
+           -- first version of this query reported six violations, five of them invented.
+           (case when e.tool_name = 'memory_dream' then e.seq else -1 end) as self_arm
     from memory.event e
-    where e.kind = 'tool_call' and coalesce(e.meta ->> 'dream_turn', 'false') = 'true'
-      and e.tool_name <> 'memory_dream'
+    where e.kind in ('tool_call', 'tool_result')
+      and coalesce(e.meta ->> 'dream_turn', 'false') = 'true'
+  ),
+  armed as (
+    select tagged.*, greatest(nearest_prompt, nearest_dream_row, self_arm) as arm
+    from tagged
+    where greatest(nearest_prompt, nearest_dream_row, self_arm) > last_user
   )
   select count(*) filter (
-           where nearest_prompt is not null
-             and nearest_boundary is not null
-             and nearest_boundary > nearest_prompt
-             and not exists (
-               select 1 from memory.event d
-                where d.session_id = tagged.session_id and d.tool_name = 'memory_dream'
-                  and d.seq < tagged.seq and d.seq > tagged.nearest_boundary
-             )
+           -- Tagged, with a settled turn sitting between the thing that armed it and itself, and no dream row
+           -- arriving after that turn to re-arm. That last clause is what separates damage from a dream that simply
+           -- arrived late in a turn.
+           where exists (
+             select 1 from memory.event s
+              where s.session_id = armed.session_id and s.seq > armed.arm and s.seq < armed.seq
+                and s.kind = 'marker'
+                and (s.tool_name = 'turn-stats' or s.meta ->> 'customType' = 'turn-stats')
+           )
+           and not exists (
+             select 1 from memory.event d
+              where d.session_id = armed.session_id and d.tool_name = 'memory_dream' and d.kind <> 'marker'
+                and d.seq < armed.seq and d.seq > coalesce(
+                  (select min(s2.seq) from memory.event s2
+                    where s2.session_id = armed.session_id and s2.seq > armed.arm and s2.seq < armed.seq
+                      and s2.kind = 'marker'
+                      and (s2.tool_name = 'turn-stats' or s2.meta ->> 'customType' = 'turn-stats'))
+                , 2147483647)
+           )
          ) as tagged_past_boundary,
          count(*) as tagged_tool_rows
-  from tagged`;
+  from armed`;
 
 // One region per dream: from its prompt to the next dream's prompt. A row belongs to exactly one region, which is
 // what makes the windows below safe to union - a later dream's residue can never be swallowed by an earlier one's
@@ -127,6 +157,18 @@ if (!dsn) {
 
 const pg = await import("pg");
 const db = new pg.Pool({ connectionString: dsn, max: 2 });
+
+if (CHECK) {
+  const only = await db.query(INVARIANT);
+  const bad = Number(only.rows[0].tagged_past_boundary);
+  const universe = Number(only.rows[0].tagged_tool_rows);
+  console.log(`boundary check, counted independently of the windows above:`);
+  console.log(`  ${universe} tagged tool rows in the store (both kinds, dream rows included and treated as arming themselves)`);
+  console.log(`  ${bad} of them tagged past a turn-stats boundary with nothing re-arming behind it`);
+  console.log(bad === 0 ? "  the tagger's boundary rule is holding on live data." : "  the boundary rule is NOT holding; the repair below should be run and the window rule believed only after both agree.");
+  await db.end();
+  process.exit(bad === 0 ? 0 : 1);
+}
 
 const { rows } = await db.query(
   `${WINDOWS}
