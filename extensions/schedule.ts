@@ -652,6 +652,24 @@ function matchZone(tokens: string[], index: number): { tz: string; used: number 
   return null;
 }
 
+/**
+ * The three delivery modes, read honestly.
+ *
+ * The CLI is strict and errors on `--deliver bogus`, but the storage layer cannot be: a job file is older than the
+ * code reading it, and a value that was invalid when written must not brick every other schedule in the file. So it
+ * falls back to `followUp`. That asymmetry is the trap - an operator who believes a job is set to `steer` gets a
+ * quiet `followUp` and no indication why.
+ *
+ * The fallback is kept, because a broken schedule is worse than a default one, but it is stamped rather than hidden:
+ * `list` and `show` say the value out loud, so the default never looks like a choice.
+ */
+export function readDeliverAs(value: unknown): { deliverAs: DeliverAs; deliverAsUnread?: string } {
+  if (value === "steer" || value === "followUp" || value === "nextTurn") return { deliverAs: value };
+  // Absent is not unreadable; it is the default, and saying so would be noise.
+  if (value === undefined || value === null || value === "") return { deliverAs: "followUp" };
+  return { deliverAs: "followUp", deliverAsUnread: String(value) };
+}
+
 function skipTimeNoise(tokens: string[], index: number): number {
   let cursor = index;
   while (TIME_NOISE.has((tokens[cursor] ?? "").toLowerCase().replace(/[,.;]/g, ""))) cursor++;
@@ -682,6 +700,18 @@ export function parseWhen(tokens: string[], tz: string, now: number): ParsedWhen
   if (leading === "every" || leading === "each" || leading === "daily" || leading === "hourly" || leading === "weekly" || leading === "monthly") {
     const parsed = parseRecurrence(tokens, 0, zone, now);
     if (parsed) return parsed;
+  }
+
+  // A leading `cron` keyword is accepted because it is what this file itself prints: the summary of a cron job
+  // renders as `cron 0 10 * * *`, and an agent that copies what it was shown must not be told the string is
+  // unreadable. Before this the round trip was lossy in exactly the direction that matters - `list` emitted a shape
+  // `add` rejected - and it failed silently rather than loudly, because `cron 0 6 * *` (the first five tokens) is
+  // itself a *parseable-looking* candidate: letters are legal in a day-of-week field, so the shape test let the
+  // keyword through and the expression died in parseCron. Reuse the rest of the parser rather than duplicating it,
+  // so the quoted form `cron "0 6 * * 1"` works for free too.
+  if (leading === "cron" && tokens.length > 1) {
+    const stripped = parseWhen(tokens.slice(1), zone, now);
+    if (stripped) return { ...stripped, rest: stripped.rest + 1 };
   }
 
   // A cron expression, quoted (one token, or a quoted run of tokens) or as five loose tokens.
@@ -879,6 +909,11 @@ interface Job {
   /** Skip the occurrence rather than queue it when this Pi is mid-answer. */
   skipIfBusy: boolean;
   deliverAs: DeliverAs;
+  /**
+   * Set when the stored value could not be read as a delivery mode and `deliverAs` is the fallback rather than a
+   * choice. See `readDeliverAs`.
+   */
+  deliverAsUnread?: string;
   catchupMs: number;
   announce: boolean;
   /** Match peers by path suffix instead of the working directory itself. */
@@ -1169,6 +1204,7 @@ export default function (pi: ExtensionAPI) {
     enabled?: boolean;
     skipIfBusy?: boolean;
     deliverAs?: DeliverAs;
+    deliverAsUnread?: string;
     catchupMs?: number;
     announce?: boolean;
     repo?: string;
@@ -1189,7 +1225,8 @@ export default function (pi: ExtensionAPI) {
       schedule: serializeSchedule(input.schedule),
       enabled: input.enabled !== false,
       skipIfBusy: input.skipIfBusy === true,
-      deliverAs: input.deliverAs === "steer" || input.deliverAs === "nextTurn" ? input.deliverAs : "followUp",
+      deliverAs: readDeliverAs(input.deliverAs).deliverAs,
+      deliverAsUnread: readDeliverAs(input.deliverAs).deliverAsUnread,
       catchupMs: input.catchupMs ?? defaultCatchup,
       announce: input.announce !== false,
       repo: input.repo?.trim() || undefined,
@@ -1247,7 +1284,8 @@ export default function (pi: ExtensionAPI) {
         owner: typeof record.owner === "string" ? record.owner : declaredDefaults.owner,
         enabled: record.enabled !== false,
         skipIfBusy: record.skip_if_busy === true || record.skipIfBusy === true,
-        deliverAs: record.deliver_as === "steer" || record.deliver_as === "nextTurn" ? (record.deliver_as as DeliverAs) : "followUp",
+        deliverAs: readDeliverAs(record.deliver_as).deliverAs,
+        deliverAsUnread: readDeliverAs(record.deliver_as).deliverAsUnread,
         catchupMs: catchupText === "always" ? Number.POSITIVE_INFINITY : catchupText === "none" ? 0 : catchupText ? (matchDuration(catchupText.split(/\s+/), 0)?.ms ?? undefined) : undefined,
         announce: record.announce !== false,
         repo: typeof record.repo === "string" ? record.repo : declaredDefaults.repo,
@@ -1300,7 +1338,8 @@ export default function (pi: ExtensionAPI) {
           owner: record.owner,
           enabled: record.enabled,
           skipIfBusy: record.skipIfBusy,
-          deliverAs: record.deliverAs === "steer" || record.deliverAs === "nextTurn" ? record.deliverAs : "followUp",
+          deliverAs: readDeliverAs(record.deliverAs).deliverAs,
+          deliverAsUnread: readDeliverAs(record.deliverAs).deliverAsUnread,
           catchupMs: record.catchupMs,
           announce: record.announce,
           repo: record.repo,
@@ -1613,7 +1652,7 @@ export default function (pi: ExtensionAPI) {
 
   function jobFlags(job: Job): string {
     const catchup = job.catchupMs === Number.POSITIVE_INFINITY ? "always" : job.catchupMs > 0 ? formatDuration(job.catchupMs) : "off";
-    return [`owner ${ownerPatterns(job).join(",") || "(any session)"}`, `deliver ${job.deliverAs}`, `catch-up ${catchup}`, job.skipIfBusy ? "skip-if-busy" : "queue when busy", job.announce ? "announce" : "quiet"].join("  ");
+    return [`owner ${ownerPatterns(job).join(",") || "(any session)"}`, `deliver ${job.deliverAs}${job.deliverAsUnread ? ` (unread "${job.deliverAsUnread}")` : ""}`, `catch-up ${catchup}`, job.skipIfBusy ? "skip-if-busy" : "queue when busy", job.announce ? "announce" : "quiet"].join("  ");
   }
 
   function describeJob(job: Job, now: number): string[] {
@@ -2076,13 +2115,19 @@ export default function (pi: ExtensionAPI) {
         Type.Literal("next"),
       ]),
       id: Type.Optional(Type.String({ description: "Job id (required for show, pause, resume, remove, run)" })),
-      at: Type.Optional(Type.String({ description: "When, in the shapes /at accepts: `in 20m`, `2am perth`, `every day at 2am perth`, `every 6h`, `2026-11-06T02:00`" })),
+      at: Type.Optional(Type.String({ description: "When, in the shapes /at accepts: `in 20m`, `2am perth`, `every day at 2am perth`, `every 6h`, `2026-11-06T02:00`, or a five-field cron such as `0 2 * * *`. A leading `cron` keyword is also accepted, so a string copied out of `list` can be handed straight back to `add`." })),
       cron: Type.Optional(Type.String({ description: "Cron expression such as `0 2 * * *`, alternative to `at`" })),
       prompt: Type.Optional(Type.String({ description: "Text to inject when the job fires. Self-contained: a scheduled run has no conversation context." })),
       tz: Type.Optional(Type.String({ description: "IANA zone the schedule is expressed in, for example Australia/Perth. Defaults to the machine zone." })),
       owner: Type.Optional(Type.String({ description: "Session-name pattern allowed to fire this job, for example home-ops or home-*. Empty means any session in this repository." })),
       note: Type.Optional(Type.String({ description: "Context shown with the prompt: which runbook to read, which checkout to act on." })),
       skipIfBusy: Type.Optional(Type.Boolean({ description: "Skip an occurrence instead of queueing the prompt when this session is mid-answer" })),
+      // The per-job flags a human reads in README.md have to be reachable from here too, or the tool is a subset of
+      // the CLI and an agent quietly cannot do the thing its own documentation says is possible.
+      deliverAs: Type.Optional(Type.Union([Type.Literal("followUp"), Type.Literal("steer"), Type.Literal("nextTurn")], { description: "How an occurrence reaches the agent. followUp (default) queues behind the current turn and starts one when idle; steer injects into the turn in flight; nextTurn waits for a turn to attach to and never starts one - so a nextTurn job will not fire an idle session at all." })),
+      catchup: Type.Optional(Type.String({ description: "What to do with occurrences missed while the session was down: a duration such as `2h` (fire only if the miss is recent), `none` (never fire a missed occurrence), or `always` (fire every one). Defaults to always." })),
+      repo: Type.Optional(Type.String({ description: "Repository the job belongs to, matched by path suffix. Defaults to the checkout the job was created in." })),
+      announce: Type.Optional(Type.Boolean({ description: "false to keep runs of this job out of the team room; runs are announced unless told otherwise" })),
     }),
     execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
       lastCtx = ctx;
@@ -2131,6 +2176,10 @@ export default function (pi: ExtensionAPI) {
         if (params.owner) flags.owner = params.owner;
         if (params.note) flags.note = params.note;
         if (params.skipIfBusy) flags["skip-if-busy"] = "true";
+        if (params.deliverAs) flags.deliver = params.deliverAs;
+        if (params.catchup) flags.catchup = params.catchup;
+        if (params.repo) flags.repo = params.repo;
+        if (params.announce === false) flags.announce = "false";
         const text = createJobFromParts({ zone, parsed, promptWords: [params.prompt.trim()], flags }, ctx);
         return toolText(text, { result: text });
       }

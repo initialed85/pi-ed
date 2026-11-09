@@ -13,6 +13,7 @@ import {
   occurrenceKey,
   parseCron,
   parseWhen,
+  readDeliverAs,
   previousOccurrence,
   wallToInstant,
   type Schedule,
@@ -141,6 +142,40 @@ describe("reading a when", () => {
     // 17:00 Perth now, so the next 02:00 Perth is 18:00Z the next day.
     expect((parsed!.schedule as { at: number }).at).toBe(T("2026-11-05T18:00:00Z"));
     expect(parsed!.rest).toBe(2);
+  });
+
+  it("reads back a cron string it printed itself, which is the whole point of a round trip", () => {
+    // The five loose tokens of a cron schedule were accepted, but not the shape `list` and `show` render. A summary
+    // comes out as `cron 0 10 * * *`, an agent copies it into `at`, and `add` rejected it - and rejected it
+    // confusingly, because `cron 0 6 * *` (the first five tokens) looks parseable: letters are legal in a
+    // day-of-week field, so the shape test waved the keyword through and the expression died in parseCron.
+    const loose = parseWhen(["cron", "0", "6", "*", "*", "1", "pull", "the", "repo"], PERTH, NOW);
+    expect(loose).not.toBeNull();
+    expect(loose!.schedule).toEqual(cron("0 6 * * 1", PERTH));
+    // `rest` counts the keyword too, or the prompt that follows would be read as part of the time.
+    expect(loose!.rest).toBe(6);
+    expect(loose!.summary).toBe("cron 0 6 * * 1 " + PERTH);
+    // The quoted form works for free, because the prefix is stripped and the parser re-entered.
+    expect(parseWhen(["cron", '"0 6 * * 1"'], PERTH, NOW)!.schedule).toEqual(cron("0 6 * * 1", PERTH));
+    // And a bare expression still parses exactly as it did before - the keyword is tolerated, not required.
+    expect(parseWhen(["0", "6", "*", "*", "1"], PERTH, NOW)!.schedule).toEqual(cron("0 6 * * 1", PERTH));
+    // The keyword alone is not a schedule, and must not be mistaken for one.
+    expect(parseWhen(["cron"], PERTH, NOW)).toBeNull();
+  });
+
+  it("stamps a delivery mode it could not read instead of letting the default look like a choice", () => {
+    // The CLI refuses `--deliver bogus`, but the storage layer cannot - a job file outlives the code that reads it,
+    // and one bad value must not brick every other schedule. So it falls back, and the trap was that the fallback
+    // was silent: an operator who believed a job was set to `steer` was getting `followUp` with no indication.
+    expect(readDeliverAs("steer")).toEqual({ deliverAs: "steer" });
+    expect(readDeliverAs("nextTurn")).toEqual({ deliverAs: "nextTurn" });
+    expect(readDeliverAs("followUp")).toEqual({ deliverAs: "followUp" });
+    // Absent is the default, not a mistake, and must not be reported as one.
+    expect(readDeliverAs(undefined)).toEqual({ deliverAs: "followUp" });
+    expect(readDeliverAs("")).toEqual({ deliverAs: "followUp" });
+    // Unreadable is still the safe fallback, but it says so.
+    expect(readDeliverAs("steer" + "r")).toEqual({ deliverAs: "followUp", deliverAsUnread: "steerr" });
+    expect(readDeliverAs("immediate")).toEqual({ deliverAs: "followUp", deliverAsUnread: "immediate" });
   });
 
   it("turns a recurrence phrase into a cron in the named zone", () => {

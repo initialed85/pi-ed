@@ -185,10 +185,11 @@ jq -r '[(.at / 1000 | todate), .op, .id, .key, .session, .node] | @tsv' .pi/sche
 | | |
 | --- | --- |
 | Commands | `/at <when> <prompt>` · `/every <recurrence> <prompt>` · `/cron <expr> <prompt>` · `/schedule <verb>` |
-| Tool | `schedule_jobs` — `list · show · add · pause · resume · remove · run · next`; `add` writes local jobs only |
+| Tool | `schedule_jobs` — `list · show · add · pause · resume · remove · run · next`; `add` writes local jobs only, and accepts the per-job flags below as parameters (`deliverAs`, `catchup`, `repo`, `announce`, `owner`, `note`, `tz`, `skipIfBusy`) so the tool is not a subset of the CLI |
 | Flags | `--schedules-off` · `--schedule-name <name>` · `--schedule-tz <IANA>` · `--schedule-tick <ms>` |
 | Env | `SCHEDULE_OFF` · `SCHEDULE_NAME` · `SCHEDULE_TZ` · `SCHEDULE_TICK_MS` · `SCHEDULE_REQUIRE_OWNER` · `SCHEDULE_STATE_DIR` · `PI_TEAM_ROOM_STATE` · `NODE_NAME` |
 | Per job | `--tz` · `--owner <pattern>` · `--note <text>` · `--id <name>` · `--deliver followUp\|steer\|nextTurn` · `--catchup <dur>\|none\|always` · `--skip-if-busy` · `--quiet` · `--repo <path>` |
+| Round trip | `list`/`show` render a cron schedule as `cron 0 10 * * * <tz>`, and `add` accepts that string back verbatim — a leading `cron` keyword is tolerated, because an agent copies what it was shown and should not be told its own output is unreadable |
 | State | `.pi/schedule.json` (committed) · `.pi/schedule/jobs.jsonl` · `.pi/schedule/events.jsonl` · `.pi/schedule/locks/<job>/<occurrence>.lock` |
 | Knobs | `DEFAULT_TICK_MS` (20000), `DEFAULT_CATCHUP_MS` (3h), `CATCHUP_PERIOD_CAP_MS` (24h), `LOCK_PRUNE_MS` (30d), `CRON_SEARCH_DAYS` (800), `TEAM_STALE_MS` (90000, pi-team-room's own window) |
 
