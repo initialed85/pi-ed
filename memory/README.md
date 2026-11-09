@@ -117,10 +117,32 @@ disappear three ways:
 1. **candidate-window starvation** - hnsw takes `p_limit * 5` nearest neighbours before weighting is applied, so with
    `limit 1` the window is five rows wide and an own row that is merely farther cannot enter it;
 2. **the `p_since` window**, which is a deliberate age cut, not a bug;
-3. **identity drift**, which is the interesting one. `agentIdentity` is a config override, else the session name, else
-   `host:directory` - deliberately *not* repo-scoped, so that one agent in two repositories stays one agent. That
-   choice is also what makes drift possible: rename a session, move a checkout, or run on another host, and the id
-   your rows were written under stops being the id that searches.
+3. **identity drift**, which is the interesting one, and the one most easily acquired by accident.
+
+### The agent_id chain, in the order it is consulted
+
+`agentIdentity` (`extensions/memory.ts`) resolves in four links, first non-empty wins:
+
+1. **`cfg.agent`** — a config override, either `~/.pi/agent/memory.json` or `.pi/memory.json` in the checkout (the
+   repo file wins; the two are merged key by key). This beats everything *including an explicit session name*, so
+   `"agent": "ocr"` is the one setting that makes the id stable regardless of how the process was launched.
+2. **`getSessionName()`** — what `pi --name <x>` passes. This is what every pod in slopyphus actually resolves through,
+   because the launcher runs `pi --name $NAME`.
+3. **`process.env.NAME`** — the deployment's exported name. Caught here if the session name is absent.
+4. **`hostname():basename(cwd)`** — the last resort for a plain `pi` opened in a directory.
+
+It is deliberately **not** repo-scoped: one agent working in two repositories is one personality with two workplaces,
+and the repository travels on the session row instead. That choice is also what makes drift possible — rename a
+session, move a checkout, or run on another host, and the id your rows were written under stops being the id that
+searches.
+
+**The consequence of link 4 that cost an incident.** In slopyphus `hostname()` is the *pod name* —
+`camry-7fdf5564b8-mnjmb` — which Kubernetes regenerates on every rollout. Before `01b6df7` the fallback was the bare
+hostname, so an agent that reached link 4 would write memories under one id, come back after a deploy under another,
+and never find the first ones again: **identity rotated on every rollout, silently, and the memories did not.**
+`01b6df7` inserted `NAME` ahead of the host and qualified the host with the directory, so the last resort is at least
+stable across restarts. The blast radius on the day was zero only because every pod passes `--name`, which is luck,
+not design — so if you want stability *by design*, set link 1.
 
 The pair that tells them apart is two counts, not a ranking:
 
