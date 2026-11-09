@@ -28,9 +28,16 @@
  *   PI_LIVE_DSN="$DSN" node hack/recall-probe.mjs --live          # known-good rows in the real corpus
  *   PI_LIVE_DSN="$DSN" node hack/recall-probe.mjs --jsonl f.jsonl # append one record per run
  *
- * The floor is the baseline that was measured when this was written, not an aspiration. Five of six fixture questions
- * come back, three of those first, giving MRR 0.667; one is a documented vocabulary miss. Raising it later is the
- * actual win condition.
+ * The floor is the baseline that was measured when this was written, not an aspiration. All six fixture questions
+ * come back, three of them first, giving MRR 0.750; the other three sit at rank 2. Raising it further is the actual
+ * win condition.
+ *
+ * The floor is only meaningful because fixture mode is hermetic: it ranks within the corpus it plants, so the number
+ * does not move when the fleet grows. See the comment at the search for the red gate this was written to fix.
+ *
+ * The margin is deliberate. At a 0.6 floor against a 0.750 baseline, one question demoting from rank 1 to rank 2
+ * costs 0.083 and stays green, while two demotions cost 0.167 and go red. A gate that reddens on a single shuffle
+ * trains people to ignore it, and a gate that cannot see a collapse was never a gate.
  */
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -158,8 +165,17 @@ try {
   for (const item of (live ? LIVE_CASES : QUESTIONS)) {
     const embedded = await mod.embedText(item.q, {});
     if (!embedded.ok) throw new Error(`question could not be embedded: ${embedded.error}`);
-    const statement = mod.vectorSearch(live ? item.agent : AGENT, embedded.vector, { limit: 8 });
-    const rows = (await q(statement.sql, statement.values)).rows;
+    const statement = mod.vectorSearch(live ? item.agent : AGENT, embedded.vector, { limit: live ? 8 : 50 });
+    const fetched = (await q(statement.sql, statement.values)).rows;
+    // The fixture mode and the live mode ask different questions, and the difference has to be enforced or the gate
+    // is noise. `memory_search` deliberately spans every agent - own rows and others' rows, weighted - so a fixture
+    // that searches the whole store is measuring the fleet, not the embedder. That is not hypothetical: when the
+    // rollout added fifteen real memories, the "fixture" MRR fell from 0.667 to 0.583 with no code change at all and
+    // the gate went red on a corpus that had simply grown. So fixture mode widens the window (the hnsw candidate set
+    // is limit * 5, and a narrow limit can starve a planted row out of it entirely, which is a different failure from
+    // ranking it badly) and then ranks within the rows it planted. The relative order of those rows is set by cosine
+    // similarity and the fixed own/other weights, so it holds however large the store becomes.
+    const rows = live ? fetched : fetched.filter((row) => row.agent_id === AGENT || row.agent_id === OTHER);
     // Fixture mode matches the whole planted sentence, which is exact and cannot false-positive. Live mode matches the
     // row's primary key, and separately reports whether that row is still in the store, because "the agent forgot to
     // say that" and "the agent said it and nothing can find it" are different findings that a rank alone conflates.
