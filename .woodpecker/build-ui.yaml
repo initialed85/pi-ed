@@ -53,6 +53,13 @@ steps:
 
   - name: build-and-push
     image: docker.io/library/docker:cli
+    # Not decoration, and not for the docker client: this step reaches a dockerd over `DOCKER_HOST` and would build
+    # perfectly well unprivileged. It is Woodpecker's gate that makes it a declaration - `pipeline/frontend/yaml/linter`
+    # rejects any `privileged` step on a repository whose `security` trust bit is false, and it does so at parse time:
+    # the pipeline lands in `error` with zero steps, so nothing is scheduled and the only trace is the linter entry on
+    # the pipeline's Errors tab. Measured the day this lane was written, when pi-ed had never needed a privileged step
+    # before and therefore had never been given the bit. `network` and `volumes` stay false; only `security` is asked
+    # for, because only `privileged` is used.
     privileged: true
     depends_on: [test-ui]
     environment:
@@ -111,4 +118,7 @@ when:
         - package.json
         - package-lock.json
         - .dockerignore
+        # The lane itself. A change to how the image is built is a change to the image, and a lane that cannot re-run
+        # itself is a lane whose fix has to be smuggled in through a file it does not build.
+        - .woodpecker/build-ui.yaml
   - event: manual
