@@ -40,6 +40,14 @@
  * being residue when the turn ends, not when the user next speaks, or every later turn - a teammate steer, a
  * scheduled prompt, a resume - is tagged as dreaming and the memory system stops being told that work happened at
  * all. See `closeDreamTurn`, `minDreamWork` and `dreamFloorFor`.
+ *
+ * Both of the incidents this file has carried share one shape, and naming it is worth more than the two fixes, because
+ * the third instance is already written somewhere: **state that lives only in process memory, or only in a hostname,
+ * is not state - it is a coincidence.** The dream boundary was a single in-memory entry id, so a rollout lost it and
+ * every session reopened the blindness on resume (`01e47e0` reads it from the transcript instead). The agent identity
+ * fell back to `hostname()`, which in Kubernetes is the pod name, so it regenerated on every deploy and the memories
+ * did not follow (`01b6df7` puts `NAME` ahead of it). The test for anything here is whether it survives the process
+ * that needed it: if not, it belongs in the store or in the transcript, not in a variable.
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";

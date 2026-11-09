@@ -190,6 +190,14 @@ jq -r '[(.at / 1000 | todate), .op, .id, .key, .session, .node] | @tsv' .pi/sche
 | Env | `SCHEDULE_OFF` · `SCHEDULE_NAME` · `SCHEDULE_TZ` · `SCHEDULE_TICK_MS` · `SCHEDULE_REQUIRE_OWNER` · `SCHEDULE_STATE_DIR` · `PI_TEAM_ROOM_STATE` · `NODE_NAME` |
 | Per job | `--tz` · `--owner <pattern>` · `--note <text>` · `--id <name>` · `--deliver followUp\|steer\|nextTurn` · `--catchup <dur>\|none\|always` · `--skip-if-busy` · `--quiet` · `--repo <path>` |
 | Round trip | `list`/`show` render a cron schedule as `cron 0 10 * * * <tz>`, and `add` accepts that string back verbatim — a leading `cron` keyword is tolerated, because an agent copies what it was shown and should not be told its own output is unreadable |
+
+The invariant, because it was violated for a long time and is easy to re-violate: **every per-job flag must be
+reachable from the tool, not just from the CLI.** `deliverAs`, `catchup`, `repo` and `announce` were documented here
+and plumbed only into the human command, so `schedule_jobs` could not set them at all — which meant the README was
+accurately describing a capability an agent did not have. The worst case was `nextTurn`, the one flag that stops a
+scheduled prompt starting a turn in an idle session, because that is exactly what an agent reaches for when its
+schedules are colliding with live work. If a flag is added to `applyFlags`, it goes in the tool schema and the
+`add` path in the same change.
 | State | `.pi/schedule.json` (committed) · `.pi/schedule/jobs.jsonl` · `.pi/schedule/events.jsonl` · `.pi/schedule/locks/<job>/<occurrence>.lock` |
 | Knobs | `DEFAULT_TICK_MS` (20000), `DEFAULT_CATCHUP_MS` (3h), `CATCHUP_PERIOD_CAP_MS` (24h), `LOCK_PRUNE_MS` (30d), `CRON_SEARCH_DAYS` (800), `TEAM_STALE_MS` (90000, pi-team-room's own window) |
 
