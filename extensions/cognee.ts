@@ -1,11 +1,16 @@
 /**
  * cognee — the fleet's graph memory, spoken over HTTP.
  *
- * This replaces `parked/memory.ts` as the memory the fleet is given. The old extension wrote to a Postgres store it
- * owned; this one writes to Cognee 1.6.7 in namespace `cognee`, which ingests text, builds a knowledge graph out of
- * it (entities and relationships, via rooter for the LLM and the embeddings Service for the vectors), and answers
- * questions against that graph. Ed chose it over mem0 because mem0's FOSS build dropped the graph and the graph was
- * the point.
+ * This is the fleet's intended memory door. It writes to Cognee 1.6.7 in namespace `cognee`, which ingests text,
+ * builds a knowledge graph out of it (entities and relationships, via rooter for the LLM and the embeddings Service
+ * for the vectors), and answers questions against that graph. Ed chose it over mem0 because mem0's FOSS build dropped
+ * the graph and the graph was the point.
+ *
+ * It is not, yet, the only door. `extensions/memory.ts` (Postgres) is loaded alongside it as the recall of record —
+ * measured reasons in `parked/README.md` and in that file's banner: cognee cannot write while its embedder cannot
+ * schedule, and a fact plainly present in a stored document was not returned by `CHUNKS` after the `chunkSize: 400`
+ * rebuild. An agent that gets nothing back from cognee is told to try the other door rather than told the fleet
+ * never wrote it down, which is the difference between a memory system and a source of false negatives.
  *
  * Everything numeric here was measured on home-dev on 2026-11-10 from inside a pod, against
  * `http://cognee.cognee.svc.cluster.local:8000`, not copied from Cognee's documentation:
@@ -164,8 +169,8 @@ function readFirstFile(paths: string[]): { value?: string; source?: string } {
  *
  * `agent` is resolved last and from the caller's context rather than from the environment alone, because the
  * session name is the one identity a human chose on purpose. The rest of the fleet's fallback order lives in
- * `parked/memory.ts` and in the schedule extension; this repeats the short version rather than importing it from a
- * parked module, so a parked extension is not load-bearing for a live one.
+ * `extensions/memory.ts` and in the schedule extension; this repeats the short version rather than importing it, so
+ * two extensions that talk to two different stores do not become one extension's dependency.
  */
 export function resolveConfig(
   env: NodeJS.ProcessEnv = process.env,
@@ -225,6 +230,11 @@ export function recallPayload(input: RecallInput, cfg: Pick<CogneeConfig, "datas
     topK: Math.min(20, Math.max(1, Math.floor(input.topK ?? 5))),
     searchType: MODES[input.mode ?? "chunks"],
   };
+  // Scoped only when the caller asks for a scope, which is measured behaviour rather than an oversight: an unscoped
+  // CHUNKS query answered 200 in 1.7 s and returned fleet-ops text, the same query with datasets:["fleet-ops"]
+  // answered in 191 ms, and datasets:["memory"] — a name this key does not own — answered 404. So the default is
+  // "everything this credential can read", which is the fleet, and narrowing is the caller's choice. A default of
+  // cfg.dataset would be tidier and would break for an agent whose dataset does not exist yet.
   if (input.dataset) payload.datasets = [input.dataset];
   const tags = (input.tags ?? []).filter(Boolean);
   // Cognee validates nodeName as a list; a bare string is a 400 with a body that blames the caller.
@@ -439,7 +449,7 @@ export default function activate(api: ExtensionAPI): void {
   api.registerTool({
     name: "memory_recall",
     label: "memory_recall",
-    description: `Ask the fleet's cognee graph (this agent's dataset: ${cfg.dataset}). Default mode is chunks (verbatim stored text, sub-second); graph/hybrid modes synthesize across the graph and cost an LLM round trip (10–25 s).`,
+    description: `Ask the fleet's cognee graph. Default scope is every dataset this key can read (measured: unscoped CHUNKS answered 200 in 1.7 s and returned fleet-ops text; ${cfg.dataset} answered the same in 191 ms; a dataset the key cannot read is a 404, not an empty result). Default mode is chunks (verbatim stored text, sub-second); graph/hybrid modes synthesize across the graph and cost an LLM round trip (10–25 s). Pass dataset to narrow the search.`,
     promptSnippet: "Recall from the fleet graph (chunks = fast verbatim, graph = synthesized)",
     promptGuidelines: [
       "Run one memory_recall before web_search or a guess about something this fleet already settled. chunks is the default for a fact; graph only when the question spans several notes.",
@@ -467,7 +477,13 @@ export default function activate(api: ExtensionAPI): void {
         if (!result.ok) return { content: [{ type: "text", text: describeFailure(result, "memory_recall") }], details: { error: `http ${result.status}` } };
         const formatted = formatRecall(result.body, params.dataset ?? cfg.dataset);
         const head = `${formatted.hits} result(s) · ${mode} · ${result.ms} ms${formatted.note ? ` · ${formatted.note}` : ""}`;
-        return { content: [{ type: "text", text: [head, formatted.text].filter(Boolean).join("\n") }], details: { hits: formatted.hits, mode, ms: result.ms } };
+        // The most damaging thing a memory system can say is "nothing matched" when something is stored. Cognee's
+        // chunk retrieval is measured to miss facts that are plainly present in the stored document (home-ops,
+        // 2026-11-10, after the chunkSize 400 rebuild), so an empty cognee answer is reported as one door being
+        // quiet, not as the fleet having forgotten.
+        const emptyHint = "Cognee returned nothing, which is not the same as nothing being stored: its chunk retrieval is measured to miss plainly-stored text. Ask memory_search (the Postgres recall of record) before concluding the fleet never wrote it down.";
+        const empty = formatted.hits ? "" : emptyHint;
+        return { content: [{ type: "text", text: [head, formatted.text, empty].filter(Boolean).join("\n") }], details: { hits: formatted.hits, mode, ms: result.ms } };
       } catch (error) {
         const message = scrub(error instanceof Error ? error.message : String(error), [cfg.key]).text.replace(/\s+/g, " ");
         return { content: [{ type: "text", text: describeCallFailure(error, cfg.url, Date.now() - started, "memory_recall") }], details: { error: message } };
@@ -489,7 +505,7 @@ export default function activate(api: ExtensionAPI): void {
       } catch (error) {
         lines.push(`status unavailable: ${scrub(error instanceof Error ? error.message : String(error), [cfg.key]).text}`);
       }
-      lines.push("parked/memory.ts is still parked; this fleet's durable memory is in cognee now.");
+      lines.push("cognee is the intended door; extensions/memory.ts (Postgres) remains loaded as the recall of record until cognee's live check proves a newly written fact is retrievable.");
       ctx.ui.notify(lines.join("\n"), "info");
     },
   });

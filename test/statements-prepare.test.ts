@@ -35,7 +35,7 @@ const PREPARE_LABEL = "pi_ed_prepare_probe";
  */
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const source = path.join(here, "..", "parked", "memory.ts");
+const source = path.join(here, "..", "extensions", "memory.ts");
 const liveDsn = process.env.PI_LIVE_DSN ?? "";
 
 type Statement = { sql: string; values: unknown[] };

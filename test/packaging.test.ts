@@ -10,7 +10,11 @@ import { createFakePi, fakeTheme, painted, type FakePi } from "./harness.ts";
 const EXTENSIONS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../extensions");
 /** Parked extensions are compiled, tested and swept against the live store, but are not in Pi's load path. */
 const PARKED_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../parked");
-const PARKED = ["memory.ts"];
+// Nothing is parked today. memory.ts was parked on 2026-11-10 while the fleet was cut over to cognee and returned to
+// service the same evening, on measurements rather than on a hunch (parked/README.md). The empty list is kept rather
+// than deleted because the suite below asserts the directory is *explained*, and an unexplained parked/ gets tidied
+// away along with the record of why something was taken out of the fleet.
+const PARKED: string[] = [];
 
 /**
  * The contract that holds for every extension in this directory, and the reason the directory can
@@ -220,16 +224,15 @@ describe("extensions directory", () => {
     expect(readdirSync(EXTENSIONS_DIR).sort()).toEqual(FILES.filter((name) => !PARKED.includes(name)).sort());
   });
 
-  it("keeps the parked set parked, and says why in the file Pi will not load", () => {
-    // The reason matters as much as the state here: a directory someone cannot explain gets moved back "while we are
-    // in there", and the memory extension is parked because a fleet is being cut over to cognee, not because it broke.
+  it("keeps the parked directory explainable even when it holds nothing", () => {
+    // The directory is allowed to be empty of code but not of reasons: an unexplained `parked/` gets tidied away, and
+    // with it goes the record of why an extension was taken out of the fleet and what measurement put it back. Today
+    // it holds no extension because memory.ts returned to service; the README still has to say what was parked, why,
+    // and what proved the parking was wrong.
     expect(readdirSync(PARKED_DIR).filter((name) => name.endsWith(".ts")).sort()).toEqual([...PARKED].sort());
     const why = readFileSync(path.join(PARKED_DIR, "README.md"), "utf8");
     expect(why).toContain("cognee");
-    for (const name of PARKED) {
-      expect(existsSync(path.join(EXTENSIONS_DIR, name)), `${name} is in extensions/ and therefore loaded`).toBe(false);
-      expect(readFileSync(path.join(PARKED_DIR, name), "utf8"), name).toContain("PARKED");
-    }
+    expect(why).toContain("returned to service");
   });
 
   it("holds no file that something else manages", () => {

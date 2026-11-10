@@ -36,9 +36,11 @@ class registries.
 
 ## The extensions
 
-Eleven of them live in `extensions/` and are what `pi install git:github.com/initialed85/pi-ed` loads. One more,
-`memory.ts`, is in **`parked/`**: compiled, tested and swept against the live store, but outside the directory Pi
-discovers, so no session is given its tools. `parked/README.md` says why and how to bring it back.
+Thirteen of them live in `extensions/` and are what `pi install git:github.com/initialed85/pi-ed` loads. Nothing is
+currently in **`parked/`**, which used to hold `memory.ts`: it was taken out of the load path on 2026-11-10 while the
+fleet was cut over to cognee and returned to service the same evening, on measurements — cognee could neither write
+nor reliably retrieve. `parked/README.md` keeps the whole episode, including what has to be proven before cognee
+becomes the only memory door.
 
 `turn-stats.ts` is documented in its own file header: it replaces the client's guesses
 about throughput and timing with the numbers Rooter already publishes in response headers, drawn as one
@@ -307,10 +309,13 @@ the Secret has no memory tools rather than a tool that always fails.
 
 ### `memory.ts` — what an agent remembers tomorrow
 
-**Parked since 2026-11-10.** It lives in `parked/memory.ts`, so Pi does not load it and no agent in the fleet is given
-`memory_search` or `memory_dream` while cognee (above) carries the fleet instead. Everything below describes an extension that
-works and is still tested; the store, the reading room and the MCP server are untouched by the parking. Skip this
-section until it moves back.
+**Back in the load path since 2026-11-10, as the recall of record.** It was parked for part of that day while cognee
+was expected to carry the fleet alone, and un-parked when the measurements came in: cognee answers 409 on every
+foreground write while its embedder cannot schedule, its `CHUNKS` retrieval missed a fact plainly present in the
+stored document after the `chunkSize: 400` rebuild, and the Postgres store answered a lexical query throughout the
+same outage. So the fleet is given two doors with different names — `memory_remember` / `memory_recall` / `/cognee`
+for cognee, `memory_search` / `memory_dream` for this one — and `parked/README.md` states the three measurements that
+have to pass before cognee is trusted alone.
 
 Nothing Pi does today survives a machine being rebuilt. This puts the session itself in Postgres: every turn
 recorded raw, and a smaller set of things the agent decided were worth remembering, in `pi_ed` on home-dev

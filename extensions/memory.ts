@@ -1,7 +1,34 @@
 /**
- * PARKED (2026-11-10): this extension is not in `extensions/`, so `pi install git:github.com/initialed85/pi-ed` does not
- * load it and no agent is given `memory_search` or `memory_dream`. The fleet is cutting over to mem0 for a while - see
- * `parked/README.md` for the reason, what is unaffected, and the one command that puts it back.
+ * memory — the Postgres store, back in the load path on 2026-11-10.
+ *
+ * It was parked the same day while the fleet was cut over to cognee; `parked/README.md` keeps the reason, the
+ * measurements and the history, including the fact that the cutover target changed from mem0 to cognee within hours.
+ *
+ * It is un-parked because cognee cannot yet be the only door an agent has, and every clause below is measured rather
+ * than felt:
+ *
+ *   - cognee cannot write at all while its embedder cannot schedule: every foreground `remember` answers 409 with
+ *     "Embedding connection test timed out after 30s", and a background write answers 200 while storing nothing.
+ *   - even where a fact is plainly present in the stored raw document, Cognee's `CHUNKS` search did not return it
+ *     after the `chunkSize: 400` rebuild, and `RAG_COMPLETION` refused it too (home-ops, 2026-11-10). Retrieval, not
+ *     composing, is the weak axis — and retrieval is the whole point of a memory system.
+ *   - this store answered during the same outage: a lexical query returned recent dreams, and 139 of 139 rows carry a
+ *     vector. Cognee's `CHUNKS` door also answered while the embedder was down (250–480 ms, relevant chunks on three
+ *     different questions) — which is worth saying plainly because the assumption on the morning was that cognee would
+ *     be entirely dark. It is not: it cannot write and cannot build a graph, but it can still read back stored text.
+ *     Read quality is the open question, not read availability.
+ *
+ * So the fleet is given two doors with distinct names and no ambiguity about which store each one touches:
+ *
+ *   - `memory_remember` / `memory_recall` / `/cognee` — cognee. The graph, and the intended write path.
+ *   - `memory_search` / `memory_dream` — this extension. Postgres: the recall of record, still writable precisely
+ *     because writing is the one thing cognee currently cannot do.
+ *
+ * The interim has an end condition, and it is a measurement rather than a date. `hack/cognee-live-check.mjs` must
+ * show that a marker written now is retrievable from `CHUNKS`, that `/data/count` really moves when a write is
+ * accepted, and that a delete removes the credential the note carried (`--prove-delete`). Until all three hold, both
+ * doors stay open. Meanwhile the migration is not finished even though it looks finished: anything this store
+ * receives after the 139 exported rows needs a second pass, so the ledger wants an export watermark, not a tally.
  */
 
 /**

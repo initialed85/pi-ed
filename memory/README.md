@@ -144,7 +144,7 @@ disappear three ways:
 
 ### The agent_id chain, in the order it is consulted
 
-`agentIdentity` (`parked/memory.ts`) resolves in four links, first non-empty wins:
+`agentIdentity` (`extensions/memory.ts`) resolves in four links, first non-empty wins:
 
 1. **`cfg.agent`** — a config override, either `~/.pi/agent/memory.json` or `.pi/memory.json` in the checkout (the
    repo file wins; the two are merged key by key). This beats everything *including an explicit session name*, so

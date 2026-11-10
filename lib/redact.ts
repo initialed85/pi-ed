@@ -1,7 +1,7 @@
 /**
  * Credential redaction, shared by every extension that puts agent-produced text somewhere durable.
  *
- * This used to live inside `parked/memory.ts`, which was the only writer that needed it. It no longer is: cognee
+ * This used to live inside `extensions/memory.ts` (then parked), which was the only writer that needed it. It no longer is: cognee
  * takes free text from an agent, embeds it, and hands it to an LLM for entity extraction before storing it, so the
  * scrub has to happen before the request leaves the process rather than in whatever the store does on the way in.
  * Keeping two copies of a rule list is how the two copies drift, so there is now one, outside `extensions/` because

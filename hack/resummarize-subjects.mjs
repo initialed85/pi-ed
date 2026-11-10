@@ -7,7 +7,7 @@
  *
  *   1. 33 labels were parse fragments - `["agent memory and recall"`, `"backup and replication decisions"` - produced
  *      when a model passed a JSON array as a string and the write path split it on commas. That is fixed in
- *      parked/memory.ts (parseSubjects) and this script repairs what it already wrote.
+ *      extensions/memory.ts (parseSubjects) and this script repairs what it already wrote.
  *   2. The rest were near-synonyms invented per dream: 1.0 uses per label on average. Nothing joined an existing
  *      subject, so the index was a list of one-off phrases instead of something a future self can scan.
  *
@@ -45,7 +45,7 @@ if (!dsn) {
 const { default: pg } = await import("pg");
 // One set of rules for how a subject label is read. Duplicating them here would give the write path and the repair
 // path two different ideas about what a label is, which is how the store acquired 33 fragments in the first place.
-const { parseSubjects } = await import("../parked/memory.ts");
+const { parseSubjects } = await import("../extensions/memory.ts");
 const client = new pg.Client({ connectionString: dsn });
 
 async function embed(texts) {
