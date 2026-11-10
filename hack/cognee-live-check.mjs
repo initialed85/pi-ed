@@ -9,6 +9,7 @@
  *
  *   node hack/cognee-live-check.mjs
  *   node hack/cognee-live-check.mjs --graph     # also ask the graph to synthesize (10–25 s, costs a rooter call)
+ *   node hack/cognee-live-check.mjs --tail      # a 20 KB note through a chunkSize 400 embedder: the tail a real agent hits
  *   node hack/cognee-live-check.mjs --url https://cognee.dev.initialed85.cc --key-file ~/cognee-key.txt
  *
  * It writes to the `pi-ed-probe` dataset, never to `fleet-ops`, and deletes what it wrote unless --keep is passed.
@@ -236,6 +237,31 @@ if (flag("prove-delete")) {
   check("the literal credential is gone from every remaining data row", proven && !inRawScan, !proven ? "NOT PROVEN" : (inRawScan ? "a remaining row still carries it" : "raw scan of remaining rows is clean"));
   check("the literal credential is not answerable from the graph", proven && !inGraphAnswer, !proven ? "NOT PROVEN" : (inGraphAnswer ? "a synthesized answer still reproduces it — cognee's delete did not cascade to the nodes" : `graph answered without it in ${graphAfter.ms} ms`));
   say(`     caveat on the last one: a GRAPH_COMPLETION that omits the string is evidence the model did not find it, not proof no node holds it. No node-enumeration door is known to this script; if one is found, that assertion belongs on it.`);
+}
+
+if (flag("tail")) {
+  // The case an agent actually hits, and the one a 512-token default batch turns into work: cognee is configured with
+  // chunkSize: 400 (its embedding batch is 512 and 512 tokens exceeds 400 characters, so a chunk gets split before
+  // it is embedded), which means a long note is embedded as roughly 2.5x the chunks its author imagined — all of it
+  // before a foreground write answers. 20 KB is a plausible size for a real incident write-up, and at 400 characters
+  // per chunk that is ~50 chunks to embed. home-ops runs the embedder; this measures whether the tail still fits the
+  // 300 s budget extensions/cognee.ts gives memory_remember, and it is the number that decides whether a long note
+  // should simply be written in the background instead.
+  const LINES = [
+    "pi-ed tail probe: a long incident write-up, the kind an agent actually stores.",
+    "The node came back after the kubelet stopped reporting; the volume detached cleanly; the pod rescheduled.",
+    "Evidence was gathered from describe, logs and the Longhorn volume state, and each is quoted verbatim below.",
+    "Nothing here is a secret: postgres://tail:nothing-at-all@pi-ed-postgres:5432/pi_ed is the credential to redact.",
+  ];
+  const bigNote = `${MARK} tail note. ` + Array.from({ length: 200 }, (_, i) => `${i}: ${LINES[i % LINES.length]}`).join("\n");
+  const bigForm = new FormData();
+  bigForm.set("raw_data", redact(bigNote).text);
+  bigForm.set("datasetName", DATASET);
+  bigForm.set("node_set", NODE_SET);
+  const bigStarted = Date.now();
+  const big = await call("/api/v1/remember", { method: "POST", body: bigForm }, 300_000);
+  const chunkEstimate = Math.ceil(redact(bigNote).text.length / 400);
+  check(`a ${bigNote.length} B note (${chunkEstimate} chunks at chunkSize 400) lands inside the 300 s budget`, big.ok && big.body?.status === "completed", `HTTP ${big.status} in ${Date.now() - bigStarted} ms · status ${String(big.body?.status)}${big.ok && big.body?.status === "completed" ? "" : " — if a CPU embedder makes this the normal answer, memory_remember should stop waiting for large notes at all"}`);
 }
 say(`\n${failures ? "FAIL" : "PASS"} cognee live check against ${BASE} (dataset ${DATASET}, key from ${KEY_FILE} — value not shown)`);
 process.exit(failures ? 1 : 0);
