@@ -13,7 +13,7 @@
  *
  * Exit code is the verdict: 0 is fine, 1 is not.
  */
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -28,7 +28,6 @@ const EXPECTED_EXTENSIONS = [
   "autopilot.ts",
   "compaction-summary-guard.ts",
   "loop-guard.ts",
-  "memory.ts",
   "queue-reload.ts",
   "schedule.ts",
   "searxng.ts",
@@ -37,6 +36,13 @@ const EXPECTED_EXTENSIONS = [
   "tags.ts",
   "turn-stats.ts",
 ];
+/**
+ * Compiled, tested and swept against the live store, but deliberately outside the load path: Pi discovers extensions
+ * through `pi.extensions` -> `./extensions`, so a file in `parked/` is not installed into anyone's session. Parked is
+ * the honest word for it - the memory extension is out of the fleet while Ed cuts over to mem0 (parked/README.md), and
+ * a list that does not say which files are parked is a list that lets one drift out by accident.
+ */
+const PARKED_EXTENSIONS = ["memory.ts"];
 const HOST_PACKAGES = [
   "@earendil-works/pi-ai",
   "@earendil-works/pi-agent-core",
@@ -66,6 +72,16 @@ if (!Array.isArray(dirs) || dirs.length !== 1) {
   if (missing.length || extra.length) {
     fail(`expected ${EXPECTED_EXTENSIONS.join(", ")} in ${dir}, missing ${missing.join(", ") || "nothing"}, unexpected ${extra.join(", ") || "nothing"}`);
   }
+  // A parked file that is also in the discovered directory would be loaded, and "parked" would be a comment in a
+  // README rather than a fact about what sessions run.
+  for (const name of PARKED_EXTENSIONS) {
+    if (files.includes(name)) fail(`parked extension ${name} is also in ${dir}/, so Pi loads it`);
+    if (!existsSync(path.join(ROOT, "parked", name))) fail(`parked extension ${name} is missing from parked/`);
+  }
+  const parked = readdirSync(path.join(ROOT, "parked")).filter((f) => f.endsWith(".ts")).sort();
+  const strayParked = parked.filter((name) => !PARKED_EXTENSIONS.includes(name));
+  if (strayParked.length) fail(`parked/ holds ${strayParked.join(", ")} which this guard does not know about`);
+  if (PARKED_EXTENSIONS.length) console.log(`parked (not loaded): ${PARKED_EXTENSIONS.join(" ")}`);
 }
 
 // 2. Host packages are peers, never dependencies.
@@ -89,5 +105,5 @@ const devDeps = Object.keys(pkg.devDependencies ?? {});
 const unresolvable = HOST_PACKAGES.filter((name) => !devDeps.includes(name));
 if (unresolvable.length) fail(`host packages missing from devDependencies, so a clone cannot typecheck: ${unresolvable.join(", ")}`);
 
-if (!failed) console.log(`ok: ${EXPECTED_EXTENSIONS} extensions discovered through pi.extensions, host packages are peers`);
+if (!failed) console.log(`ok: ${EXPECTED_EXTENSIONS.length} extensions discovered through pi.extensions, ${PARKED_EXTENSIONS.length} parked, host packages are peers`);
 process.exit(failed ? 1 : 0);

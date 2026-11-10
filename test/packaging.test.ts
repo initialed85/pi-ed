@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -8,6 +8,9 @@ import { Text as RealText } from "@earendil-works/pi-tui";
 import { createFakePi, fakeTheme, painted, type FakePi } from "./harness.ts";
 
 const EXTENSIONS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../extensions");
+/** Parked extensions are compiled, tested and swept against the live store, but are not in Pi's load path. */
+const PARKED_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../parked");
+const PARKED = ["memory.ts"];
 
 /**
  * The contract that holds for every extension in this directory, and the reason the directory can
@@ -159,6 +162,13 @@ const EXPECTED: Record<string, Surface> = {
 const FILES = Object.keys(EXPECTED);
 
 /**
+ * Where a file lives decides whether Pi loads it, and that is the whole difference between these two directories -
+ * `pi.extensions` points at `./extensions` and nothing else, so a file moved to `parked/` stops reaching sessions
+ * without anything having to remember to exclude it.
+ */
+const dirFor = (name: string): string => (PARKED.includes(name) ? PARKED_DIR : EXTENSIONS_DIR);
+
+/**
  * Some extensions are inert unless they are configured, and "inert" is the behaviour worth pinning - test/memory.test.ts
  * asserts it. The packaging contract is about what an extension registers when it *is* configured, so those files are
  * loaded with a placeholder that configures them. No credentials here: this DSN points at a closed port.
@@ -183,7 +193,7 @@ async function load(name: string): Promise<FakePi> {
   process.env = previousEnv as NodeJS.ProcessEnv;
   vi.resetModules();
   try {
-    const mod = await import(path.join(EXTENSIONS_DIR, name));
+    const mod = await import(path.join(dirFor(name), name));
     const pi = createFakePi();
     expect(typeof mod.default, `${name} default export`).toBe("function");
     mod.default(pi as any);
@@ -195,17 +205,29 @@ async function load(name: string): Promise<FakePi> {
 
 describe("extensions directory", () => {
   it("contains exactly the files this suite knows about", () => {
-    expect(readdirSync(EXTENSIONS_DIR).sort()).toEqual([...FILES].sort());
+    expect(readdirSync(EXTENSIONS_DIR).sort()).toEqual(FILES.filter((name) => !PARKED.includes(name)).sort());
+  });
+
+  it("keeps the parked set parked, and says why in the file Pi will not load", () => {
+    // The reason matters as much as the state here: a directory someone cannot explain gets moved back "while we are
+    // in there", and the memory extension is parked because a fleet is being cut over to mem0, not because it broke.
+    expect(readdirSync(PARKED_DIR).filter((name) => name.endsWith(".ts")).sort()).toEqual([...PARKED].sort());
+    const why = readFileSync(path.join(PARKED_DIR, "README.md"), "utf8");
+    expect(why).toContain("mem0");
+    for (const name of PARKED) {
+      expect(existsSync(path.join(EXTENSIONS_DIR, name)), `${name} is in extensions/ and therefore loaded`).toBe(false);
+      expect(readFileSync(path.join(PARKED_DIR, name), "utf8"), name).toContain("PARKED");
+    }
   });
 
   it("holds no file that something else manages", () => {
     // ~/.pi/agent/extensions also holds integrations that other tools write and overwrite on update
     // (herdr's pi integration is one). Those belong to their own project: copying one here means the
-    // next upstream install silently diverges from this repo, and "our copy" stops being true. The
-    // markers below are how such a file announces itself.
+    // next upstream install silently diverges from this repo, and "our copy" stops being true. The markers
+    // below are how such a file announces itself.
     const managed = /installed by|managed by|@ts-nocheck|INTEGRATION_ID/i;
     for (const name of FILES) {
-      const head = readFileSync(path.join(EXTENSIONS_DIR, name), "utf8").slice(0, 2000);
+      const head = readFileSync(path.join(dirFor(name), name), "utf8").slice(0, 2000);
       expect(head.match(managed), name).toBeNull();
     }
   });

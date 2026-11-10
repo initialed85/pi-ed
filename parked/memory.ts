@@ -1,4 +1,10 @@
 /**
+ * PARKED (2026-11-10): this extension is not in `extensions/`, so `pi install git:github.com/initialed85/pi-ed` does not
+ * load it and no agent is given `memory_search` or `memory_dream`. The fleet is cutting over to mem0 for a while - see
+ * `parked/README.md` for the reason, what is unaffected, and the one command that puts it back.
+ */
+
+/**
  * Memory
  *
  * Pi agents forget everything between sessions. This is the start of a fix: the full history of what an agent did,

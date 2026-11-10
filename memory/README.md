@@ -144,7 +144,7 @@ disappear three ways:
 
 ### The agent_id chain, in the order it is consulted
 
-`agentIdentity` (`extensions/memory.ts`) resolves in four links, first non-empty wins:
+`agentIdentity` (`parked/memory.ts`) resolves in four links, first non-empty wins:
 
 1. **`cfg.agent`** — a config override, either `~/.pi/agent/memory.json` or `.pi/memory.json` in the checkout (the
    repo file wins; the two are merged key by key). This beats everything *including an explicit session name*, so
@@ -272,7 +272,7 @@ about a place the reader has already proven they are in. Run the sanity row firs
 
 ## The Pi side
 
-`extensions/memory.ts` is the writer and the reader. It records turns as `event` rows on `turn_end` and when a run
+`parked/memory.ts` is the writer and the reader. It records turns as `event` rows on `turn_end` and when a run
 settles, on a short debounce, through a connection pool it never lets a slow database block a turn: if the store
 refuses, the rows go to a local spool file and ride along with the next successful flush, keyed by the session they
 came from. A dream is not injected by code. The extension posts one hidden message (`customType: "memory:dream",
@@ -360,7 +360,7 @@ table whose severities are frozen - see the contract at the end of the heartbeat
 ## Why every statement names its schema, and the typo that proved the point
 
 home-ops asked which of three spellings the exported statements should use - `from writer_heartbeat`, `from memory`,
-`memory.memory` - and the answer is a fourth thing: **every statement in `extensions/memory.ts` now names `memory.`
+`memory.memory` - and the answer is a fourth thing: **every statement in `parked/memory.ts` now names `memory.`
 explicitly, writes included**. The inconsistency they spotted was one step short of the actual exposure.
 
 The store's role has `search_path = memory, public` (set in `schema/001_init.sql`, a file the extension cannot see), so
@@ -465,7 +465,7 @@ while the statement that actually runs restarts its own counter from 1. Budget a
 survives the discontinuity (`15.55 ms` and `19.73 ms`, both inside the window that began `19:27:33Z`).
 
 And the standing note about this file's SQL blocks, which home-ops already solved better than I did: **they are a
-reading aid, not the authority.** The canonical text is `extensions/memory.ts`. home-ops' `hack/check-pied-statements.py`
+reading aid, not the authority.** The canonical text is `parked/memory.ts`. home-ops' `hack/check-pied-statements.py`
 extracts the statements from the source, resolves the window constants from the code, refuses anything with an
 unresolved `${…}` left in it, and runs the result - which is the shape that cannot drift, as against a runbook that
 copies prose and slowly stops describing the system it documents.
@@ -1330,7 +1330,7 @@ was `xact_rollback` climbing while the tables stayed empty.
 
 `schema/003_writer_heartbeat.sql` - the table itself, including `spool_since` (created with the table for a fresh
 store, and carried onto an existing one by `alter table ... add column if not exists`); `heartbeatPageAlertStatement` and
-`heartbeatAdvisoryAlertStatement` in `extensions/memory.ts` - the two queries, exported from the writer so the
+`heartbeatAdvisoryAlertStatement` in `parked/memory.ts` - the two queries, exported from the writer so the
 documentation and the alerts cannot drift apart; `test/writer-heartbeat.test.ts` - the proof, which runs only against
 a store (`PI_LIVE_DSN=... npx vitest run test/writer-heartbeat.test.ts`) and fabricates each shape: stale without a
 commit, healthy, recently refused, refused long ago:
@@ -1715,7 +1715,7 @@ Two faults, and only one of them is about contexts:
    unhandled rejection as an uncaughtException and Pi exits. Six call sites did this. Internal correctness cannot fix
    a call site that throws a promise away, so the fix is at the call sites.
 
-The shape of the fix, in `extensions/memory.ts`: `ui(ctx)` is the one place allowed to read `hasUI`, and it wraps the
+The shape of the fix, in `parked/memory.ts`: `ui(ctx)` is the one place allowed to read `hasUI`, and it wraps the
 read; `attempt(label, work, rescue)` keeps every rejection and runs a rescue when dropping the work would lose rows;
 and `collect` now bakes `sessionId` into each queued row at the moment the session is knowable, because a flush that
 fires from a timer or after its context is dead cannot ask a dead context which session it belonged to. Faults are
@@ -1771,7 +1771,7 @@ role says so. The failure mode if it ever changes is not an error - if `public` 
 same-named table in `public`, the writes silently split between two tables and the store reports exactly the row
 counts a healthy store would. Two rules follow, and both are worth stating before someone "just reorders" a line:
 keep `memory` first in that role's `search_path`, and if it ever has to move, qualify every name in
-`extensions/memory.ts` first.
+`parked/memory.ts` first.
 
 home-ops' copy in `MAINTENANCE.md` spells the sweep query `memory.writer_heartbeat`, and that is the right difference
 rather than drift: a report run by someone else should not inherit a setting it does not own, because a sweep that

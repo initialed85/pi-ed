@@ -43,7 +43,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const source = path.join(here, "..", "extensions", "memory.ts");
+const source = path.join(here, "..", "parked", "memory.ts");
 const liveDsn = process.env.PI_LIVE_DSN ?? process.env.PI_MEMORY_DSN ?? "";
 const flags = new Set(process.argv.slice(2));
 const live = flags.has("--live");

@@ -36,6 +36,10 @@ class registries.
 
 ## The extensions
 
+Eleven of them live in `extensions/` and are what `pi install git:github.com/initialed85/pi-ed` loads. One more,
+`memory.ts`, is in **`parked/`**: compiled, tested and swept against the live store, but outside the directory Pi
+discovers, so no session is given its tools. `parked/README.md` says why and how to bring it back.
+
 `turn-stats.ts` is documented in its own file header: it replaces the client's guesses
 about throughput and timing with the numbers Rooter already publishes in response headers, drawn as one
 dim line under each assistant answer.
@@ -252,6 +256,11 @@ jq -r 'select(.customType=="auto-resume")
 
 
 ### `memory.ts` — what an agent remembers tomorrow
+
+**Parked since 2026-11-10.** It lives in `parked/memory.ts`, so Pi does not load it and no agent in the fleet is given
+`memory_search` or `memory_dream` while the fleet is cut over to mem0. Everything below describes an extension that
+works and is still tested; the store, the reading room and the MCP server are untouched by the parking. Skip this
+section until it moves back.
 
 Nothing Pi does today survives a machine being rebuilt. This puts the session itself in Postgres: every turn
 recorded raw, and a smaller set of things the agent decided were worth remembering, in `pi_ed` on home-dev

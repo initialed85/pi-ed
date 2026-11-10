@@ -3,7 +3,7 @@
  *
  * Three separate jobs, in escalating order of what they need:
  *
- *   offline     the kind vocabulary in extensions/memory.ts and the CHECK constraint in the migration are the same
+ *   offline     the kind vocabulary in parked/memory.ts and the CHECK constraint in the migration are the same
  *               set, and every edge statement targets `memory.edge` with the conflict clause that makes a re-run a
  *               no-op. A kind the code invents and the schema refuses is a failed flush; a statement missing the
  *               conflict clause is a backfill that doubles the table every time it runs.
@@ -24,9 +24,9 @@ const liveDsn = process.env.PI_LIVE_DSN ?? "";
 const liveSuite = liveDsn ? describe : describe.skip;
 
 const migration = readFileSync(fileURLToPath(new URL("../memory/schema/005_edges.sql", import.meta.url)), "utf8");
-const source = readFileSync(fileURLToPath(new URL("../extensions/memory.ts", import.meta.url)), "utf8");
+const source = readFileSync(fileURLToPath(new URL("../parked/memory.ts", import.meta.url)), "utf8");
 
-const loadModule = async () => import("../extensions/memory.ts");
+const loadModule = async () => import("../parked/memory.ts");
 
 /** The kinds the migration's CHECK enumerates, read out of the migration text. */
 function kindsInSchema(): string[] {

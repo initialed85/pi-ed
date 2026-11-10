@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Live check for extensions/memory.ts: drives a real Pi session against a real store and reports what landed.
+// Live check for parked/memory.ts: drives a real Pi session against a real store and reports what landed.
 //
 // This is not CI. It needs a reachable Postgres with the schema applied, and it spends model tokens. Run it by hand
 // after changing the write path, the dream instruction, or the schema:
@@ -25,7 +25,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const EXTENSION = path.resolve(HERE, "../extensions/memory.ts");
+const EXTENSION = path.resolve(HERE, "../parked/memory.ts");
 
 const argv = process.argv.slice(2);
 const arg = (name, fallback) => {

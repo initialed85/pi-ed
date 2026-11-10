@@ -31,7 +31,7 @@ import { createFakePi, createContext, callTool } from "./harness.ts";
  */
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const source = path.join(here, "..", "extensions", "memory.ts");
+const source = path.join(here, "..", "parked", "memory.ts");
 const liveDsn = process.env.PI_LIVE_DSN ?? "";
 
 const DIMENSIONS = 768;

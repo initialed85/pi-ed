@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
  */
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const source = path.join(here, "..", "extensions", "memory.ts");
+const source = path.join(here, "..", "parked", "memory.ts");
 const liveDsn = process.env.PI_LIVE_DSN ?? "";
 
 // A computed import path keeps this file independent of how the extension is packaged; the values are asserted by
