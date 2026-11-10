@@ -12,6 +12,11 @@
  *   node hack/cognee-live-check.mjs --url https://cognee.dev.initialed85.cc --key-file ~/cognee-key.txt
  *
  * It writes to the `pi-ed-probe` dataset, never to `fleet-ops`, and deletes what it wrote unless --keep is passed.
+ * Passing `--dataset` something that is not a `*-probe` dataset is refused outright unless `--allow-shared` is also
+ * passed, because probe markers in a real corpus become false controls: slopyphus' planned positive control was
+ * "what does agent coral record about slopy-redstart-7412", which passes for as long as that scratch note sits in
+ * fleet-ops and proves nothing about whether a newly written memory is retrievable. A control marker must be fresh
+ * and must never live in the corpus it is testing.
  * Every line this script prints has been through `scrub` with the live key as a literal rule, so the check cannot
  * become the thing that leaks the credential it was given.
  */
@@ -42,6 +47,11 @@ if (!key) {
 }
 // The only printing this script does, and it is scrubbed. `console.error` goes through the same gate.
 const say = (line) => console.log(scrub(line, [key]).text);
+
+if (!/-probe$/.test(DATASET) && !flag("allow-shared")) {
+  say(`refusing to write probe markers into "${DATASET}" — that looks like a corpus people remember with, and a marker left in it becomes a control that passes forever. Use a *-probe dataset, or pass --allow-shared deliberately.`);
+  process.exit(2);
+}
 
 const MARK = `quokkalisk-${Date.now()}`;
 const NOTE = `pi-ed live check ${new Date().toISOString()} on ${hostname()}: the marker word is ${MARK}. A credential for the check to swallow: postgres://probe:hunter2@pi-ed-postgres:5432/pi_ed and api_key=abcdefghijklmnop.`;
