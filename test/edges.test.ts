@@ -24,9 +24,9 @@ const liveDsn = process.env.PI_LIVE_DSN ?? "";
 const liveSuite = liveDsn ? describe : describe.skip;
 
 const migration = readFileSync(fileURLToPath(new URL("../memory/schema/005_edges.sql", import.meta.url)), "utf8");
-const source = readFileSync(fileURLToPath(new URL("../extensions/memory.ts", import.meta.url)), "utf8");
+const source = readFileSync(fileURLToPath(new URL("../parked/memory.ts", import.meta.url)), "utf8");
 
-const loadModule = async () => import("../extensions/memory.ts");
+const loadModule = async () => import("../parked/memory.ts");
 
 /** The kinds the migration's CHECK enumerates, read out of the migration text. */
 function kindsInSchema(): string[] {

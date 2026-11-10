@@ -25,7 +25,7 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const EXTENSION = path.resolve(HERE, "../extensions/memory.ts");
+const EXTENSION = path.resolve(HERE, "../parked/memory.ts");
 
 const argv = process.argv.slice(2);
 const arg = (name, fallback) => {

@@ -169,7 +169,7 @@ function readFirstFile(paths: string[]): { value?: string; source?: string } {
  *
  * `agent` is resolved last and from the caller's context rather than from the environment alone, because the
  * session name is the one identity a human chose on purpose. The rest of the fleet's fallback order lives in
- * `extensions/memory.ts` and in the schedule extension; this repeats the short version rather than importing it, so
+ * `parked/memory.ts` and in the schedule extension; this repeats the short version rather than importing it, so
  * two extensions that talk to two different stores do not become one extension's dependency.
  */
 export function resolveConfig(
@@ -481,7 +481,7 @@ export default function activate(api: ExtensionAPI): void {
         // chunk retrieval is measured to miss facts that are plainly present in the stored document (home-ops,
         // 2026-11-10, after the chunkSize 400 rebuild), so an empty cognee answer is reported as one door being
         // quiet, not as the fleet having forgotten.
-        const emptyHint = "Cognee returned nothing, which is not the same as nothing being stored: its chunk retrieval is measured to miss plainly-stored text. Ask memory_search (the Postgres recall of record) before concluding the fleet never wrote it down.";
+        const emptyHint = "Cognee returned nothing. That is not proof nothing was stored: its chunk retrieval is measured to miss plainly-stored text (a fact present in the stored document did not come back on CHUNKS after the chunkSize 400 rebuild). Say that the search found nothing in cognee, rather than that the fleet never wrote it down.";
         const empty = formatted.hits ? "" : emptyHint;
         return { content: [{ type: "text", text: [head, formatted.text, empty].filter(Boolean).join("\n") }], details: { hits: formatted.hits, mode, ms: result.ms } };
       } catch (error) {
@@ -505,7 +505,7 @@ export default function activate(api: ExtensionAPI): void {
       } catch (error) {
         lines.push(`status unavailable: ${scrub(error instanceof Error ? error.message : String(error), [cfg.key]).text}`);
       }
-      lines.push("cognee is the intended door; extensions/memory.ts (Postgres) remains loaded as the recall of record until cognee's live check proves a newly written fact is retrievable.");
+      lines.push("cognee is the only memory door: the Postgres extension was parked at Ed's direction on 2026-11-10 and is not loaded.");
       ctx.ui.notify(lines.join("\n"), "info");
     },
   });

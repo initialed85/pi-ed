@@ -45,7 +45,7 @@ if (!dsn) {
 const { default: pg } = await import("pg");
 // One set of rules for how a subject label is read. Duplicating them here would give the write path and the repair
 // path two different ideas about what a label is, which is how the store acquired 33 fragments in the first place.
-const { parseSubjects } = await import("../extensions/memory.ts");
+const { parseSubjects } = await import("../parked/memory.ts");
 const client = new pg.Client({ connectionString: dsn });
 
 async function embed(texts) {

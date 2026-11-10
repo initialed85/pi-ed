@@ -11,51 +11,47 @@ the return trip worse. The file stays typechecked, its tests keep running, and i
 against the live store by home-ops' `hack/check-pied-statements.py`. A parked extension that is never compiled or
 tested is an extension that has quietly rotted.
 
-**Nothing is parked today.** This directory is kept with its reasoning intact because an unexplained `parked/` gets
-tidied away, and with it the record of why something was taken out of the fleet and what measurement put it back.
+## `memory.ts` — parked, un-parked, and parked again, all on 2026-11-10
 
-## `memory.ts` — parked 2026-11-10, returned to service the same evening
+The store is untouched. The reading room (`memory-ui`), the MCP server, the schema and the 139 migrated rows all stay
+in service; what stopped is agents being *given* `memory_search` and `memory_dream`.
 
-**Why it was parked:** Ed was cutting the fleet over to **cognee** (`extensions/cognee.ts`, talking to Cognee 1.6.7 in
-namespace `cognee` on home-dev), and `memory_search` / `memory_dream` were not to be offered to an agent while that
-cutover ran. Two agents answering from two different memory systems is worse than one agent answering from none.
+**The order.** Ed has decided that cognee is the memory path: *"i told you to turn off memory … we're pivoting to
+cognee"*. That is a decision about which store the fleet writes to, and it is his to make, so `extensions/memory.ts`
+is back here and `extensions/cognee.ts` is the only memory door a session sees.
 
-The first version of this note said mem0. That was true at the moment it was written and wrong within hours: mem0 was
-turned down in favour of cognee because mem0's FOSS build dropped the knowledge graph and the graph was the whole point
-("a filing cabinet is fine but I wanted to test the graph" — home-ops `clusters/dev/applications/cognee/README.md`).
-
-**Why it returned to service, on measurements rather than on a change of heart, all of them taken on home-dev on
-2026-11-10:**
+**Why it was un-parked for a few hours, since the reasoning is the useful part.** The fleet was mid-cutover, cognee
+could not write, and I thought the safe answer was two doors. The measurements behind that call, taken on home-dev:
 
 1. **Cognee could not write at all.** `POST /api/v1/remember` answered **409 after ~31 s** — "Embedding connection
    test timed out after 30s. Check that your embedding endpoint is reachable." — because `embeddings-nvidia` cannot
-   schedule (`0/1`; "0/12 nodes are available: 1 node(s) were unschedulable, 4 node(s) didn't match Pod's node
-   affinity/selector, 7 node(s) had untolerated taints", and `gpu-size: medium` labels only hermes, NotReady since
-   2026-11-10T12:13:33Z). A background write of the same note answered **200 in 135 ms and stored nothing**: the
-   live check's own row-count assertion reported `0 → 0 row(s)`.
-2. **Cognee's retrieval is the weak axis, not its composing.** home-ops measured that a fact plainly present in the
-   stored raw document was **not returned by `CHUNKS`** after the `chunkSize: 400` rebuild, and `RAG_COMPLETION`
-   refused it too. A memory system that cannot retrieve what it stored is not a memory system yet.
-3. **Both stores read; only one of them writes.** During the same outage the Postgres store answered a lexical query
-   with recent dreams (139 of 139 rows carry a vector), and cognee's `CHUNKS` door also answered — unscoped, 250–480 ms
-   per query, relevant chunks on three separate questions — even with no embedder anywhere in the cluster. The
-   assumption that cognee would be entirely dark was wrong, and the honest version is narrower and worse for cognee:
-   it can read what it already stored, it cannot store anything new, and the one retrieval test that mattered — a fact
-   plainly present in the stored document — it failed.
+   schedule (`0/1`; `gpu-size: medium` labels only hermes, NotReady since 2026-11-10T12:13:33Z). A background write of
+   the same note answered **200 in 135 ms and stored nothing**: the live check's row-count assertion read `0 → 0`.
+2. **Its retrieval missed a fact it demonstrably had.** home-ops measured a fact plainly present in the stored raw
+   document that **`CHUNKS` did not return** after the `chunkSize: 400` rebuild, and `RAG_COMPLETION` refused it too.
+3. **Cognee reads what it already holds.** With the embedder down and no schedulable GPU anywhere, unscoped `CHUNKS`
+   recall answered **200 in 250–480 ms with relevant chunks on three separate questions**. So cognee-only is blind to
+   *the future*, not the past — which is why the interim being asked for was tolerable, and why the end condition below
+   is about writes and retrieval quality rather than availability.
+4. **Postgres answers too, by design.** `memory_search` runs vector recall when the embedder replies and otherwise
+   falls back to keyword/full-text (`parked/memory.ts`, the recall section) — so it worked through the outage.
 
-**The interim, and its end condition.** Both doors are loaded, with distinct tool names and no ambiguity:
-`memory_remember` / `memory_recall` / `/cognee` for cognee (the intended write path and the graph), and
-`memory_search` / `memory_dream` for Postgres (the recall of record, still writable precisely because writing is what
-cognee currently cannot do). Cognee becomes the only door when `hack/cognee-live-check.mjs` shows three things: a
-marker written now is retrievable from `CHUNKS`; `/data/count` moves when a write is accepted; and `--prove-delete`
-shows a delete removes the credential the note carried. Until then, an agent that gets nothing from cognee is told to
-try the other door rather than told the fleet never wrote it down.
+**What "cognee only" costs while the embedder is unschedulable, stated plainly so nobody is surprised later:** every
+`memory_remember` answers 409 in the foreground, or 200-and-stored-nothing in the background. Until home-ops lands a
+reachable embedder, the fleet has a memory system that reads yesterday and cannot write today. That is not an
+argument against the pivot; it is the thing to watch after it.
 
-**Also settled on the way back:** the migration is not finished even though the tally looks finished. Anything
-`extensions/memory.ts` writes after the 139 exported rows needs a second pass, so home-ops' ledger wants an export
-watermark rather than a count.
+**End condition — what `hack/cognee-live-check.mjs` has to show before anyone re-opens this file:** a marker written
+now is retrievable from `CHUNKS`; `/data/count` moves when a write is accepted; and `--prove-delete` shows a delete
+removes the credential the note carried. All three are written and ready to run.
 
-**To park something again:** `git mv extensions/<name>.ts parked/<name>.ts`, add the name to `PARKED` in
+**Also settled on the way:** the migration is not finished just because the tally looks finished. Anything Postgres
+receives after the 139 exported rows needs a second pass, so home-ops' ledger wants an export watermark rather than a
+count.
+
+**To park something:** `git mv extensions/<name>.ts parked/<name>.ts`, add the name to `PARKED` in
 `test/packaging.test.ts` and `PARKED_EXTENSIONS` in `hack/check-package-shape.mjs`, and write the reason in this file
-before the reason is forgotten. `pi update --extensions`, or a container restart, is what carries the change into a
-running session; a session already up keeps the tools it loaded at startup until it restarts or `/reload`s.
+before the reason is forgotten. **To bring one back:** the same `git mv` in the other direction, remove the name from
+those two lists, and say why in the section above. `pi update --extensions`, or a container restart, is what carries
+the change into a running session; a session already up keeps the tools it loaded at startup until it restarts or
+`/reload`s.

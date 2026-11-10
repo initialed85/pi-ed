@@ -29,7 +29,7 @@ import { fileURLToPath } from "node:url";
 
 import { createFakePi, createContext, callTool, type FakePi } from "./harness.ts";
 
-const MODULE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../extensions/memory.ts");
+const MODULE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../parked/memory.ts");
 const MEMORY_ID = "11111111-1111-1111-1111-111111111111";
 
 const store = vi.hoisted(() => ({

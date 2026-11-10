@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { createFakePi, createContext, callTool, fakeTheme, painted, type FakePi } from "./harness.ts";
 
-const MODULE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../extensions/memory.ts");
+const MODULE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../parked/memory.ts");
 
 /**
  * A DSN to a closed port.

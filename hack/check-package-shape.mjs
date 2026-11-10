@@ -29,7 +29,6 @@ const EXPECTED_EXTENSIONS = [
   "cognee.ts",
   "compaction-summary-guard.ts",
   "loop-guard.ts",
-  "memory.ts",
   "queue-reload.ts",
   "schedule.ts",
   "searxng.ts",
@@ -41,12 +40,12 @@ const EXPECTED_EXTENSIONS = [
 /**
  * Compiled, tested and swept against the live store, but deliberately outside the load path: Pi discovers extensions
  * through `pi.extensions` -> `./extensions`, so a file in `parked/` is not installed into anyone's session. Parked is
- * the honest word for it, and the list is empty today: `memory.ts` was parked on 2026-11-10 while the fleet was cut
- * over to cognee and returned to service the same evening because cognee could neither write nor reliably retrieve
- * (parked/README.md keeps the measurements). A list that does not say which files are parked is a list that lets one
- * drift out by accident, so the empty list is the point rather than an oversight.
+ * the honest word for it. `memory.ts` is here since 2026-11-10 because Ed turned Postgres memory off to make cognee
+ * the fleet's memory path; it was also parked briefly earlier the same day, and the measurements taken while that
+ * decision was made are kept in `parked/README.md` rather than in chat. A list that does not say which files are
+ * parked is a list that lets one drift out by accident.
  */
-const PARKED_EXTENSIONS = [];
+const PARKED_EXTENSIONS = ["memory.ts"];
 const HOST_PACKAGES = [
   "@earendil-works/pi-ai",
   "@earendil-works/pi-agent-core",
