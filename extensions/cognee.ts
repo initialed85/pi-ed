@@ -309,6 +309,23 @@ export class Cognee {
 }
 
 /** How a failed call should be described to an agent, with enough to act on and no secrets in it. */
+/**
+ * A failed call is two different facts, and an agent needs to know which one it was told.
+ *
+ * A connection that was refused or a name that did not resolve means the store is not there. A call that ran out of
+ * its budget means the store exists and is busy — Cognee serves one worker, so an in-flight build blocks reads
+ * outright (measured: recall calls timing out at 120 s with zero bytes while a cognify ran). The first is "no
+ * information available"; the second is "unknown", and neither one is "nothing was remembered".
+ */
+export function describeCallFailure(error: unknown, url: string, ms: number, tool: string): string {
+  const message = scrub(error instanceof Error ? error.message : String(error), []).text.replace(/\s+/g, " ").trim();
+  const timedOut = /timeout|aborted|deadline/i.test(message);
+  if (timedOut) {
+    return `${tool} stopped waiting for cognee at ${url} after ${ms} ms. cognee serves one worker, so it is likely busy building rather than refusing — treat this as unknown, not as nothing remembered, and not as a licence to write the same note again.`;
+  }
+  return `${tool} could not reach cognee at ${url}: ${message} (${ms} ms). Treat this as no information, not as a negative.`;
+}
+
 export function describeFailure(result: CallResult, action: string): string {
   const detail = result.raw.replace(/\s+/g, " ").trim();
   if (result.status === 401 || result.status === 403) {
@@ -385,7 +402,7 @@ export default function activate(api: ExtensionAPI): void {
         const message = scrub(error instanceof Error ? error.message : String(error), [cfg.key]).text.replace(/\s+/g, " ");
         // A timeout is not a rollback. Cognee's pipeline outlives this request (measured: a write that aborted at
         // 180 s was found by a recall a moment later), so saying "nothing was stored" would invite a duplicate write.
-        return { content: [{ type: "text", text: `memory_remember stopped waiting for cognee at ${cfg.url}: ${message} (${Date.now() - started} ms). The note may still be building server-side — check with memory_recall or /cognee before writing it again, or use background=true next time.` }], details: { error: message } };
+        return { content: [{ type: "text", text: `${describeCallFailure(error, cfg.url, Date.now() - started, "memory_remember")} The note may still be building server-side either way — check with memory_recall or /cognee before writing it again, or use background=true next time.` }], details: { error: message } };
       }
     },
   });
@@ -424,7 +441,7 @@ export default function activate(api: ExtensionAPI): void {
         return { content: [{ type: "text", text: [head, formatted.text].filter(Boolean).join("\n") }], details: { hits: formatted.hits, mode, ms: result.ms } };
       } catch (error) {
         const message = scrub(error instanceof Error ? error.message : String(error), [cfg.key]).text.replace(/\s+/g, " ");
-        return { content: [{ type: "text", text: `memory_recall could not reach cognee at ${cfg.url}: ${message} (${Date.now() - started} ms). Treat this as no information, not as a negative.` }], details: { error: message } };
+        return { content: [{ type: "text", text: describeCallFailure(error, cfg.url, Date.now() - started, "memory_recall") }], details: { error: message } };
       }
     },
   });

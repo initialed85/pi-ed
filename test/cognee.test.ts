@@ -369,6 +369,24 @@ describe("the tools as an agent meets them", () => {
     expect(out.text).toContain("Treat this as no information, not as a negative.");
   });
 
+  it("distinguishes a store that is busy from a store that is gone, because the agent's next action differs", async () => {
+    const busy = await activateWith(async () => {
+      throw new Error("The operation was aborted due to timeout");
+    });
+    const busyOut = await run("memory_recall", { query: "anything" });
+    expect(busyOut.text).toMatch(/stopped waiting for cognee/i);
+    expect(busyOut.text).toMatch(/likely busy building rather than refusing/i);
+    expect(busyOut.text).toMatch(/not as a licence to write the same note again/i);
+    expect(busyOut.text).not.toMatch(/Treat this as no information/);
+
+    const gone = await activateWith(async () => {
+      throw new Error("getaddrinfo ENOTFOUND cognee.cognee.svc.cluster.local");
+    });
+    const goneOut = await run("memory_recall", { query: "anything" });
+    expect(goneOut.text).toMatch(/could not reach cognee/i);
+    expect(goneOut.text).toMatch(/Treat this as no information, not as a negative\./);
+  });
+
   it("the /cognee command reports where memory goes without revealing the key", async () => {
     await activateWith(async () => fakeResponse(200, { "4de7843f-0f0d-5a20-ab2d-f94d1c5b99ee": { state: "ready", message: "Memory is fully built.", dataset_name: "fleet-ops" } }));
     await pi.commands.get("cognee")!.handler!("", ctx);
