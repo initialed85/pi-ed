@@ -26,6 +26,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const EXPECTED_EXTENSIONS = [
   "auto-resume.ts",
   "autopilot.ts",
+  "cognee.ts",
   "compaction-summary-guard.ts",
   "loop-guard.ts",
   "queue-reload.ts",
@@ -39,7 +40,7 @@ const EXPECTED_EXTENSIONS = [
 /**
  * Compiled, tested and swept against the live store, but deliberately outside the load path: Pi discovers extensions
  * through `pi.extensions` -> `./extensions`, so a file in `parked/` is not installed into anyone's session. Parked is
- * the honest word for it - the memory extension is out of the fleet while Ed cuts over to mem0 (parked/README.md), and
+ * the honest word for it - the memory extension is out of the fleet while Ed cuts over to cognee (`extensions/cognee.ts`, parked/README.md), and
  * a list that does not say which files are parked is a list that lets one drift out by accident.
  */
 const PARKED_EXTENSIONS = ["memory.ts"];

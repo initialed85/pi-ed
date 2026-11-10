@@ -14,14 +14,20 @@ that has quietly rotted.
 
 ## `memory.ts` — parked 2026-11-10
 
-**Why:** Ed is cutting the fleet over to **mem0** (shipped from home-ops) for a while, and `memory_search` /
-`memory_dream` must not be offered to an agent while that cutover runs. Two agents answering from two different memory
-systems is worse than one agent answering from none.
+**Why:** Ed is cutting the fleet over to **cognee** (`extensions/cognee.ts`, talking to Cognee 1.6.7 in namespace
+`cognee` on home-dev), and `memory_search` / `memory_dream` must not be offered to an agent while that cutover runs.
+Two agents answering from two different memory systems is worse than one agent answering from none.
+
+The first version of this file said mem0. That was true at the moment it was written and wrong within hours: mem0 was
+turned down in favour of cognee because mem0's FOSS build dropped the knowledge graph and the graph was the whole
+point ("a filing cabinet is fine but I wanted to test the graph" — home-ops
+`clusters/dev/applications/cognee/README.md`). A repo every agent installs is not the place for an expired plan.
 
 **What is unaffected:** the Postgres store (`pi-ed-postgres`), its schema and its existing rows; the reading room at
 `memory.dev.initialed85.cc`; the `pi-memory` MCP server; every test in this repository. Parked means not loaded, not
-erased — the old memories stay exactly where they are and stay searchable through the reading room and the MCP server
-while mem0 warms up.
+erased — the old memories stay exactly where they are and stay searchable through the reading room and the MCP server.
+Nothing has been migrated into cognee yet; that is Ed's call, and `hack/cognee-live-check.mjs` is the probe that would
+accompany it.
 
 **Bring it back:**
 

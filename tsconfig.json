@@ -13,5 +13,5 @@
     "esModuleInterop": true,
     "resolveJsonModule": true
   },
-  "include": ["extensions/**/*.ts", "parked/**/*.ts", "test/**/*.ts", "vitest.config.ts"]
+  "include": ["extensions/**/*.ts", "parked/**/*.ts", "lib/**/*.ts", "test/**/*.ts", "vitest.config.ts"]
 }

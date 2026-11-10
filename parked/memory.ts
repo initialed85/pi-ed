@@ -63,6 +63,7 @@ import { basename, dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { redact, type Redaction } from "../lib/redact.ts";
 
 /* ------------------------------------------------------------------ configuration */
 
@@ -203,52 +204,10 @@ export function agentIdentity(ctx: Pick<ExtensionContext, "cwd"> & Partial<Exten
 
 /* ------------------------------------------------------------------ redaction */
 
-/**
- * Things that must not end up in a permanent record whatever the config says.
- *
- * These are credential *shapes*, not a secret manager. The point is that a DSN pasted into a transcript to debug
- * something, or a token echoed by a tool result, does not become a durable searchable row in a database that gets
- * backed up nightly to a file share. Each rule is named so the replacement text says which one fired rather than
- * silently eating the text.
- */
-const CREDENTIAL_SHAPES: { name: string; pattern: RegExp }[] = [
-  { name: "private-key", pattern: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g },
-  { name: "key-value", pattern: /\b(password|passwd|secret|api[_ -]?key|access[_ -]?token|client[_ -]?secret|token)\b["']?\s*[:=]\s*["']?[^\s"',;]{6,}/gi },
-  { name: "bearer", pattern: /\bBearer\s+[A-Za-z0-9._-]{12,}/gi },
-  { name: "aws-key-id", pattern: /\bAKIA[0-9A-Z]{16}\b/g },
-  { name: "github-token", pattern: /\bgh[pousr]_[A-Za-z0-9]{16,}\b/g },
-  { name: "slack-token", pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g },
-  { name: "dsn", pattern: /\bpostgres(ql)?:\/\/[^\s"'@]*:[^\s"']+@[^\s"']+/gi },
-];
-
-export type Redaction = { text: string; hits: string[] };
-
-export function redact(input: string, extraPatterns: string[] = []): Redaction {
-  let text = input;
-  const hits: string[] = [];
-  for (const rule of CREDENTIAL_SHAPES) {
-    // One RegExp instance per rule, with lastIndex reset between the test and the replace: a /g pattern left
-    // mid-scan is how a redaction pass starts missing matches.
-    rule.pattern.lastIndex = 0;
-    if (rule.pattern.test(text)) {
-      hits.push(rule.name);
-      rule.pattern.lastIndex = 0;
-      text = text.replace(rule.pattern, `[redacted:${rule.name}]`);
-    }
-  }
-  for (const source of extraPatterns) {
-    try {
-      const pattern = new RegExp(source, "gi");
-      if (pattern.test(text)) {
-        hits.push(source);
-        text = text.replace(new RegExp(source, "gi"), "[redacted:custom]");
-      }
-    } catch {
-      // A bad pattern is skipped rather than crashing a write path that exists to be forgiving.
-    }
-  }
-  return { text, hits };
-}
+// The credential shapes and the scrubbing pass moved to `lib/redact.ts` when `extensions/cognee.ts` needed the same
+// rules: two copies of a rule list is how two copies drift. Re-exported rather than quietly imported so every
+// existing importer of this module keeps working while the fleet has exactly one list.
+export { redact, type Redaction };
 
 /**
  * Redact and bound an extension's `details` payload before it is stored.

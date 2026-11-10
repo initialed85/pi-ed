@@ -51,6 +51,15 @@ const EXPECTED: Record<string, Surface> = {
     messageRenderers: ["autopilot"],
     entryRenderers: [],
   },
+  "cognee.ts": {
+    // A pure client: nothing here is lifecycle. It speaks when an agent asks, and asks nothing of the session.
+    events: [],
+    tools: ["memory_remember", "memory_recall"],
+    commands: ["cognee"],
+    flags: [],
+    messageRenderers: [],
+    entryRenderers: [],
+  },
   "compaction-summary-guard.ts": {
     events: ["session_before_compact"],
     tools: [],
@@ -175,6 +184,9 @@ const dirFor = (name: string): string => (PARKED.includes(name) ? PARKED_DIR : E
  */
 const LOAD_ENV: Record<string, Record<string, string>> = {
   "memory.ts": { PI_MEMORY_DSN: "postgres://packaging:packaging@127.0.0.1:1/packaging" },
+  // A key that is not a key, set the way a laptop would set it. The pod path (a mounted file) is exercised in
+  // test/cognee.test.ts against a scratch file, so nothing here reads a real Secret.
+  "cognee.ts": { COGNEE_API_KEY: "packaging-not-a-real-key-000000000000000000" },
 };
 
 function loadModuleEnv(): Record<string, string | undefined> {
@@ -210,10 +222,10 @@ describe("extensions directory", () => {
 
   it("keeps the parked set parked, and says why in the file Pi will not load", () => {
     // The reason matters as much as the state here: a directory someone cannot explain gets moved back "while we are
-    // in there", and the memory extension is parked because a fleet is being cut over to mem0, not because it broke.
+    // in there", and the memory extension is parked because a fleet is being cut over to cognee, not because it broke.
     expect(readdirSync(PARKED_DIR).filter((name) => name.endsWith(".ts")).sort()).toEqual([...PARKED].sort());
     const why = readFileSync(path.join(PARKED_DIR, "README.md"), "utf8");
-    expect(why).toContain("mem0");
+    expect(why).toContain("cognee");
     for (const name of PARKED) {
       expect(existsSync(path.join(EXTENSIONS_DIR, name)), `${name} is in extensions/ and therefore loaded`).toBe(false);
       expect(readFileSync(path.join(PARKED_DIR, name), "utf8"), name).toContain("PARKED");
