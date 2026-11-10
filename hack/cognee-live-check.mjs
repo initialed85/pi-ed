@@ -142,5 +142,55 @@ if (!flag("keep")) {
   }
 }
 
+
+if (flag("prove-delete")) {
+  // slopyphus' caution, made testable: a DELETE that reports deletedNodes/deletedEdges proves *something* came out,
+  // not that the credential did. Graph nodes routinely outlive the document that introduced them. So the proof is
+  // written as a search for the literal before and after, with the counts recorded rather than trusted.
+  const SECRET = `SCRUBME-${MARK}`;
+  const secretNote = `note ${MARK}-secret carrying a credential: api_key=${SECRET}. It is a probe and belongs in the probe dataset.`;
+  const secretForm = new FormData();
+  secretForm.set("raw_data", secretNote);
+  secretForm.set("datasetName", DATASET);
+  secretForm.set("node_set", NODE_SET);
+  const seeded = await call("/api/v1/remember", { method: "POST", body: secretForm }, 300_000);
+  note("seeded a note carrying a literal credential", seeded.ok, `HTTP ${seeded.status} in ${seeded.ms} ms · status ${String(seeded.body?.status)}`);
+
+  const before = await call("/api/v1/recall", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: SECRET, datasets: [DATASET], topK: 8, searchType: "CHUNKS" }) }, 90_000);
+  const seenBefore = JSON.stringify(before.body ?? []).includes(SECRET);
+  check("the literal credential is retrievable before the delete", seenBefore, `HTTP ${before.status} in ${before.ms} ms`);
+
+  const seededIds = Array.isArray(seeded.body?.items) ? seeded.body.items.map((item) => item?.id).filter(Boolean) : [];
+  const removedCounts = [];
+  for (const id of seededIds) {
+    const del = await call(`/api/v1/datasets/${seeded.body?.dataset_id ?? datasetId}/data/${id}`, { method: "DELETE" }, 90_000);
+    removedCounts.push(del.body ?? { status: del.status });
+  }
+  say(`     delete reported: ${JSON.stringify(removedCounts).slice(0, 300)}`);
+
+  const after = await call("/api/v1/recall", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: SECRET, datasets: [DATASET], topK: 8, searchType: "CHUNKS" }) }, 90_000);
+  const inChunks = JSON.stringify(after.body ?? []).includes(SECRET);
+
+  const datasetsAfter = await call("/api/v1/datasets");
+  const listAfter = Array.isArray(datasetsAfter.body) ? datasetsAfter.body : datasetsAfter.body?.datasets ?? [];
+  const targetAfter = listAfter.find((entry) => entry.name === DATASET);
+  let inRawScan = false;
+  if (targetAfter?.id) {
+    const rowsAfter = await call(`/api/v1/datasets/${targetAfter.id}/data`);
+    const itemsAfter = Array.isArray(rowsAfter.body) ? rowsAfter.body : rowsAfter.body?.data ?? rowsAfter.body?.items ?? [];
+    for (const row of itemsAfter) {
+      const raw = await call(`/api/v1/datasets/${targetAfter.id}/data/${row.id}/raw`);
+      if (raw.raw.includes(SECRET)) inRawScan = true;
+    }
+  }
+
+  const graphAfter = await call("/api/v1/recall", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: `which api_key value appears in note ${MARK}-secret? answer with the exact string if you can find it, otherwise say none`, datasets: [DATASET], topK: 3, searchType: "GRAPH_COMPLETION" }) }, 90_000);
+  const inGraphAnswer = JSON.stringify(graphAfter.body ?? []).includes(SECRET);
+
+  check("the literal credential is gone from chunks after the delete", !inChunks, inChunks ? "still in stored chunks" : "not in stored chunks");
+  check("the literal credential is gone from every remaining data row", !inRawScan, inRawScan ? "a remaining row still carries it" : "raw scan of remaining rows is clean");
+  check("the literal credential is not answerable from the graph", !inGraphAnswer, inGraphAnswer ? "a synthesized answer still reproduces it — cognee's delete did not cascade to the nodes" : `graph answered without it in ${graphAfter.ms} ms`);
+  say(`     caveat on the last one: a GRAPH_COMPLETION that omits the string is evidence the model did not find it, not proof no node holds it. No node-enumeration door is known to this script; if one is found, that assertion belongs on it.`);
+}
 say(`\n${failures ? "FAIL" : "PASS"} cognee live check against ${BASE} (dataset ${DATASET}, key from ${KEY_FILE} — value not shown)`);
 process.exit(failures ? 1 : 0);
