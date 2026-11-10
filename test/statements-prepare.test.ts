@@ -177,6 +177,7 @@ describe("every exported statement", () => {
     expect(builders).toEqual([
       "agentStatement",
       "dreamCallEdgeStatement",
+      "dreamConsiderStatement",
       "dreamCursorStatement",
       "dreamSpanStatement",
       "dreamStatement",

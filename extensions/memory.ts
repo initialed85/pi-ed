@@ -1319,7 +1319,25 @@ export function dreamSpanStatement(sessionId: string): Statement {
 
 export function dreamCursorStatement(sessionId: string): Statement {
   return {
-    sql: `update memory.session set dream_seq = (select coalesce(max(seq), dream_seq) from memory.event where session_id = $1) where id = $1`,
+    sql: `update memory.session set dream_seq = (select coalesce(max(seq), dream_seq) from memory.event where session_id = $1), dream_considered_seq = greatest(dream_considered_seq, dream_seq, (select coalesce(max(seq), dream_seq) from memory.event where session_id = $1)) where id = $1`,
+    values: [sessionId],
+  };
+}
+
+/**
+ * Looked at, not remembered: the watermark for a dream turn that wrote nothing.
+ *
+ * This advances only `dream_considered_seq`, so the span stays open and the next memory that is actually written
+ * covers these rows too. The old behaviour reused `dreamCursorStatement` here, which moved `dream_seq` over content
+ * no memory had ever described - a decline read as a verdict, and the rows fell out of every future span. That is how
+ * a peer's question about the Earl himself was looked at, declined on a row count, and buried.
+ *
+ * The asking still does not loop: `dreamWatermarkStatement` reads the considered watermark, so a restarted session
+ * knows it has already been asked about this stretch.
+ */
+export function dreamConsiderStatement(sessionId: string): Statement {
+  return {
+    sql: `update memory.session set dream_considered_seq = (select coalesce(max(seq), dream_considered_seq) from memory.event where session_id = $1) where id = $1`,
     values: [sessionId],
   };
 }
@@ -1338,7 +1356,7 @@ export function dreamWatermarkStatement(sessionId: string): Statement {
   return {
     sql: `select count(*) filter (where coalesce(meta ->> 'dream_turn', 'false') <> 'true') as work_before
           from memory.event
-          where session_id = $1 and seq <= coalesce((select dream_seq from memory.session where id = $1), 0)`,
+          where session_id = $1 and seq <= coalesce((select greatest(dream_seq, dream_considered_seq) from memory.session where id = $1), 0)`,
     values: [sessionId],
   };
 }
@@ -1570,19 +1588,29 @@ export function dreamFloorFor(trigger: Trigger, minWork: number): number {
 }
 
 /**
- * The store-side half of the same bar the triggers use, in words an agent can act on.
+ * The store-side half of the same bar the triggers use, split into the two things it was conflating.
  *
- * Returns `undefined` when the stretch is worth a memory. This is not a fault path: a stretch that is below the floor
- * has been looked at and judged, so the dream still closes it and the next idle window does not ask again. Returning
- * the wording rather than writing the row is what keeps four empty "nothing happened" paragraphs out of a store whose
- * whole purpose is being searched by somebody who was not there.
+ * `dreamRefusal` is the hard one, and it fires only on a span with nothing in it: a dream about a previous dream, or
+ * a stretch that has already been summarized. That is the only case where the arithmetic can be certain, because
+ * there is literally no content to remember.
+ *
+ * `dreamThinNote` is advisory and the write goes ahead anyway. The count used to refuse a short stretch outright, and
+ * the prompt told the agent to decline before it tried, which is a gate tuned for work volume when the thing being
+ * measured is whether a sentence is worth reading later. A two-row span holding a peer's question about the Earl is
+ * worth a memory; a forty-row span of a botched refactor may not be. The floor survives as a nudge in the result and
+ * as the trigger's own economy of turns, and the model is the judge of the content.
  */
-export function dreamFloorNote(workEvents: number, floor: number): string | undefined {
+export function dreamRefusal(workEvents: number): string | undefined {
+  return workEvents > 0
+    ? undefined
+    : "memory_dream not written: nothing unsummarized since the last dream (0 non-dream events in the span). Either this stretch is already remembered or the only thing that happened since was dreaming - say what you learned in the reply instead.";
+}
+
+/** The thinness note, worded so the agent knows the write happened and the count was only an opinion. */
+export function dreamThinNote(workEvents: number, floor: number): string | undefined {
   const bar = Math.max(1, floor);
-  if (workEvents >= bar) return undefined;
-  return workEvents
-    ? `memory_dream not written: the span holds ${workEvents} work event(s), under the ${bar} a memory is worth. Say in the reply that the stretch was thin and leave it there - nothing else is needed and the stretch is closed either way.`
-    : `memory_dream not written: nothing unsummarized since the last dream (0 non-dream events in the span). Either this stretch is already remembered or the only thing that happened since was dreaming - say what you learned in the reply instead.`;
+  if (workEvents >= bar || workEvents === 0) return undefined;
+  return `thin span: ${workEvents} work event(s), under the ${bar} a stretch is normally worth a dream - written anyway, because the count is not the judge of whether a thing is worth remembering`;
 }
 
 export const DREAM_PROMPT = [
@@ -1591,9 +1619,29 @@ export const DREAM_PROMPT = [
   "summary: two to four sentences about what actually happened and what would be useful later — decisions, findings, dead ends, the state things were left in.",
   "subjects: three to six loose, generic labels. They are the index your future self scans, so a label that only makes sense inside one file is a bad label.",
   "feel: one honest line about how this stretch felt to work on. Not decoration — this is the part that shows up over months.",
-  "If the stretch is thin or empty, say so in one sentence and do not call memory_dream: the store refuses a span with too few work events to be a memory, and an empty stretch should leave no rows behind. Declining is safe - the stretch is closed either way, and you will not be asked about it again.",
-  "If the only thing that has happened since your last dream is other dreams, do not call the tool at all: a memory about a memory is not a memory.",
+  "The store refuses only a span with nothing in it. A short stretch is not automatically a thin one: a decision, a question worth keeping, or something Ed said about himself is a memory even when no tool was touched, and you are the judge of that, not the row count.",
+  "Decline - say so in one sentence and do not call the tool - only when the span is genuinely empty, or when all that happened since your last dream is other dreams. A memory about a memory is not a memory, and an empty stretch should leave no rows behind.",
+  "Declining is safe either way: the stretch is closed for asking, and if it is ever worth remembering the next dream's span will still hold it.",
 ].join("\n");
+
+/**
+ * The dream instruction, per trigger.
+ *
+ * Before compaction the instruction has to include the one thing the base prompt forbids, because the base prompt was
+ * eating live work. A pre-compaction dream arrives as a turn, and the run that was about to take its next step got
+ * this instead: slopyphus session 01a1a6d9 had a syntax error in hand at 09:27:18, the dream fired at 09:32:01, the
+ * agent wrote the memory, said "Dream recorded, m'lord" and stopped, and the fix waited seven minutes for the Earl to
+ * poke it. "Do not start new work" is right for a session that is idle and wrong for one that is mid-task, so the
+ * mid-task case says so out loud.
+ */
+export function dreamPromptFor(trigger: Trigger): string {
+  if (trigger !== "pre_compaction") return DREAM_PROMPT;
+  return [
+    DREAM_PROMPT,
+    "You were interrupted mid-task to do this: the context is being compacted, not ended, and the work is still yours.",
+    "Once the memory is written (or declined), take the next step of the task you were doing in the same turn - run the tool, make the edit, keep going - rather than reporting the dream and stopping. Do not wait to be asked.",
+  ].join("\n");
+}
 
 /** How long a dream turn is allowed to look in-flight before a later trigger may run again. */
 const DREAM_TURN_TIMEOUT_MS = 5 * 60_000;
@@ -1952,7 +2000,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
     dreamStartedAt = Date.now();
     dreamWriteFaulty = false;
     try {
-      await api.sendMessage({ customType: "memory:dream", content: DREAM_PROMPT, display: false, details: { trigger } }, { triggerTurn: true });
+      await api.sendMessage({ customType: "memory:dream", content: dreamPromptFor(trigger), display: false, details: { trigger } }, { triggerTurn: true });
     } catch (error) {
       // The dream never started, so the clock has to be let go or this session believes it is dreaming for the next
       // DREAM_TURN_TIMEOUT_MS and quietly refuses every later trigger.
@@ -1982,9 +2030,13 @@ export default function memoryExtension(api: ExtensionAPI): void {
    * and leaves hidden prompt rows in the branch that `collect()` counts, which is how a no-op ends up in the context
    * and stays there.
    *
-   * Advancing the cursor on a clean no-op is safe in a way advancing it on a failure is not: the agent saw the stretch
-   * and judged it, and a memory that was never worth writing is not lost by not being written. A store that refused
-   * for a transient reason is different - there the stretch really is unsummarized, so the gate stays open.
+   * Advancing the *considered* watermark on a clean no-op is what stops the asking loop; advancing the *summarized*
+   * one would be a different thing entirely, and it used to happen here. A stretch the agent looked at and found
+   * empty is not lost by not being written, but a stretch the agent never got to judge on its merits - declined on a
+   * row count, or refused by an empty span - is content that no memory has ever described, and closing it made it
+   * unreachable. So the decline moves only the watermark that says "this has been asked about", and the rows stay in
+   * the next memory's span. A store that refused for a transient reason is a third case: there the gate stays open
+   * entirely, because nothing was judged at all.
    */
   function closeDreamTurn(ctx: ExtensionContext, aborted = false): void {
     if (dreamStartedAt === 0) return;
@@ -2004,16 +2056,18 @@ export default function memoryExtension(api: ExtensionAPI): void {
     if (dreamed >= workSeen) return;
     dreamed = workSeen;
     triggers.delete(sessionId);
-    // ...and move the store-side watermark with it, or the next pod restart reads `dream_seq`, finds the same
-    // already-considered stretch, and wakes the session up to decline it again.
+    // ...and move the store-side "has this been asked about" watermark with it, or the next pod restart reads a stale
+    // one, finds the same already-considered stretch, and wakes the session up to decline it again. Deliberately not
+    // `dreamCursorStatement`: that would also mark the stretch summarized, which is the lie this whole function used
+    // to tell.
     attempt(
-      "dream cursor after a dream that wrote nothing",
+      "dream considered watermark after a dream that wrote nothing",
       (async () => {
         const refused = await flush(ctx, "flush");
         if (refused) throw new Error(refused);
         const db = await database();
         if (!db) throw new Error(connectError || lastError || "no database reachable");
-        const cursor = dreamCursorStatement(sessionId);
+        const cursor = dreamConsiderStatement(sessionId);
         await db.query(cursor.sql, cursor.values);
       })(),
     );
@@ -2235,17 +2289,19 @@ export default function memoryExtension(api: ExtensionAPI): void {
         const spanResult = await client.query(span.sql, span.values);
         const spanRow = spanResult.rows[0] ?? { last_seq: 0, work_events: 0 };
         const workEvents = Number(spanRow.work_events);
-        // The floor again, this time where the row would land, and asked of the same trigger so the two halves cannot
-        // disagree: the trigger does not ask about a scrap, the store does not remember one, and compaction is
-        // exempted in both places because that is where a thin stretch is the one worth keeping.
+        // The floor, this time where the row would land. It is an opinion about economy, not a verdict about content:
+        // the hard refusal is only the empty span, because that is the one case where the arithmetic can be certain
+        // there is nothing to remember. A short span is written and annotated, since the alternative - learned the
+        // hard way on macker's session - is a stretch of pure conversation being counted, declined and buried.
         const floor = dreamFloorFor(trigger, cfg.minDreamWork ?? DEFAULTS.minDreamWork);
-        const refusal = dreamFloorNote(workEvents, floor);
+        const refusal = dreamRefusal(workEvents);
         if (refusal) {
           return {
             content: [{ type: "text", text: refusal }],
-            details: { error: workEvents ? "span below the floor" : "empty span", workEvents, floor },
+            details: { error: "empty span", workEvents, floor },
           };
         }
+        const thin = dreamThinNote(workEvents, floor);
 
         // The vector is written when the embedder answers and omitted when it does not. A memory without a vector is
         // still findable by keywords and still says in its own `detail` why it has no vector, which is better than a
@@ -2257,6 +2313,7 @@ export default function memoryExtension(api: ExtensionAPI): void {
         const detail: Record<string, unknown> = {
           written_by: "memory_dream",
           span_events: Number(spanRow.work_events),
+          ...(thin ? { thin } : {}),
           ...(embedded.ok
             ? { embed_model: embedded.model, embed_chunks: embedded.chunks, embed_tokens: embedded.tokens }
             : { embed_error: embedded.error }),
@@ -2301,8 +2358,8 @@ export default function memoryExtension(api: ExtensionAPI): void {
         const vectorNote = embedded.ok ? `vector from ${embedded.model} (${embedded.tokens} tokens, ${embedded.chunks} chunk(s))` : `no vector (${embedded.error})`;
         ui(ctx).notify(`memory: dream written (${subjects.join(", ") || "no subjects"}, ${vectorNote})`, "info");
         return {
-          content: [{ type: "text", text: `dream recorded for session ${sessionId} (${trigger}); subjects: ${subjects.join(", ") || "none"}; ${vectorNote}${edgesIncomplete ? `; edges incomplete: ${edgesIncomplete}` : ""}` }],
-          details: { subjects, trigger, embedded: embedded.ok, embed: embedded.ok ? { tokens: embedded.tokens, chunks: embedded.chunks, model: embedded.model } : embedded.error, memoryId: memoryId ?? null, edgesIncomplete: edgesIncomplete || null },
+          content: [{ type: "text", text: `dream recorded for session ${sessionId} (${trigger}); subjects: ${subjects.join(", ") || "none"}; ${vectorNote}${thin ? `; ${thin}` : ""}${edgesIncomplete ? `; edges incomplete: ${edgesIncomplete}` : ""}` }],
+          details: { subjects, trigger, embedded: embedded.ok, embed: embedded.ok ? { tokens: embedded.tokens, chunks: embedded.chunks, model: embedded.model } : embedded.error, memoryId: memoryId ?? null, edgesIncomplete: edgesIncomplete || null, ...(thin ? { thin } : {}) },
         };
       } catch (error) {
         const message = describeStoreError(error instanceof Error ? error.message : String(error));

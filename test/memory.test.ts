@@ -695,7 +695,7 @@ describe("sql", () => {
     // The mirror of the span query: the span counts what is ahead of the cursor, the seed counts what is behind it,
     // and the two together are the whole history. If the gate starts at zero instead, a resumed session's every row
     // is unsummarized work and the first clock tick asks about it.
-    expect(seed.sql).toContain("seq <= coalesce((select dream_seq from memory.session where id = $1), 0)");
+    expect(seed.sql).toContain("seq <= coalesce((select greatest(dream_seq, dream_considered_seq) from memory.session where id = $1), 0)");
     expect(seed.sql).toContain(`count(*) filter (where coalesce(meta ->> 'dream_turn', 'false') <> 'true') as work_before`);
     expect(seed.values).toEqual(["s1"]);
     // Same definition of work, or the two halves would disagree about what the gate is counting.
@@ -901,15 +901,64 @@ describe("dream gate", () => {
     // idle window.
     expect(dreamPending!(1, 0)).toBe(true);
   });
-  it("refuses to remember a stretch too thin to be a memory, in the unit the gate counts", async () => {
-    const { dreamFloorNote } = await loadModule();
-    expect(dreamFloorNote!(4, 4)).toBeUndefined();
-    expect(dreamFloorNote!(9, 4)).toBeUndefined();
-    expect(dreamFloorNote!(3, 4)).toContain("under the 4 a memory is worth");
-    expect(dreamFloorNote!(0, 4)).toContain("nothing unsummarized since the last dream");
-    // A floor of 1 is the old behaviour, and an empty span is still refused under it.
-    expect(dreamFloorNote!(1, 0)).toBeUndefined();
-    expect(dreamFloorNote!(0, 0)).toContain("0 non-dream events");
+  it("refuses a span with nothing in it and annotates one that is merely short", async () => {
+    // Two things the old single function conflated, and the conflation is what lost the fleet a question about the
+    // Earl: a count of rows is a good way to decide whether a dream is worth *asking* about, and a terrible way to
+    // decide whether a sentence is worth remembering. Only the empty span is refused outright.
+    const { dreamRefusal, dreamThinNote } = await loadModule();
+    expect(dreamRefusal!(2)).toBeUndefined();
+    expect(dreamRefusal!(0)).toContain("nothing unsummarized since the last dream");
+    expect(dreamRefusal!(0)).toContain("0 non-dream events");
+    // Below the floor the write goes ahead, and the thinness travels with it as a note, not a veto.
+    expect(dreamThinNote!(3, 4)).toContain("thin span: 3 work event(s), under the 4");
+    expect(dreamThinNote!(3, 4)).toContain("written anyway");
+    expect(dreamThinNote!(4, 4)).toBeUndefined();
+    expect(dreamThinNote!(9, 4)).toBeUndefined();
+    // An empty span is refused by the refusal, so the note must not double up on it.
+    expect(dreamThinNote!(0, 4)).toBeUndefined();
+  });
+
+  it("tells the dreamer it is the judge of a short stretch, not the row count", async () => {
+    const { DREAM_PROMPT } = await loadModule();
+    expect(String(DREAM_PROMPT)).toContain("you are the judge of that, not the row count");
+    expect(String(DREAM_PROMPT)).toContain("The store refuses only a span with nothing in it");
+    // The old wording told the agent to decline a thin stretch before it had read it, which is what macker obeyed.
+    expect(String(DREAM_PROMPT)).not.toContain("too few work events");
+    expect(String(DREAM_PROMPT)).toContain("A memory about a memory is not a memory");
+    expect(String(DREAM_PROMPT)).toContain("Call memory_dream exactly once");
+    expect(String(DREAM_PROMPT)).not.toContain("use subjects {none}");
+    // A decline no longer burns the rows: the promise is that the next span still holds them.
+    expect(String(DREAM_PROMPT)).toContain("the next dream's span will still hold it");
+  });
+
+  it("tells a pre-compaction dream to go back to the work it interrupted", async () => {
+    // The dream that ate slopyphus's fix: 09:27:18 a syntax error in hand, 09:32:01 the context filled and the dream
+    // arrived as a turn, and "do not start new work" was obeyed so literally that the run stopped and the Earl had to
+    // poke it seven minutes later. The base prompt is written for a session that is idle; a mid-task one has to be
+    // told the work is still its own.
+    const { dreamPromptFor, DREAM_PROMPT } = await loadModule();
+    expect(dreamPromptFor!("idle10m")).toBe(DREAM_PROMPT);
+    expect(dreamPromptFor!("resume10m")).toBe(DREAM_PROMPT);
+    expect(dreamPromptFor!("manual")).toBe(DREAM_PROMPT);
+    const compact = String(dreamPromptFor!("pre_compaction"));
+    expect(compact).toContain(DREAM_PROMPT);
+    expect(compact).toContain("You were interrupted mid-task");
+    expect(compact).toContain("take the next step of the task you were doing in the same turn");
+    expect(compact).not.toContain("awaiting the next instruction");
+  });
+
+  it("keeps the two watermarks honest about which one each path moves", async () => {
+    const { dreamCursorStatement, dreamConsiderStatement } = await loadModule();
+    // A written memory closes the stretch for both questions: nothing left to summarise, nothing left to ask about.
+    const written = dreamCursorStatement!("s1");
+    expect(written.sql).toContain("set dream_seq =");
+    expect(written.sql).toContain("dream_considered_seq");
+    // A dream that wrote nothing closes only the asking. Moving `dream_seq` here is what buried the rows: the memory
+    // was never written, so the span was never summarised, whatever the dream decided to say.
+    const declined = dreamConsiderStatement!("s1");
+    expect(declined.sql).toContain("set dream_considered_seq =");
+    expect(declined.sql).not.toContain("set dream_seq");
+    expect(declined.values).toEqual(["s1"]);
   });
 
   it("exempts compaction from the floor, because that is where a thin stretch is the one worth keeping", async () => {
@@ -925,12 +974,12 @@ describe("dream gate", () => {
     expect(dreamPending!(2, 0, dreamFloorFor!("idle10m", 4))).toBe(false);
   });
 
-  it("tells the agent that declining an empty stretch is safe, because the watermark closes either way", async () => {
+  it("tells the agent that declining an empty stretch is safe, because the asking closes either way", async () => {
     // The instruction used to end the other way: "a dream that admits it was empty is fine", which is exactly what put
     // four paragraphs of "nothing happened" into a store that other agents then retrieve.
     const { DREAM_PROMPT } = await loadModule();
-    expect(String(DREAM_PROMPT)).toContain("do not call memory_dream");
-    expect(String(DREAM_PROMPT)).toContain("closed either way");
+    expect(String(DREAM_PROMPT)).toContain("do not call the tool");
+    expect(String(DREAM_PROMPT)).toContain("closed for asking");
     expect(String(DREAM_PROMPT)).not.toContain("use subjects {none}");
     expect(String(DREAM_PROMPT)).toContain("Call memory_dream exactly once");
   });

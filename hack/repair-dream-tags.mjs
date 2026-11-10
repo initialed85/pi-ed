@@ -235,17 +235,21 @@ try {
       + ` that no longer matches it is worse than no repair at all.`);
   }
 
-  // The cursor has to follow, or the work stays behind it - but to the front of the recovered work, not the end of the
-  // history. Moving it to the top would mark the untagged rows as already summarized, which is the exact thing this
-  // repair is trying to undo. Lowered only, never raised: a session that has legitimately dreamed since has nothing
-  // to gain from being pushed forward.
+  // The cursors have to follow, or the work stays behind them - but to the front of the recovered work, not the end of
+  // the history. Moving them to the top would mark the untagged rows as already summarized, which is the exact thing
+  // this repair is trying to undo. Lowered only, never raised: a session that has legitimately dreamed since has
+  // nothing to gain from being pushed forward. Both watermarks, because the gate reads `dream_considered_seq` and a
+  // repair that lowers only the summarization cursor leaves the work span-open but never asked about again - which is
+  // the same silence this script was written to break.
   const moved = await client.query(`
-    update memory.session set dream_seq = f.to_seq
+    update memory.session
+      set dream_seq = least(dream_seq, f.to_seq),
+          dream_considered_seq = least(dream_considered_seq, f.to_seq)
     from (select session_id, min(seq) - 1 as to_seq from repair_targets group by session_id) f
-    where memory.session.id = f.session_id and memory.session.dream_seq > f.to_seq
+    where memory.session.id = f.session_id and (memory.session.dream_seq > f.to_seq or memory.session.dream_considered_seq > f.to_seq)
     returning memory.session.id`);
-  console.log(`lowered the dream cursor on ${moved.rowCount} session(s) from ${captured} captured target row(s), so the`
-    + ` untagged work is ahead of it.`);
+  console.log(`lowered both dream cursors on ${moved.rowCount} session(s) from ${captured} captured target row(s), so the`
+    + ` untagged work is ahead of them.`);
   await client.query("commit");
 } catch (error) {
   await client.query("rollback");

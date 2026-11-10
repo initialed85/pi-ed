@@ -272,12 +272,19 @@ produced itself do not count as work — and only when that stretch holds at lea
 so a session that woke up, said one line and went quiet is not asked to reflect on it. An interrupted run never
 dreams: that was somebody hitting Escape on purpose.
 
-A dream that decides nothing was worth remembering has to close its stretch anyway. Until it did, the watermark moved
-only on a successful `memory_dream` write, so an agent that answered the prompt with "nothing here is worth
-remembering" got asked again every idle window — five dream turns in one session, the last three with no work between
-them, each one a hidden prompt and a refusal sitting in the context forever. `closeDreamTurn` moves both the local
-gate and the store's `dream_seq` on a clean no-op, and deliberately leaves the gate open when the store refused for a
-transient reason: a stretch Postgres would not take really is unsummarized.
+The count is a gate on *asking*, not a verdict on *content*. The store refuses a span for one reason only: it holds
+nothing. A short but non-empty span is written and annotated, because the failure mode of the old hard floor was
+silent and total — a two-row stretch holding a peer's question about the Earl was declined as "too thin", and the
+watermark moved past it anyway. There are two watermarks for the two questions: `dream_seq` is how far a memory has
+summarized (what the next dream's span reads off), `dream_considered_seq` is how far a dream has been asked about
+(what the gate reads off). Writing a memory moves both; declining moves only the second, so the stretch is folded into
+the next memory instead of being buried by the one that passed on it.
+
+A dream that decides nothing was worth remembering still has to close its stretch, or the gate re-opens every idle
+window forever: five dream turns in one session, the last three with no work between them, each one a hidden prompt and
+a refusal sitting in the context. `closeDreamTurn` moves the local gate and the store's `dream_considered_seq` on a
+clean no-op, and deliberately leaves everything open when the store refused for a transient reason — a stretch Postgres
+would not take really is unsummarized. What it must never do is move `dream_seq` over rows no memory ever described.
 
 Retrieval is `memory_search`, and it runs two paths rather than choosing between them: the query is embedded and
 handed to pgvector's hnsw index, and full text over summary and feel runs underneath as the net - a memory written
@@ -309,8 +316,8 @@ is safe to leave in the package before the store exists.
 | Env | `PI_MEMORY_DSN` (wins over both files) · `PI_MEMORY_DISABLED` · `PI_MEMORY_CONFIG` · `PI_MEMORY_SPOOL` |
 | Store | `memory.pi-ed.svc.cluster.local:5432` in-cluster; `192.168.1.113:5434` from the LAN (LAN-only LoadBalancer); secret in home-ops' `___secret/` |
 | Embedder | `https://embeddings.dev.initialed85.cc` — `bge-base-en-v1.5`, 768-dim, `POST /v1/embeddings` |
-| Writes | `event` (raw turns: user / assistant / tool_call / tool_result / marker / system), `session`, `agent` on the way in; `memory` (with `embedding`, `embedding_model`, `detail`) and `subject_index` when a dream lands, plus `session.dream_seq` when a dream ends having written nothing |
-| Reads | the session branch, the session id, `session.dream_seq`, and `agent.name` for cross-agent attribution |
+| Writes | `event` (raw turns: user / assistant / tool_call / tool_result / marker / system), `session`, `agent` on the way in; `memory` (with `embedding`, `embedding_model`, `detail`) and `subject_index` when a dream lands, plus `session.dream_considered_seq` when a dream ends having written nothing (`session.dream_seq` only when a memory actually landed) |
+| Reads | the session branch, the session id, `session.dream_seq` and `session.dream_considered_seq`, and `agent.name` for cross-agent attribution |
 | Live check | `hack/memory-live-check.mjs` — a real Pi session against the real store; needs the DSN, spends model tokens, and deletes what it wrote, including when it fails halfway |
 
 #### the graph that forms on its own (`memory.edge`)

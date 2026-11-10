@@ -26,23 +26,36 @@ prompt.
 
 ## When an agent dreams
 
-Three triggers, all gated on the same test: is there a stretch that has not been summarized yet. In the extension the
+Three triggers, all gated on the same test: is there a stretch that has not been looked at yet. In the extension the
 test counts *work* rows in the current branch against how many there were when the last dream landed
-(`dreamPending(workSeen, dreamed)`); `session.event_count > session.dream_seq` is the same idea expressed in the store,
-for anyone looking from outside. If there is no unsummarized stretch, no dream runs - a session that is merely open is
-not a session worth thinking about.
+(`dreamPending(workSeen, dreamed)`); `session.event_count > greatest(session.dream_seq, session.dream_considered_seq)`
+is the same idea expressed in the store, for anyone looking from outside. If there is no unconsidered stretch, no dream
+runs - a session that is merely open is not a session worth thinking about.
 
 - **10 minutes after going idle** - the ordinary case.
 - **Just before compaction** - the last chance to keep something the harness is about to throw away.
 - **10 minutes after a resume** - a session that came back is usually continuing something, and what it remembered
   on the way out is worth comparing with what it does next.
 
-`dream_seq` moves when a dream turn *ends*, not only when it writes. A dream that decided nothing was worth
-remembering has still looked at the stretch and judged it, and a cursor that only advances on a successful write
-re-opens the gate every idle window afterwards - one session on the fleet asked seventeen times about three rows of
-history. The exception is a write the store refused for a transient reason (no connection, or the events it would
-summarise had not landed): there the stretch really is unsummarized, so the gate stays open and the next window tries
-again. Losing a memory is worse than dreaming twice.
+There are **two watermarks, because there are two different questions**, and conflating them is how the fleet lost a
+thing its Earl found interesting. `dream_seq` answers "how far has a memory *summarized*?" and is what a future
+dream's span reads off; `dream_considered_seq` (added in `schema/006_dream_watermarks.sql`) answers "how far has a
+dream *been asked about*?" and is what the gate reads off. A dream that writes moves both. A dream that declines -
+answered the prompt without calling the tool, or called it and was refused by an empty span - moves only the
+considered one.
+
+The single cursor used to move on a dream turn's *end*, on the reasoning that a stretch the agent looked at and found
+empty is not lost by not being written, and a cursor that only advanced on a successful write re-opens the gate every
+idle window (one session on the fleet asked seventeen times about three rows of history). That half is still true, and
+it is why the considered watermark exists. The other half was a lie: at 10:15 on 10-Nov-26 macker's session (01a1b9ad)
+was asked about a stretch holding a peer's question about Ed himself, the prompt told the agent to decline thin
+stretches, the agent declined, and the cursor moved past the rows anyway - so the content was neither remembered nor
+left in the next memory's span, and nothing on the fleet could find it again. A decline is not a verdict on the
+content, and must not bury it.
+
+The exception is a write the store refused for a *transient* reason (no connection, or the events it would summarise
+had not landed): there nothing was judged at all, so both watermarks stay put and the next window tries again. Losing a
+memory is worse than dreaming twice.
 
 **A dream's own rows are not new work.** Dreaming is a turn like any other, so it leaves rows behind: the hidden
 request, the agent's answer, the `memory_dream` call and its result. They are recorded in `event` and tagged
@@ -60,9 +73,19 @@ dream correctly refused a stretch that was full of it. `hack/repair-dream-tags.m
 the old rule had swallowed, and it is the thing to re-run if a session ever reports a span of zero work again.
 
 A second gate sits in front of the first: `minDreamWork` (4 by default) is how much work a stretch has to hold before
-asking about it is worth a turn, enforced at the trigger and again where the row would land. `pre_compaction` is
-exempted from the floor in both places, because there the turn is already spent and the memory is the only version of
-the stretch that survives - a two-row stretch holding one dense decision is exactly what it is for.
+*asking* about it is worth a turn. It is enforced at the trigger, and it is an opinion everywhere else. The store
+refuses a span for one reason only - it holds nothing (`dreamRefusal`); a span that is short but not empty is written
+and annotated (`dreamThinNote`), and the model is the judge of whether a sentence is worth keeping. The count used to
+refuse outright, and the prompt told the agent to decline before it had read the stretch, which is a gate tuned for
+work volume being asked to measure whether a thing is interesting. A two-row span holding a question about the Earl is
+worth a memory; a forty-row span of a botched refactor may not be. `pre_compaction` keeps a floor of 1 in both places:
+there the turn is already spent and the memory is the only version of the stretch that survives.
+
+That same trigger is the one place where the dream instruction has to contradict itself, because a pre-compaction dream
+arrives as a *turn* and eats the run it interrupted. `dreamPromptFor("pre_compaction")` appends the instruction to go
+back to the work: "do not start new work" is right for a session that is idle and ruinous for one that is mid-task -
+slopyphus session 01a1a6d9 had a syntax error in hand at 09:27:18, dreamed at 09:32:01, reported the dream, and
+stopped for seven minutes until the Earl poked it.
 
 ## How retrieval weights
 

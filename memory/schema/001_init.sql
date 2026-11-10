@@ -51,9 +51,11 @@ create table if not exists agent (
 
 /* One recorded Pi session.
 
-   `dream_seq` is the cursor that answers "do we have an unsummarized delta?" - a dream is only worth running when
-   `event_count > dream_seq`. Storing it here rather than computing it per query is the difference between a cheap
-   idle check and a scan, and it is the field that makes an interrupted dream resumable. */
+   `dream_seq` is the cursor that answers "has a memory summarized this far?" - a dream's span starts after it. It is
+   stored here rather than computed per query because the difference is between a cheap idle check and a scan, and it
+   is the field that makes an interrupted dream resumable. Its sibling `dream_considered_seq` (added in
+   `006_dream_watermarks.sql`) answers the different question "has a dream been asked about this far?", which is what
+   the trigger gates on; a dream that declines moves that one alone, so refusing to write never buries the rows. */
 create table if not exists session (
   id text primary key,
   agent_id text not null references agent (id),
