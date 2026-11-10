@@ -184,8 +184,9 @@ describe("turn-stats", () => {
     expect(text).toContain("48.2 tok/s");
     expect(text).toContain("qwen3.8-flash-next-iq3_xxs");
     expect(text).toContain("→ strata");
-    // A clock to the second is the whole of "when", and it costs one token of width.
-    expect(text).toMatch(/\b\d{2}:\d{2}:\d{2}\b/);
+    // The calendar date in front of the clock, in the reader's own timezone. Ed's sessions run for days and
+    // a row reading `12:07:15` in a long transcript is a row that could be any day in it.
+    expect(text).toMatch(/\b\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\b/);
     // The extras that live on /rooter/metrics and in Grafana are deliberately not here: the line is
     // five fields wide so the model name does not have to share it with a cache ratio.
     expect(text).not.toContain("cache");
@@ -197,12 +198,26 @@ describe("turn-stats", () => {
     const text = one(pi, await drive(pi), 120);
     expect(visibleWidth(text)).toBe(120);
     expect(text.endsWith("→ strata")).toBe(true);
-    // Narrower than the row: the padding goes, the numbers stay, and the tail is what gets cut.
-    // A fresh extension, because a second drive on the same one would add a second row.
+    // Narrower than the row: the padding goes first, then `truncateToWidth` keeps the HEAD and eats the
+    // tail, so the casualties are the right-hand end - the model name and the box - and this fixture row
+    // (81 columns dated, 70 without the date) loses them at any phone width. What survives at 40 is the
+    // part a reader actually needs: when the turn happened, and the head of the numbers.
     const second = await load();
     const cut = one(second, await drive(second), 40);
-    expect(cut).toContain("48.2 tok/s");
+    expect(cut).toContain("2024-10-27 11:33:20");
+    expect(cut).not.toContain("qwen3.8-flash-next-iq3_xxs");
     expect(visibleWidth(cut)).toBeLessThanOrEqual(40);
+  });
+
+  it("dates every row, not only the one where the day changed", async () => {
+    // The alternative - printing a date only when it differs from the row above - saves eleven columns and
+    // leaves the first row of a session undatable from itself, which is the row a reader is most likely to
+    // be trying to place.
+    const fresh = await load();
+    await drive(fresh);
+    const rows = await drive(fresh);
+    expect(rows).toHaveLength(2);
+    for (const entry of rows) expect(paint(fresh, entry, 120)).toMatch(/\b2024-10-27 \d{2}:\d{2}:\d{2}\b/);
   });
 
   it("is dim, because it is a margin note and not an answer", async () => {

@@ -20,6 +20,12 @@
  *
  * What the numbers mean, and where each one comes from:
  *
+ *   - `when` is the calendar date and the clock, in the reader's timezone, on every row. The date is
+ *     eleven columns on a row that is 63 wide undated and 74 dated, and a narrow terminal keeps the head
+ *     of the row rather than its tail - so at 50 columns the undated row had already lost `41.7 tok/s`
+ *     onward and at 45 it had already lost the model name. The date does not newly sacrifice anything a
+ *     phone reader was keeping; it buys the only field that a long-lived session cannot infer from the
+ *     row itself.
  *   - `duration` is wall clock around the provider call, from the request Pi made to the message
  *     finishing. A turn that ran three tool calls gets three lines, one per answer, which is the
  *     granularity a reader actually scans for.
@@ -62,9 +68,9 @@
  *   - `ctrl+o` (expand) writes a second line under the first rather than appending to it: the prompt
  *     length and how much of it was cached, the work done, the cache rate, the prefill window and its
  *     rate, the generation window and its rate, the output token count with how much of it was
- *     thinking, and the proxy's own queue wait. A second line because the scan line is right-aligned
- *     and truncates from the left in a narrow terminal, and those are the numbers that would be
- *     truncated away.
+ *     thinking, and the proxy's own queue wait. A second line because the scan line is right-aligned and a
+ *     narrow terminal truncates its tail - the model and the box go first - and those are the numbers that
+ *     would otherwise be truncated away.
  *
  * No flag and no configuration, and nothing at all outside TUI modes: `pi -p` and `--json` have no
  * transcript to decorate, and appending an entry there costs a write to a session nobody is reading.
@@ -529,7 +535,10 @@ class StatsLine implements Component {
     const { primary, detail } = format(this.data, this.expanded);
     const lines = [primary, ...(detail ? [detail] : [])].map((text) => {
       const w = visibleWidth(text);
-      // Prefer losing the left padding to losing the model name, then truncate hard.
+      // What actually happens at a narrow terminal, measured rather than assumed: the padding only exists
+      // while the row fits, and once it does not, `truncateToWidth` keeps the HEAD and eats the TAIL. So a
+      // row that is too wide loses its right-hand end - the model and the box - not its left padding, and
+      // the order `format` puts the fields in is what decides the casualties.
       const aligned = w <= width ? " ".repeat(Math.max(0, width - w)) + text : truncateToWidth(text, width, "…");
       return this.theme?.fg?.("dim", aligned) ?? aligned;
     });
@@ -542,9 +551,10 @@ class StatsLine implements Component {
 /**
  * The line itself, in the order a reader actually scans it: when, how long, how fast, what answered.
  *
- * Expansion adds a second line rather than appending to the first. The scan line is right-aligned and
- * truncates from the left when the terminal is narrow; the detail line carries the numbers that would
- * have been the first casualties of that truncation.
+ * Expansion adds a second line rather than appending to the first. The scan line is right-aligned, and a
+ * terminal narrower than the row loses its right-hand end - truncation keeps the head - so the fields a
+ * reader on a phone keeps are the left ones: the time, then the duration. The detail line carries the
+ * numbers that would otherwise be the first casualties.
  */
 function format(data: TurnStatsData, expanded: boolean): { primary: string; detail?: string } {
   const parts: string[] = [];
@@ -611,10 +621,24 @@ function detailLine(data: TurnStatsData): string | undefined {
   return parts.length ? parts.join("  ") : undefined;
 }
 
+/**
+ * When the turn finished, in the reader's own timezone, with the calendar date in front of the clock.
+ *
+ * The date used to be left off on the theory that a clock to the second is the whole of "when". That is
+ * true of a turn and false of a scrollback: Ed's sessions run for days, and a row reading `12:07:15` in
+ * a long transcript is a row that could be any day in it. Measured on the row in his own screenshot -
+ * `11:54:20  177.8s  ttft ~171.1s  pre 170.7s  41.7 tok/s  -> sushi` - the line is 63 columns undated and
+ * 74 dated, and `truncateToWidth` keeps the head, so at 50 columns the *undated* row already loses from
+ * `41.7 tok/s` onward and at 45 it already loses the model name. The date does not newly sacrifice the
+ * model column on a phone; that column was already gone. It is on every row unconditionally, rather than
+ * only when the day changes, because a day-change-only rule makes the first row of a session the one row
+ * that cannot be dated from itself.
+ */
 function clock(value: number): string {
   const d = new Date(value);
   const pad = (n: number) => String(n).padStart(2, "0");
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  const date = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  return `${date} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 /** Durations below a second read better in milliseconds than as 0.4s next to 12s. */
