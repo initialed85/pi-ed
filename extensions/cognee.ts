@@ -41,6 +41,10 @@
  *      (home-ops `applications/cognee/README.md`), so writes serialize: under contention `background: true` is the
  *      honest choice — 0.2 s to return, the build happens server-side.
  *
+ *   7. **Two doors, two name rules.** `POST /api/v1/recall` wants real dataset names owned by the caller (fleet-ops
+ *      works, `memory` 404s); `GET /api/v1/datasets/status/<name>` wants the alias `memory` and answers with the
+ *      caller's own dataset keyed by UUID (fleet-ops, its UUID, and any casing of it all 404). Both measured on
+ *      home-dev on 2026-11-10. Neither door accepts the other's vocabulary.
  *   6. **A dead embedder arrives as a write conflict.** On 2026-11-10, with the embeddings pod unschedulable, every
  *      foreground `remember` answered **409 after ~31 s** — "Embedding connection test timed out after 30s. Check
  *      that your embedding endpoint is reachable." — while `run_in_background=true` accepted the same note in 154 ms.
@@ -309,7 +313,18 @@ export class Cognee {
     return this.call("/api/v1/recall", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(recallPayload(input, this.cfg)) }, RECALL_TIMEOUT_MS);
   }
 
-  /** Per-dataset build state. The distinction between "searchable" and "graph built" is the one a dashboard hides. */
+  /**
+   * Per-dataset build state. The distinction between "searchable" and "graph built" is the one a dashboard hides.
+   *
+   * The literal `memory` here is not a typo for the configured dataset, and it is the opposite of how the recall door
+   * resolves names. Measured on home-dev on 2026-11-10 with the agent key: `GET /api/v1/datasets/status/memory`
+   * answers 200 and its body is keyed by the UUID of fleet-ops — the dataset that key actually owns — while
+   * `status/fleet-ops`, `status/FLEET-OPS`, `status/<fleet-ops's own UUID>` all answer 404, and
+   * `POST /api/v1/recall` for `datasets: ["memory"]` answers 404 with "Dataset names resolve only among the datasets
+   * you own". So `status` takes Cognee's own alias for the caller's memory dataset, and `recall` takes real dataset
+   * names. Getting these two the wrong way round produces a healthy-looking status for a dataset nobody reads, or a
+   * 404 for one that is perfectly fine.
+   */
   async status(): Promise<CallResult> {
     return this.call("/api/v1/datasets/status/memory", { method: "GET" }, QUICK_TIMEOUT_MS);
   }

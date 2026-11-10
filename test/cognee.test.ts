@@ -396,6 +396,19 @@ describe("the tools as an agent meets them", () => {
     expect(text).toMatch(/Nothing was stored/);
   });
 
+  it("keeps the two doors' name rules apart, because cognee gives them different vocabularies", () => {
+    // Measured on home-dev with the agent key: status/memory answers 200 with a body keyed by fleet-ops's UUID,
+    // while status/fleet-ops, status/FLEET-OPS and status/<fleet-ops's UUID> all answer 404 — and the reverse holds
+    // for recall, where datasets:["memory"] 404s with "Dataset names resolve only among the datasets you own".
+    const { seen, impl } = recordingFetch(() => fakeResponse(200, { "4de7843f-0f0d-5a20-ab2d-f94d1c5b99ee": { state: "ready" } }));
+    const client = new Cognee(resolveConfig(podEnv({ COGNEE_MEMORY_DATASET: "fleet-ops" }))!, impl);
+    void client.status();
+    void client.recall({ query: "anything" });
+    expect(seen[0]?.url).toBe("http://cognee.cognee.svc.cluster.local:8000/api/v1/datasets/status/memory");
+    const recallDataset = JSON.parse(String(seen[1]?.init.body)).datasets;
+    expect(recallDataset).toEqual(["fleet-ops"]);
+  });
+
   it("the /cognee command reports where memory goes without revealing the key", async () => {
     await activateWith(async () => fakeResponse(200, { "4de7843f-0f0d-5a20-ab2d-f94d1c5b99ee": { state: "ready", message: "Memory is fully built.", dataset_name: "fleet-ops" } }));
     await pi.commands.get("cognee")!.handler!("", ctx);
