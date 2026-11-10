@@ -387,6 +387,15 @@ describe("the tools as an agent meets them", () => {
     expect(goneOut.text).toMatch(/Treat this as no information, not as a negative\./);
   });
 
+  it("a 409 says what cognee actually meant, because the status code alone reads like a busy store", async () => {
+    // Measured: 409 after ~31 s with an embedding-connection body. An agent told "conflict, try again" would retry
+    // forever against a dead embedder.
+    const text = describeFailure({ ok: false, status: 409, body: { error: "An error occurred during remember: Embedding connection test timed out after 30s." }, raw: "Embedding connection test timed out after 30s.", ms: 31_000 }, "memory_remember");
+    expect(text).toMatch(/409/);
+    expect(text).toMatch(/embedding endpoint/i);
+    expect(text).toMatch(/Nothing was stored/);
+  });
+
   it("the /cognee command reports where memory goes without revealing the key", async () => {
     await activateWith(async () => fakeResponse(200, { "4de7843f-0f0d-5a20-ab2d-f94d1c5b99ee": { state: "ready", message: "Memory is fully built.", dataset_name: "fleet-ops" } }));
     await pi.commands.get("cognee")!.handler!("", ctx);

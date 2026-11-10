@@ -110,7 +110,10 @@ const writtenIds = Array.isArray(written.body?.items) ? written.body.items.map((
 const chunks = await call("/api/v1/recall", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: `what is ${MARK}`, datasets: [DATASET], topK: 5, searchType: "CHUNKS", nodeName: [NODE_SET] }) }, 90_000);
 const stored = JSON.stringify(chunks.body ?? []);
 check("recall (chunks) finds the marker", chunks.ok && stored.includes(MARK), `HTTP ${chunks.status} in ${chunks.ms} ms${wroteInTime ? "" : " (written in the background / after the wait — proves the write landed regardless)"}`);
-check("the credential never reached cognee", !stored.includes("hunter2") && !stored.includes("abcdefghijklmnop"), stored.includes("[redacted:") ? "[redacted:…] is what was stored" : "no redaction marker in the returned chunks");
+// Only a demonstrated read proves the redaction. If nothing landed, "the stored text contains no password" is
+// vacuously true and must not be reported as a pass.
+const demonstrated = stored.includes(MARK);
+check("the credential never reached cognee", demonstrated && !stored.includes("hunter2") && !stored.includes("abcdefghijklmnop"), demonstrated ? (stored.includes("[redacted:") ? "[redacted:…] is what was stored" : "no redaction marker visible in the returned chunks") : "NOT PROVEN: nothing was read back, so an absence proves nothing");
 
 if (flag("graph")) {
   const graph = await call("/api/v1/recall", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: `what is ${MARK}, and what was redacted from the note?`, datasets: [DATASET], topK: 3, searchType: "GRAPH_COMPLETION" }) }, 90_000);
@@ -187,9 +190,12 @@ if (flag("prove-delete")) {
   const graphAfter = await call("/api/v1/recall", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: `which api_key value appears in note ${MARK}-secret? answer with the exact string if you can find it, otherwise say none`, datasets: [DATASET], topK: 3, searchType: "GRAPH_COMPLETION" }) }, 90_000);
   const inGraphAnswer = JSON.stringify(graphAfter.body ?? []).includes(SECRET);
 
-  check("the literal credential is gone from chunks after the delete", !inChunks, inChunks ? "still in stored chunks" : "not in stored chunks");
-  check("the literal credential is gone from every remaining data row", !inRawScan, inRawScan ? "a remaining row still carries it" : "raw scan of remaining rows is clean");
-  check("the literal credential is not answerable from the graph", !inGraphAnswer, inGraphAnswer ? "a synthesized answer still reproduces it — cognee's delete did not cascade to the nodes" : `graph answered without it in ${graphAfter.ms} ms`);
+  // Every "after" assertion below is only worth stating if the credential was provably there "before". Otherwise a
+  // failed seed passes the whole proof.
+  const proven = seenBefore && seededIds.length > 0;
+  check("the literal credential is gone from chunks after the delete", proven && !inChunks, !proven ? "NOT PROVEN: the seed never landed, so its absence afterwards means nothing" : (inChunks ? "still in stored chunks" : "not in stored chunks"));
+  check("the literal credential is gone from every remaining data row", proven && !inRawScan, !proven ? "NOT PROVEN" : (inRawScan ? "a remaining row still carries it" : "raw scan of remaining rows is clean"));
+  check("the literal credential is not answerable from the graph", proven && !inGraphAnswer, !proven ? "NOT PROVEN" : (inGraphAnswer ? "a synthesized answer still reproduces it — cognee's delete did not cascade to the nodes" : `graph answered without it in ${graphAfter.ms} ms`));
   say(`     caveat on the last one: a GRAPH_COMPLETION that omits the string is evidence the model did not find it, not proof no node holds it. No node-enumeration door is known to this script; if one is found, that assertion belongs on it.`);
 }
 say(`\n${failures ? "FAIL" : "PASS"} cognee live check against ${BASE} (dataset ${DATASET}, key from ${KEY_FILE} — value not shown)`);

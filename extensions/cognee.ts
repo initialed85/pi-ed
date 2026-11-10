@@ -41,6 +41,13 @@
  *      (home-ops `applications/cognee/README.md`), so writes serialize: under contention `background: true` is the
  *      honest choice — 0.2 s to return, the build happens server-side.
  *
+ *   6. **A dead embedder arrives as a write conflict.** On 2026-11-10, with the embeddings pod unschedulable, every
+ *      foreground `remember` answered **409 after ~31 s** — "Embedding connection test timed out after 30s. Check
+ *      that your embedding endpoint is reachable." — while `run_in_background=true` accepted the same note in 154 ms.
+ *      Cognee tests the embedder before it writes, so an outage in a dependency looks like a conflict on this door;
+ *      the extension quotes the body rather than telling the agent to retry, and does not paper over it with
+ *      `COGNEE_SKIP_CONNECTION_TEST`, which would turn a loud upfront refusal into a silent partial build.
+ *
  * Which is also why `memory_recall` defaults to `chunks`: it is 50× cheaper, it is the one that shows the stored
  * words, and an agent that has to wait twenty seconds and an LLM round trip per recall will stop recalling. The
  * synthesis modes are there when a question needs the graph rather than the notes.
@@ -332,6 +339,13 @@ export function describeFailure(result: CallResult, action: string): string {
     return `${action} refused by cognee (${result.status}): the API key is wrong, revoked, or not permitted for that dataset. Check the mounted Secret cognee-agent-keys.`;
   }
   if (result.status === 422) return `${action} rejected by cognee (422): the request was malformed. ${detail}`;
+  if (result.status === 409) {
+    // Measured on home-dev on 2026-11-10: a foreground remember can answer 409 after ~31 s with
+    // "Embedding connection test timed out after 30s. Check that your embedding endpoint is reachable." — Cognee
+    // tests the embedder before it writes, so a dead embeddings Service shows up here as a write conflict, not as
+    // an outage. The body names the reason; the agent should read it rather than try again.
+    return `${action} refused by cognee (409): cognee could not complete the write, most often because it cannot reach its own embedding endpoint (the measured body says "Embedding connection test timed out after 30s"). Nothing was stored. Report the body rather than retrying; a background write accepts the same note and fails later, which is worse, not better.`;
+  }
   return `${action} failed (HTTP ${result.status}): ${detail || "no response body"}`;
 }
 
