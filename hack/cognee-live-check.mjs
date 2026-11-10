@@ -76,11 +76,31 @@ async function call(path, init = {}, timeoutMs = 30_000) {
   return { status: response.status, ok: response.ok, body, raw: scrub(raw, [key]).text, ms: Date.now() - started };
 }
 
+
+// Row counts come from a door that takes the dataset **uuid**, not its name: `GET /api/v1/datasets/{uuid}/data/count`
+// answers 200 {"count":36} for fleet-ops while `.../data/count` with the name answers 400 uuid_parsing. Measured
+// 2026-11-10. It exists because HTTP status is not evidence on this API: home-ops measured 24 of 24 background
+// posts answering 200 that created no row at all. Only a count that moved proves a write happened.
+async function datasetIdFor(name) {
+  const datasets = await call("/api/v1/datasets");
+  const list = Array.isArray(datasets.body) ? datasets.body : datasets.body?.datasets ?? [];
+  return list.find((entry) => entry.name === name)?.id;
+}
+
+async function rowCount(id) {
+  if (!id) return { count: undefined, ok: false };
+  const res = await call(`/api/v1/datasets/${id}/data/count`);
+  return { count: typeof res.body?.count === "number" ? res.body.count : undefined, ok: res.ok };
+}
+
 const health = await call("/health");
 check("health", health.ok, `HTTP ${health.status} in ${health.ms} ms`);
 
 const status = await call("/api/v1/datasets/status/memory");
 check("datasets/status/memory", status.ok, status.ok ? "" : `HTTP ${status.status}`);
+
+const probeIdBefore = await datasetIdFor(DATASET);
+const countBefore = (await rowCount(probeIdBefore)).count ?? 0;
 
 // The fast path first, because it is the one an agent reaches for when Cognee is busy: it must return promptly and
 // it must not pretend the build is finished.
@@ -114,6 +134,15 @@ check("recall (chunks) finds the marker", chunks.ok && stored.includes(MARK), `H
 // vacuously true and must not be reported as a pass.
 const demonstrated = stored.includes(MARK);
 check("the credential never reached cognee", demonstrated && !stored.includes("hunter2") && !stored.includes("abcdefghijklmnop"), demonstrated ? (stored.includes("[redacted:") ? "[redacted:…] is what was stored" : "no redaction marker visible in the returned chunks") : "NOT PROVEN: nothing was read back, so an absence proves nothing");
+
+// The claim a status code cannot carry: that something was actually stored. Poll briefly because a background
+// write is a promise about a pipeline, not about a row.
+let countAfter = (await rowCount(await datasetIdFor(DATASET))).count;
+for (let waited = 0; countAfter !== undefined && countAfter <= countBefore && waited < 60_000; waited += 10_000) {
+  await new Promise((resolve) => setTimeout(resolve, 10_000));
+  countAfter = (await rowCount(await datasetIdFor(DATASET))).count;
+}
+check("a row really appeared in the dataset", countAfter !== undefined && countAfter > countBefore, `${countBefore} → ${countAfter ?? "unreadable"} row(s) in ${DATASET}; a 200 or a 409 on the write door would have said the same thing either way`);
 
 if (flag("graph")) {
   const graph = await call("/api/v1/recall", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: `what is ${MARK}, and what was redacted from the note?`, datasets: [DATASET], topK: 3, searchType: "GRAPH_COMPLETION" }) }, 90_000);
