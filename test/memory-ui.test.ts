@@ -13,13 +13,36 @@
  * read-only, so a future write endpoint fails rather than succeeds.
  *
  *   PI_LIVE_DSN="$DSN" npx vitest run test/memory-ui.test.ts
+ *
+ * The store's state is one of three facts, and the server tells them apart, so the tests have to as well: no DSN at
+ * all ("not configured", 503), a DSN that answers (200), and a DSN that does not (a driver's error, 500). Reading only
+ * `PI_LIVE_DSN` meant a suite run in the fleet's own pod - where the extension's DSN is in the environment - asserted
+ * "not configured" about a store that was answering, and went red for want of a variable nobody exported.
  */
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { MAX_ROWS, edgesQuery, eventsQuery, handle, identity, memoryDetailQueries, memoriesQuery, pool, vectorSearchQuery } from "../ui/server.mjs";
 import type { QuerySpec } from "../ui/server.mjs";
 
-const liveDsn = process.env.PI_LIVE_DSN ?? "";
+/** The string the server would connect with, under the precedence `ui/server.mjs` itself uses. */
+const configuredDsn = process.env.PI_LIVE_DSN || process.env.PI_MEMORY_DSN || "";
+/** ...and the subset of that which actually answers, settled by probing rather than by guessing from a variable name. */
+let liveDsn = "";
+
+beforeAll(async () => {
+  if (!configuredDsn) return;
+  const pg = await import("pg");
+  const client = new pg.Client({ connectionString: configuredDsn, connectionTimeoutMillis: 3_000 });
+  try {
+    await client.connect();
+    await client.query("select 1 as ok");
+    liveDsn = configuredDsn;
+  } catch {
+    // A store that will not answer is a fact worth having, and it is not the same fact as no store at all.
+  } finally {
+    await client.end().catch(() => {});
+  }
+});
 
 /** The response is captured rather than sent, and `writeHead` returns `this` because that is what node's does. */
 function fakeResponse() {
@@ -134,7 +157,7 @@ describe("the identity gate", () => {
     // 401 rather than the 503 an unconfigured store would earn: the ordering is the point. Being outside the gate is
     // the more urgent fact about a request, and an unconfigured store is not information a caller who was never
     // let in needs from us.
-    if (!liveDsn) {
+    if (!configuredDsn) {
       const configured = await call("/api/summary", { "x-auth-request-email": "someone@example.com" });
       expect(configured.status).toBe(503);
       expect(JSON.parse(configured.body).error).toBe("not configured");
@@ -154,10 +177,15 @@ describe("the identity gate", () => {
     if (liveDsn) {
       expect(health.status).toBe(200);
       expect(payload.ok).toBe(true);
-    } else {
+    } else if (!configuredDsn) {
       expect(health.status).toBe(503);
       expect(payload.ok).toBe(false);
       expect(payload.error).toBe("not configured");
+    } else {
+      // Configured and broken: the probe must say so in a shape kubernetes can read as not-ready, and must not dress
+      // it up as a configuration error.
+      expect(health.status).toBe(500);
+      expect(payload.ok).toBe(false);
     }
   });
 });
