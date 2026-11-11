@@ -55,11 +55,11 @@ const EXPECTED: Record<string, Surface> = {
     messageRenderers: ["autopilot"],
     entryRenderers: [],
   },
-  "cognee.ts": {
+  "graphiti.ts": {
     // A pure client: nothing here is lifecycle. It speaks when an agent asks, and asks nothing of the session.
     events: [],
     tools: ["memory_remember", "memory_recall"],
-    commands: ["cognee"],
+    commands: ["graphiti"],
     flags: [],
     messageRenderers: [],
     entryRenderers: [],
@@ -188,9 +188,9 @@ const dirFor = (name: string): string => (PARKED.includes(name) ? PARKED_DIR : E
  */
 const LOAD_ENV: Record<string, Record<string, string>> = {
   "memory.ts": { PI_MEMORY_DSN: "postgres://packaging:packaging@127.0.0.1:1/packaging" },
-  // A key that is not a key, set the way a laptop would set it. The pod path (a mounted file) is exercised in
-  // test/cognee.test.ts against a scratch file, so nothing here reads a real Secret.
-  "cognee.ts": { COGNEE_API_KEY: "packaging-not-a-real-key-000000000000000000" },
+  // Just a URL: this door has no auth, being cluster-internal. It points at a name that cannot resolve, so a
+  // packaging run cannot reach a live graph even by accident.
+  "graphiti.ts": { MEMORY_GRAPH_URL: "http://graphiti.packaging.invalid:9999", MEMORY_AGENT: "packaging-test" },
 };
 
 function loadModuleEnv(): Record<string, string | undefined> {
