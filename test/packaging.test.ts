@@ -55,11 +55,13 @@ const EXPECTED: Record<string, Surface> = {
     messageRenderers: ["autopilot"],
     entryRenderers: [],
   },
-  "cognee.ts": {
-    // A pure client: nothing here is lifecycle. It speaks when an agent asks, and asks nothing of the session.
+  "graphiti.ts": {
+    // A pure client, like the cognee door it replaced: nothing here is lifecycle. It speaks when an agent asks and
+    // asks nothing of the session. The tool names survived the swap on purpose — an agent that already knows to call
+    // memory_remember should not have to learn a new verb because the store behind it changed.
     events: [],
     tools: ["memory_remember", "memory_recall"],
-    commands: ["cognee"],
+    commands: ["graphiti"],
     flags: [],
     messageRenderers: [],
     entryRenderers: [],
@@ -188,9 +190,9 @@ const dirFor = (name: string): string => (PARKED.includes(name) ? PARKED_DIR : E
  */
 const LOAD_ENV: Record<string, Record<string, string>> = {
   "memory.ts": { PI_MEMORY_DSN: "postgres://packaging:packaging@127.0.0.1:1/packaging" },
-  // A key that is not a key, set the way a laptop would set it. The pod path (a mounted file) is exercised in
-  // test/cognee.test.ts against a scratch file, so nothing here reads a real Secret.
-  "cognee.ts": { COGNEE_API_KEY: "packaging-not-a-real-key-000000000000000000" },
+  // A door URL that points at a closed port on the loopback, which is how a laptop would set it. Graphiti needs no
+  // credential in-cluster, so there is nothing here that a Secret could have leaked.
+  "graphiti.ts": { MEMORY_GRAPH_URL: "http://127.0.0.1:1", MEMORY_AGENT: "packaging-test" },
 };
 
 function loadModuleEnv(): Record<string, string | undefined> {
@@ -199,6 +201,14 @@ function loadModuleEnv(): Record<string, string | undefined> {
   delete env.HERDR_ENV;
   delete env.HERDR_SOCKET_PATH;
   delete env.HERDR_PANE_ID;
+  // The same reasoning as the herdr keys: a developer's own agent pod exports these, and a packaging test that
+  // inherits them is asserting that an extension registers its surface when it is configured by *somebody else's*
+  // environment — which is not the contract being pinned. Graphiti in particular registers nothing without
+  // MEMORY_GRAPH_URL, so an inherited URL would make the inert case invisible rather than tested.
+  delete env.MEMORY_GRAPH_URL;
+  delete env.MEMORY_AGENT;
+  delete env.PI_MEMORY_DSN;
+  for (const key of Object.keys(env)) if (key.startsWith("COGNEE_")) delete env[key];
   return env;
 }
 
@@ -229,7 +239,7 @@ describe("extensions directory", () => {
     // away, and with it the record of why an extension left the fleet and what it would take to bring it back.
     expect(readdirSync(PARKED_DIR).filter((name) => name.endsWith(".ts")).sort()).toEqual([...PARKED].sort());
     const why = readFileSync(path.join(PARKED_DIR, "README.md"), "utf8");
-    expect(why).toContain("cognee");
+    expect(why).toContain("graphiti");
     expect(why).toContain("git mv");
   });
 

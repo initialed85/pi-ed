@@ -16,9 +16,11 @@ tested is an extension that has quietly rotted.
 The store is untouched. The reading room (`memory-ui`), the MCP server, the schema and the 139 migrated rows all stay
 in service; what stopped is agents being *given* `memory_search` and `memory_dream`.
 
-**The order.** Ed has decided that cognee is the memory path: *"i told you to turn off memory … we're pivoting to
-cognee"*. That is a decision about which store the fleet writes to, and it is his to make, so `extensions/memory.ts`
-is back here and `extensions/cognee.ts` is the only memory door a session sees.
+**The order.** Ed decided the fleet writes to a graph, not to Postgres: *"i told you to turn off memory … we're
+pivoting to cognee"*. That was 2026-11-10; cognee itself was deleted from the cluster within a day (its ingest
+stalled forever retrying schema-invalid graph output) and replaced by **Graphiti over Neo4j** in namespace `memory`,
+so the door a session is given today is `extensions/graphiti.ts`. The parking is the same parking either way: which
+store agents are handed, decided by Ed, not by whichever extension was last to work.
 
 **Why it was un-parked for a few hours, since the reasoning is the useful part.** The fleet was mid-cutover, cognee
 could not write, and I thought the safe answer was two doors. The measurements behind that call, taken on home-dev:
@@ -41,9 +43,11 @@ could not write, and I thought the safe answer was two doors. The measurements b
 reachable embedder, the fleet has a memory system that reads yesterday and cannot write today. That is not an
 argument against the pivot; it is the thing to watch after it.
 
-**End condition — what `hack/cognee-live-check.mjs` has to show before anyone re-opens this file:** a marker written
-now is retrievable from `CHUNKS`; `/data/count` moves when a write is accepted; and `--prove-delete` shows a delete
-removes the credential the note carried. All three are written and ready to run.
+**End condition — what `hack/graphiti-live-check.mjs` now has to keep showing before anyone re-opens this file:** a
+write becomes an episode *and* a retrievable fact rather than only a `202`; the stored episode carries the note
+verbatim; and `--prove-delete` shows a credential literal is gone after `DELETE /group/{id}`. All three passed on
+2026-11-11, eleven seconds after home-ops fixed the door's LLM URL — which is the same morning the door silently
+stored a probe key as a fact, the measurement that found the missing `sk-` rule in `lib/redact.ts`.
 
 **Also settled on the way:** the migration is not finished just because the tally looks finished. Anything Postgres
 receives after the 139 exported rows needs a second pass, so home-ops' ledger wants an export watermark rather than a

@@ -38,8 +38,9 @@ class registries.
 
 Twelve of them live in `extensions/` and are what `pi install git:github.com/initialed85/pi-ed` loads. One more,
 `memory.ts`, is in **`parked/`**: compiled, tested and swept against the live store, but outside the directory Pi
-discovers, so no session is given its tools. Ed turned Postgres memory off on 2026-11-10 to make cognee the fleet's
-memory path; `parked/README.md` keeps the measurements taken while that call was being made, and how to bring it back.
+discovers, so no session is given its tools. Ed turned Postgres memory off on 2026-11-10 to make a graph memory door
+the fleet's only memory; `parked/README.md` keeps the measurements taken while that call was being made, and how to
+bring it back.
 
 `turn-stats.ts` is documented in its own file header: it replaces the client's guesses
 about throughput and timing with the numbers Rooter already publishes in response headers, drawn as one
@@ -256,60 +257,46 @@ jq -r 'select(.customType=="auto-resume")
 | Reads | `session_start` reason, its own markers, and the last action in the branch: a model turn and its `stopReason`, a tool result, or a prompt nobody answered |
 
 
-### `cognee.ts` — what an agent remembers tomorrow, today
+### `graphiti.ts` — the fleet's memory, over Graphiti and Neo4j
 
-The live memory. It registers `memory_remember` and `memory_recall` plus a `/cognee` command, and talks to Cognee 1.6.7
-in namespace `cognee` on home-dev (home-ops `clusters/dev/applications/cognee/`): Cognee ingests the text, builds a
-knowledge graph from it — entities and relationships through rooter, vectors through the embeddings Service — and
-answers questions against that graph. Ed chose it over mem0 because mem0's FOSS build dropped the graph, and the graph
-was the point.
+**The live memory door.** It registers `memory_remember` and `memory_recall` plus a `/graphiti` command, and talks to
+Graphiti (`graphiti_core` 0.31.2) in namespace `memory` on home-dev — home-ops `clusters/dev/applications/memory/`,
+with Neo4j 5.26.2 behind it and `https://graph.dev.initialed85.cc` for humans. An agent's sentence is handed to an
+extract LLM (`sentiment-analyzer`, a small Gemma), which turns it into entities, relationships and facts with valid /
+invalid windows; retrieval combines cosine similarity, BM25 and graph traversal, with no LLM on the read path.
 
-Writing is `memory_remember`, foreground by default: when the tool returns, the note is in the graph. `background: true`
-returns in a fifth of a second and lets Cognee build server-side, which is the right choice for a long note or when a
-build is already running (Cognee serves one worker, so writes serialize). Attribution goes in as Cognee's `node_set` —
-the agent label plus any tags — and deliberately **not** as `session_id`: measured, a write with `session_id` set comes
-back `session_stored` with `items_processed: 0`, the dataset stays `empty`, and a recall answers `memory_warming_up`.
-Attribution that costs you the memory is not attribution.
+It replaced `cognee.ts`, which is deleted rather than parked: the Cognee service no longer exists in the cluster
+because its ingest stalled forever retrying schema-invalid graph output. Read that file's git history before doubting
+anything below — every trap recorded there is the same shape as the ones here, a request that answered 2xx and had
+remembered nothing.
 
-Reading is `memory_recall`, and its default mode is `chunks` because it is 50× cheaper (0.3–0.5 s measured) and it is
-the one mode that returns the words actually stored. `graph`, `rag` and `hybrid` synthesize across the graph in
-10–25 s and cost a rooter round trip — and they reword: a GRAPH_COMPLETION answer to "what is quokkalisk" came back as
-"Quokkalisk is a marker word used in the Pi-ed probe note written by Duke…", which is Cognee's prose, not the memory.
-An agent that has to wait twenty seconds per recall stops recalling, so the cheap honest mode is the default and the
-modes are spelled out in the tool description rather than auto-routed.
+The two things that make this door different from the Postgres one, and why the extension is written the way it is:
 
-Two things the extension refuses to be vague about. A Cognee 200 is not always an answer: while a dataset is warming
-up or mid-extraction it returns `source: "system"` entries with a status, and the tool says "no memories yet" in those
-cases instead of reporting a read that found nothing. And a timeout is not a rollback — measured, a foreground write
-that gave up after 300 s landed anyway, so the tool says the build may still be running and tells the agent to check
-with `memory_recall` before writing the same note twice.
-
-Text is redacted before it is sent, by `lib/redact.ts` — the same rule list the parked extension and the reading room
-use, so the three cannot drift. That list is not enough for a Cognee key on its own (64 unlabelled hex characters
-matches no shape), so `scrub()` adds the live key as a literal pattern to every upstream body this extension echoes.
-The key itself is read from a mounted file at activation, held in a closure, and appears in no result, log line or
-error.
-
-With no key anywhere the extension registers nothing at all — no tools, no commands — so a pod that has not been given
-the Secret has no memory tools rather than a tool that always fails.
+1. **A write is an acknowledgement, not a memory.** `POST /messages` answers `202` in tens of milliseconds and the
+   fact is *not* in the graph yet; extraction drains an in-process queue. home-ops measured the failure hard during
+   the historical import: at concurrency 10, rooter marked every backend unhealthy and **roughly 100 episodes were
+   lost behind `202` responses**. Concurrency is 3 now. The extension therefore says "accepted", never "remembered",
+   and `hack/graphiti-live-check.mjs` exists to prove a write became an episode and a fact rather than a status code.
+2. **A read is fast and confident even when it is wrong about relevance.** `/search` answers in 0.07–0.66 s and
+   returns up to `max_facts` whatever matched, so three facts about the wrong thing look exactly like three facts
+   about the right one. `memory_recall` says that out loud in its own answer rather than leaving it to the model.
 
 | | |
-| --- | --- |
-| Tools | `memory_remember` (text, dataset, tags, background) · `memory_recall` (query, mode, dataset, tags, limit) |
-| Commands | `/cognee` (where memory goes, what the key is mounted from without showing it, and each dataset's build state) |
-| URL | `COGNEE_URL` then `COGNEE_BASE_URL` (home-ops' name), default `http://cognee.cognee.svc.cluster.local:8000`; the public door `https://cognee.dev.initialed85.cc` works from a laptop |
-| Key | `COGNEE_API_KEY_FILE`, else `<mount>/api-key` where `<mount>` is `COGNEE_MOUNT_DIR` default `/run/secrets/cognee`, else `/etc/cognee/api-key`, else `COGNEE_API_KEY` — the `api-key` key of Secret `cognee-agent-keys` |
-| Dataset | `COGNEE_DATASET_FILE`, else `<mount>/dataset`, then `COGNEE_DATASET` / `COGNEE_MEMORY_DATASET`, default `fleet-ops` (Cognee creates a dataset on first write, so the name is set once in the Secret rather than invented per agent) |
-| Agent label | `COGNEE_AGENT` → `NAME` → the Pi session name → `host:repo`; sent as `node_set`, and reads can be narrowed with Cognee's `nodeName` (a list — a bare string is a 400) |
-| Endpoints used | `POST /api/v1/remember` · `POST /api/v1/recall` · `GET /api/v1/datasets/status/memory` · `GET /health` |
-| Deliberately absent | forgetting. Cognee exposes `DELETE /api/v1/datasets/{id}/data/{data_id}` and no tool offers it: deleting from a shared graph should be a decision made on purpose with the ids in front of someone |
-| Tests | `test/cognee.test.ts` — request field names against the measured OpenAPI shapes, redaction before the network, no key in any error, a warming-up dataset not reported as a read, configuration precedence |
-| Live checks | `hack/cognee-live-check.mjs` (the API contract, plus what Cognee really stored) and `hack/cognee-session-check.mjs` (a real Pi session that calls both tools and reads the marker back). Both write to probe datasets only, delete what they wrote, and scrub their own output so a check cannot become the leak |
+|---|---|
+| Tools | `memory_remember` (note, optional group, optional tags; 20,000 character cap; redaction applied before the wire) and `memory_recall` (query, optional group, `fleetWide`, `maxFacts` default 10 / max 20) |
+| Commands | `/graphiti` — the door URL, this agent's group, health, and what the service says it holds for this agent |
+| Configuration | `MEMORY_GRAPH_URL` (required; default in-cluster `http://memory-graph.memory.svc.cluster.local:9999`) and `MEMORY_AGENT` (the group, default the container hostname). **Unset URL means the extension registers nothing at all** — a pod that was never given the door has no graphiti tools rather than a tool that hangs on session start |
+| No credential | The door is cluster-internal and **unauthenticated**: every pod in home-dev can read every group. That is why redaction happens on the way out and is not configurable |
+| Groups are partitions | Group ids are the agent names exactly as the import used them (`camry`, `coral`, `quake`, `fleet-note`, …). `Quake` or `quake-2` silently creates a second brain nobody recalls from, so the extension defaults to this agent's own and only names another when a caller deliberately means the fleet-note corpus |
+| Deliberately absent | Forgetting. `POST /clear` and `DELETE /episode/{uuid}` are real and destructive; a model that asks to forget in the same breath as it asks to remember is an accident waiting to happen. Forgetting lives in `hack/graphiti-live-check.mjs --prove-delete` instead |
+| Timeouts | 15 s for a write (the acknowledgement is immediate; the budget covers the cluster being briefly weird) and 20 s for a read (measured under a second, so 20 s is slack for a warming Neo4j, not hope) |
+| Tests | `test/graphiti.test.ts` — the inert-without-URL case, the write body contract (role present, `role_type` present, **never a uuid**: a supplied uuid makes graphiti_core re-raise `NodeNotFoundError` behind a 202), redaction before the network including the `sk-` shape, group scoping, and what a 422 means |
+| Live check | `hack/graphiti-live-check.mjs` — health route name, an empty group before writing, a write, polled proof that an episode and a fact appear, verbatim storage proof from `/episodes`, and `--prove-delete` which shows a literal is retrievable while the group lives and gone after `DELETE /group/{id}`. It writes only to a `*-probe` group and refuses to write into a real one without `--allow-shared` |
 
 ### `memory.ts` — what an agent remembers tomorrow
 
-**Parked since 2026-11-10, at Ed's direction: cognee is the memory path.** Pi does not load it, so no session is given
+**Parked since 2026-11-10, at Ed's direction: a graph door is the memory path.** Pi does not load it, so no session is given
 `memory_search` or `memory_dream`. The store, the reading room and the MCP server are untouched and the file still
 typechecks, tests and sweeps against the live database — parking is about which tools agents are handed, not about
 deleting the thing. Everything below describes an extension that works; `parked/README.md` says what it was doing in
-the fleet and what cognee has to prove before it is safe to leave this parked for good.
+the fleet and what the graph door has to prove before it is safe to leave this parked for good.

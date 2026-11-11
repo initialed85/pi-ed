@@ -26,7 +26,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const EXPECTED_EXTENSIONS = [
   "auto-resume.ts",
   "autopilot.ts",
-  "cognee.ts",
+  "graphiti.ts",
   "compaction-summary-guard.ts",
   "loop-guard.ts",
   "queue-reload.ts",
@@ -40,10 +40,10 @@ const EXPECTED_EXTENSIONS = [
 /**
  * Compiled, tested and swept against the live store, but deliberately outside the load path: Pi discovers extensions
  * through `pi.extensions` -> `./extensions`, so a file in `parked/` is not installed into anyone's session. Parked is
- * the honest word for it. `memory.ts` is here since 2026-11-10 because Ed turned Postgres memory off to make cognee
- * the fleet's memory path; it was also parked briefly earlier the same day, and the measurements taken while that
- * decision was made are kept in `parked/README.md` rather than in chat. A list that does not say which files are
- * parked is a list that lets one drift out by accident.
+ * the honest word for it. `memory.ts` is here since 2026-11-10 because Ed turned Postgres memory off to make a graph
+ * memory door the fleet's only memory; it was also parked briefly earlier the same day, and the measurements taken
+ * while that decision was made are kept in `parked/README.md` rather than in chat. A list that does not say which
+ * files are parked is a list that lets one drift out by accident.
  */
 const PARKED_EXTENSIONS = ["memory.ts"];
 const HOST_PACKAGES = [

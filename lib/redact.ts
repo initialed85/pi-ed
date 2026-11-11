@@ -19,6 +19,12 @@ const CREDENTIAL_SHAPES: { name: string; pattern: RegExp }[] = [
   { name: "aws-key-id", pattern: /\bAKIA[0-9A-Z]{16}\b/g },
   { name: "github-token", pattern: /\bgh[pousr]_[A-Za-z0-9]{16,}\b/g },
   { name: "slack-token", pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g },
+  // Measured, not guessed: on 2026-11-11 a probe note containing `sk-probe-<24 zeros>` was written to Graphiti by
+  // hack/graphiti-live-check.mjs and came back as a retrievable fact. Every other shape here was already covered;
+  // the OpenAI-compatible `sk-` family — the shape this fleet's own keys actually take — was the one that was not.
+  // It is deliberately broad (`sk-ant-`, `sk-or-`, `sk-proj-`) because the cost of a false positive is a word
+  // mangled in a memory note, and the cost of a miss is a live key sitting in a graph every pod in home-dev reads.
+  { name: "openai-key", pattern: /\bsk-[A-Za-z0-9_-]{12,}\b/g },
   { name: "dsn", pattern: /\bpostgres(ql)?:\/\/[^\s"'@]*:[^\s"']+@[^\s"']+/gi },
 ];
 
