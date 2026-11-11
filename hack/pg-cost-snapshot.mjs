@@ -42,6 +42,28 @@ if (!dsn) {
   process.exit(1);
 }
 
+// A diagnostic that prints a command line prints whatever was on it. Measured, not hypothesised: one pi-ed session
+// transcript from 2026-11-05 carries the live store password eight times, produced entirely by the failure path
+// below, because the caller wrote `… -- PI_LIVE_DSN=postgres://user:pass@host:5432/db npx vitest run …` and the
+// command string was echoed verbatim on a spawn error. A transcript is readable by whoever owns the session store,
+// and the session store lives on a shared PVC - so this is a credential leak with a wide surface, not a cosmetic
+// log. Two guards, because refusing is better than masking: the command line is rejected when it carries a
+// credential, and anything that still reaches the wire is scrubbed with the same DSN rule lib/redact.ts applies on
+// the memory path (kept as a literal regex here because a .mjs run by `node` does not import the TS module).
+const CREDENTIAL_IN_ARGV = /\b\w*=?(postgres(ql)?|mysql|mongodb(\+srv)?|redis|amqp|smtp|imap|ftp|sftp|ssh):\/\/[^\s"'@]*:[^\s"']+@/gi;
+const credentialHits = positionals.filter((arg) => CREDENTIAL_IN_ARGV.test(arg));
+if (credentialHits.length) {
+  console.error("pg-cost-snapshot: the command you asked me to measure contains a connection string with a password.");
+  console.error("  Refusing to run it, because a spawn failure echoes the command line back and this script's own");
+  console.error("  output lands in agent transcripts and tool results.");
+  console.error("  Put the DSN in the environment instead, outside the measured command:");
+  console.error("    PI_MEMORY_DSN=\"$DSN\" node ./hack/pg-cost-snapshot.mjs -- npx vitest run test/…");
+  console.error(`  (${credentialHits.length} argument(s) matched; their contents are not repeated here)`);
+  process.exit(2);
+}
+const scrub = (text) => String(text ?? "").replace(/:\/\/[^:\/\s]*:[^@\s]+@/g, "://***@")
+  .replace(/\b(?:password|passwd|pwd|api[_-]?key|token)=[A-Za-z0-9._\-]{6,}/gi, (m) => `${m.split("=")[0]}=***`);
+
 // Qualified on purpose, and the reason is the `search_path` asymmetry documented in memory/README.md: this script
 // must still find the extension when the reader's role resolves `public` first.
 const SNAPSHOT = `
@@ -119,7 +141,8 @@ const { spawn } = await import("node:child_process");
 await new Promise((resolve) => {
   const child = spawn(positionals[0], positionals.slice(1), { stdio: "inherit" });
   child.on("error", (error) => {
-    console.error(`pg-cost-snapshot: could not run ${positionals.join(" ")}: ${error.message}`);
+    // Node's spawn errors embed the command it failed to start, so both halves are scrubbed rather than just ours.
+    console.error(`pg-cost-snapshot: could not run ${scrub(positionals.join(" "))}: ${scrub(error.message)}`);
     process.exitCode = 1;
     resolve();
   });
