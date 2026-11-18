@@ -204,7 +204,13 @@ describe("turn-stats", () => {
     // part a reader actually needs: when the turn happened, and the head of the numbers.
     const second = await load();
     const cut = one(second, await drive(second), 40);
-    expect(cut).toContain("2024-10-27 11:33:20");
+    // Asserted as a shape, not as `2024-10-27 11:33:20`. The formatter renders the reader's own local time
+    // (`getFullYear`/`getHours`), and the fixture instant is 2024-10-27T03:33:20Z, so an exact clock here is a
+    // statement about the machine: it passed on a UTC+8 pod and failed on the CI runner in UTC
+    // (`expected '2024-10-27 03:33:20 ttft 182ms 48.2…' to contain '2024-10-27 11:33:20'`). The value of the
+    // timestamp is not what this test is about - it is about what survives truncation - so the date/time is
+    // matched by pattern and the whole suite passes at any TZ.
+    expect(cut).toMatch(/^\s*\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}  ttft \d+ms/);
     expect(cut).not.toContain("qwen3.8-flash-next-iq3_xxs");
     expect(visibleWidth(cut)).toBeLessThanOrEqual(40);
   });
