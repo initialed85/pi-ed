@@ -263,7 +263,12 @@ export interface FakeUi {
 
 export type FakeOverlay = {
   options: any;
-  component: any;
+  /**
+   * Typed, not `any`: a component whose `render` comes back untyped makes every test assertion on a line an implicit
+   * `any` parameter, which the typecheck step in CI rejects while vitest happily runs the file. Pi's own overlay
+   * components all render to rows of text, so that is what the double promises.
+   */
+  component: { render(width: number): string[] };
   tui: any;
   closed: boolean;
   close: () => void;
