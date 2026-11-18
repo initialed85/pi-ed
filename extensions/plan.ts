@@ -45,8 +45,10 @@ import {
   countTodos,
   editTodo,
   emptyPlan,
+  endPlan,
   planPath,
   readPlan,
+  reopenPlan,
   renderPlanBlock,
   setDirection,
   setGoal,
@@ -558,6 +560,15 @@ export default function activate(pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     loaded = load(ctx);
+    // A session that came back is not an ended one, and leaving the stamp on would tell the next reader of this file
+    // that its owner is gone while it is sitting right there. Cleared here rather than in `load`, because `load` runs
+    // on every turn through `current` and must not write.
+    const reopened = reopenPlan(loaded.plan);
+    if (reopened.changed && !loaded.problem) {
+      loaded = { ...loaded, plan: reopened.plan };
+      const wrote = writePlan(ctx.cwd, reopened.plan);
+      if (!wrote.ok) warn(ctx, `not saved · ${wrote.error}`);
+    }
     if (!ctx.hasUI) return;
     if (loaded.problem) {
       ctx.ui.notify(`⚠️ plan · ${loaded.problem}`, "warning");
@@ -568,6 +579,21 @@ export default function activate(pi: ExtensionAPI) {
       ctx.ui.notify(`${MARK} goal restored${when} · ${loaded.plan.goal}`, "info");
     }
     paint(ctx);
+  });
+
+  /**
+   * Stamp, never delete. The plan is the human's record and a quit is not a licence to erase it - but every other
+   * session that lists this directory has to be able to tell that this one is over, instead of reading its open steps
+   * as live instructions. Measured, and it is not hypothetical: a fresh session in an empty sandbox `find`ed
+   * `.pi/plan/`, cat-ed a finished session's paperclip todos, and started working through a plan that was not its own.
+   */
+  pi.on("session_shutdown", async (_event, ctx) => {
+    const record = loaded ?? load(ctx);
+    if (record.problem) return; // a damaged plan is reported, not rewritten, by any path
+    const ended = endPlan(record.plan, now());
+    if (!ended.changed) return;
+    const wrote = writePlan(ctx.cwd, ended.plan);
+    if (!wrote.ok) warn(ctx, `plan not stamped · ${wrote.error}`);
   });
 
   pi.on("session_info_changed", (_event, ctx) => {

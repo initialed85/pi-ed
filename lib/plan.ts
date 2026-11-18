@@ -81,6 +81,14 @@ export type PlanRecord = {
   direction_prev?: string;
   todos: Todo[];
   updated_at: string;
+  /**
+   * Set when the session that owned this plan ended, and cleared if it comes back. It exists for the reader who is
+   * not that session: the plans of a checkout sit in one directory as plain JSON, so a model that lists `.pi/plan/`
+   * finds every session that ever ran here, and without this stamp a finished session's list looks exactly like live
+   * instructions. (Measured: a fresh session `find`ed the directory, read another session's paperclip todos, and
+   * started acting on them.)
+   */
+  ended_at?: string;
 };
 
 /** The result of a mutation: always a usable plan, plus a problem when the request was refused. */
@@ -320,6 +328,23 @@ export function countTodos(plan: PlanRecord): PlanCounts {
 const MARK: Record<TodoState, string> = { todo: "[ ]", in_progress: "[~]", done: "[x]", superseded: "[!]" };
 
 /**
+ * Stamp the plan as belonging to an ended session. Only ever called on a plan with content: an empty plan is not
+ * worth a file, let alone a stamp, and writing one on quit would create state that did not exist before the quit.
+ */
+export function endPlan(plan: PlanRecord, at: string): { plan: PlanRecord; changed: boolean } {
+  if (plan.ended_at || planIsEmpty(plan)) return { plan, changed: false };
+  return { plan: touch({ ...plan, ended_at: at }, at), changed: true };
+}
+
+/** Drop the stamp, because this session is alive again (`pi -c`, a resume, a fork). */
+export function reopenPlan(plan: PlanRecord): { plan: PlanRecord; changed: boolean } {
+  if (!plan.ended_at) return { plan, changed: false };
+  const next = { ...plan };
+  delete next.ended_at;
+  return { plan: next, changed: true };
+}
+
+/**
  * The plan as a compact block, for re-describing state where context is rebuilt (a compaction renewal, a resumed
  * session, the overlay panel's text fallback).
  *
@@ -327,6 +352,38 @@ const MARK: Record<TodoState, string> = { todo: "[ ]", in_progress: "[~]", done:
  * and completed and superseded items are shown only a few deep because they are history, not the plan. What is cut
  * says it was cut and where the rest lives, so a reader is never left believing a short list is a complete one.
  */
+/**
+ * What each label *is*, in the block itself, because the bare labels lost an ordering contest to a checklist.
+ *
+ * The wording is measured, not chosen, and the measurement is what matters as much as the result: three candidate
+ * sentences were run against the same conflicting plan (`DIRECTION acquire paperclips` with `[ ] t1 write the
+ * changelog`) and the same aligned one, with the pointer swapped, using `hack/plan-wording-probe.sh`.
+ *
+ * - no pointer: one run took the step and never mentioned the route, another noticed on its own - so it is a coin
+ *   toss whether the human's stated route is weighed at all;
+ * - "aim and route are the human's; steps are yours to move": took the step with "no conflict" twice, and on the
+ *   aligned plan *invented* a conflict (`TODO conflicts with DIRECTION`). Framing the route as belonging to somebody
+ *   else made the model read it as something to defer to rather than something to weigh;
+ * - the wording below: surfaced the real conflict in both runs (`Acquire paperclips; DIRECTION conflicts with TODO`,
+ *   `Question t1; DIRECTION conflicts with TODO t1`) and correctly reported no conflict on the aligned plan.
+ *
+ * That last contrast is the whole behaviour wanted: notice a disagreement between the route and a step, and do not
+ * stall when there is none. Two earlier readings of this script were thrown out because they were fiction - see the
+ * session-id note in `hack/plan-wording-probe.sh`, which is now the reason every probe takes a fresh id.
+ *
+ * The session clause is for the other measured failure: a model that lists `.pi/plan/` finds every session's plan in
+ * the checkout, and will read a stranger's open steps as instructions unless the text tells it whose plan it is.
+ */
+function pointer(plan: PlanRecord): string {
+  const bits = [
+    "TODO steps are the work; DIRECTION is the human's route and decides which step comes next",
+    "a step that no longer fits the route should be questioned rather than done",
+    `this is session ${plan.session_id}'s plan; the other files in ${CONFIG_DIR_NAME}/${PLAN_DIR_NAME}/ belong to other sessions`,
+  ];
+  if (plan.ended_at) bits.push(`this plan's session ended ${plan.ended_at}`);
+  return bits.join(" \u00b7 ");
+}
+
 export function renderPlanBlock(plan: PlanRecord, options: { recentDone?: number } = {}): string {
   const recentDone = options.recentDone ?? 3;
   const lines: string[] = [];
@@ -355,7 +412,7 @@ export function renderPlanBlock(plan: PlanRecord, options: { recentDone?: number
   // first), never the GOAL/DIRECTION lines. The reserve is the pointer line's own room: without it a trim that
   // lands exactly on the budget goes over the moment it says "there is more" - which is the failure this cap
   // exists to prevent, so it is measured rather than eyeballed.
-  const header = "# Plan";
+  const header = `# Plan\n${pointer(plan)}`;
   const POINTER_RESERVE = 96;
   const budget = PLAN_BLOCK_MAX_CHARS - POINTER_RESERVE;
   let body = lines;
@@ -412,6 +469,8 @@ function normalizePlan(input: unknown, sessionId: string): { plan: PlanRecord } 
   if (typeof raw.direction === "string" && raw.direction.trim()) plan.direction = clip(raw.direction, DIRECTION_MAX_CHARS);
   if (typeof raw.direction_at === "string") plan.direction_at = raw.direction_at;
   if (typeof raw.direction_prev === "string") plan.direction_prev = clip(raw.direction_prev, DIRECTION_MAX_CHARS);
+  // Carried through rather than dropped: a stamp a reader cannot see is a stamp that does nothing.
+  if (typeof raw.ended_at === "string" && raw.ended_at) plan.ended_at = raw.ended_at;
   return { plan };
 }
 

@@ -169,7 +169,9 @@ const EXPECTED: Record<string, Surface> = {
     // Pi diffs against what the model already has and patches only when it changes. So the events needed are the
     // ones where the record must be (re)read, repainted, or delivered - and not the compaction events, because
     // the section route means a plan reappears after a compaction on its own.
-    events: ["session_start", "session_info_changed", "before_agent_start"],
+    // `session_shutdown` is the stamp, not a cleanup: it marks the plan as belonging to a session that is over so
+    // the next session to list the directory cannot read a finished one's open steps as live instructions.
+    events: ["session_start", "session_info_changed", "session_shutdown", "before_agent_start"],
     tools: ["todos"],
     // Both aim doors (`/goal`, `/direction`) are human-only, so neither appears as a tool; `/todo` does, because
     // moving a step is what the agent is doing when it works.

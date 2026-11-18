@@ -95,7 +95,7 @@ describe("the surface", () => {
     expect([...harness.pi.tools.keys()]).toEqual(["todos"]);
     expect([...harness.pi.shortcuts.keys()]).toEqual(["shift+down"]);
     expect(harness.pi.flags.size).toBe(0);
-    expect(harness.pi.lifecycleEvents).toEqual(["session_start", "session_info_changed", "before_agent_start"]);
+    expect(harness.pi.lifecycleEvents).toEqual(["session_start", "session_shutdown", "session_info_changed", "before_agent_start"]);
     expect(harness.pi.appendedEntries).toHaveLength(0);
     expect(harness.pi.sentUserMessages).toHaveLength(0);
   });
@@ -420,6 +420,84 @@ function planOnDisk(cwd: string, sessionId = ID) {
 }
 
 const widgetLines = (harness: Harness) => renderedWidget(harness.ui, STATUS_KEY);
+
+describe("whose plan this is", () => {
+  it("says in the block what each label means and which one wins", async () => {
+    const harness = await setup();
+    await runDirection(harness, "acquire paperclips");
+    await runTodo(harness, "file the acquisition forms");
+    const sections = await startTurn(harness);
+    const drawn = sections[SECTION_KEY]!;
+    // The measured failure this line exists for: with a direction and an open step, the model named the step and
+    // never mentioned the direction. The labels alone were losing, so the block arbitrates.
+    expect(drawn.split("\n")[0]).toBe("# Plan");
+    expect(drawn).toContain("DIRECTION is the human's route and decides which step comes next");
+    expect(drawn).toContain("questioned rather than done");
+    expect(drawn).toContain(`this is session ${ID}'s plan`);
+    expect(drawn).toContain("belong to other sessions");
+  });
+
+  it("keeps the pointer inside the block's budget rather than after it", async () => {
+    const harness = await setup();
+    await runGoal(harness, "an aim long enough to matter ".repeat(6));
+    for (let i = 0; i < 60; i++) await runTodo(harness, `step ${i} with enough text to push the block over its cap`);
+    const drawn = (await startTurn(harness))[SECTION_KEY]!;
+    expect(drawn.length).toBeLessThanOrEqual(PLAN_BLOCK_MAX_CHARS);
+    expect(drawn).toContain("(+"); // it said what it cut, with the pointer already paid for
+  });
+
+  it("stamps the plan when the session ends, and writes nothing for an empty one", async () => {
+    const harness = await setup();
+    // Nothing said yet: no file, and quitting must not create one just to stamp it.
+    await harness.pi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, harness.context);
+    expect(existsSync(planFile(harness.cwd))).toBe(false);
+
+    await runDirection(harness, "acquire paperclips");
+    await runTodo(harness, "buy a box of clips");
+    harness.ui.notifications.length = 0; // the two writes' own messages, not the stamp's
+    await harness.pi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, harness.context);
+    const stored = readPlan(harness.cwd, ID).plan!;
+    expect(stored.ended_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(stored.direction).toBe("acquire paperclips"); // stamped, not erased
+    expect(harness.ui.notifications).toHaveLength(0);
+  });
+
+  it("clears the stamp when the session that owns it comes back", async () => {
+    const harness = await setup();
+    await runGoal(harness, "operationalize pi-ed");
+    await harness.pi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, harness.context);
+    expect(readPlan(harness.cwd, ID).plan!.ended_at).toBeDefined();
+
+    // Same id, new process: what `pi -c` does. The record is live again, so the file must stop claiming otherwise.
+    const again = await setup({ cwd: harness.cwd });
+    expect(readPlan(harness.cwd, ID).plan!.ended_at).toBeUndefined();
+    await runGoal(again, "");
+    expect(again.ui.notifications.at(-1)?.message).toContain("operationalize pi-ed");
+  });
+
+  it("says in the block when it is reading a plan whose session ended", async () => {
+    const harness = await setup();
+    await runDirection(harness, "acquire paperclips");
+    await harness.pi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, harness.context);
+    // A second session in the same checkout reading the finished one's file: the stamp has to survive the round trip.
+    const other = await setup({ cwd: harness.cwd, sessionId: OTHER });
+    const drawn = (await startTurn(other))[SECTION_KEY];
+    expect(drawn).toBeUndefined(); // the other session has no plan of its own, and does not inherit this one
+    const stamped = JSON.parse(readFileSync(planFile(harness.cwd), "utf8"));
+    expect(stamped.ended_at).toMatch(/^\d{4}/);
+  });
+
+  it("will not stamp over a plan it cannot read", async () => {
+    const harness = await setup();
+    const broken = `{"v": 99, "session_id": "${ID}", "todos": []}\n`;
+    mkdirSync(planDir(harness.cwd), { recursive: true });
+    writeFileSync(planFile(harness.cwd), broken);
+    const noisy = await setup({ cwd: harness.cwd });
+    expect(noisy.ui.notifications.at(-1)?.message).toContain("schema v99");
+    await noisy.pi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, noisy.context);
+    expect(readFileSync(planFile(harness.cwd), "utf8")).toBe(broken);
+  });
+});
 
 describe("/todo — the list, by hand", () => {
   it("adds a step and says which id it got", async () => {
