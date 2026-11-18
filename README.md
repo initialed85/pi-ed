@@ -11,7 +11,8 @@ and `/reload` follows them.
 ```
 extensions/   the extensions
 test/         vitest suite, no Pi runtime and no network needed
-hack/         check-package-shape.mjs, the CI gate on the package manifest
+hack/         check-package-shape.mjs (the CI gate on the package manifest), ci-status.sh (ask Woodpecker
+              what it did with a commit)
 .woodpecker/  CI: workflow lint + typecheck + tests
 ```
 
