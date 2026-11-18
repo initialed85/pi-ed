@@ -295,7 +295,7 @@ describe("renderPlanBlock", () => {
     plan = addTodo(plan, { text: "add /todo", why: "the biggest slice, needs the panel" }, AT).plan;
     plan = addTodo(plan, { text: "name-match inheritance", why: "looked useful at the time" }, AT).plan;
     plan = supersedeTodo(plan, "t4", "session id keying already does this", AT).plan;
-    plan = addTodo(plan, { text: "pick a shortcut", why: "shift+left measured unclaimed" }, AT).plan;
+    plan = addTodo(plan, { text: "pick a shortcut", why: "shift+down measured unclaimed" }, AT).plan;
     return completeTodo(plan, "t5", AT).plan;
   };
 

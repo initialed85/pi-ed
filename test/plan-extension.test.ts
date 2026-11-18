@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { createFakePi, createContext, callTool, type FakePi, type FakeContext, type FakeUi } from "./harness.ts";
-import { PANEL_MAX_LINES } from "../extensions/plan.ts";
+import { createFakePi, createContext, callTool, renderedWidget, type FakePi, type FakeContext, type FakeUi } from "./harness.ts";
+import { PANEL_MAX_STEPS } from "../extensions/plan.ts";
 import { planDir, PLAN_BLOCK_MAX_CHARS, readPlan } from "../lib/plan.ts";
 
 /**
@@ -71,7 +71,7 @@ async function runTodo(harness: Harness, args: string) {
 
 /** Press the panel key the way the TUI would: the recorded handler, called with a context. */
 async function pressPanelKey(harness: Harness) {
-  await harness.pi.shortcuts.get("shift+left")!.handler(harness.context);
+  await harness.pi.shortcuts.get("shift+down")!.handler(harness.context);
 }
 
 async function callTodos(harness: Harness, params: Record<string, unknown>) {
@@ -89,7 +89,7 @@ describe("the surface", () => {
     // The aim has no model-facing door; the list does, because the work on a list is done by the agent. The tool is
     // named for the list and not for the plan, so its name cannot imply it writes the goal too.
     expect([...harness.pi.tools.keys()]).toEqual(["todos"]);
-    expect([...harness.pi.shortcuts.keys()]).toEqual(["shift+left"]);
+    expect([...harness.pi.shortcuts.keys()]).toEqual(["shift+down"]);
     expect(harness.pi.flags.size).toBe(0);
     expect(harness.pi.lifecycleEvents).toEqual(["session_start", "session_info_changed", "before_agent_start"]);
     expect(harness.pi.appendedEntries).toHaveLength(0);
@@ -306,7 +306,7 @@ function planOnDisk(cwd: string, sessionId = ID) {
   return JSON.parse(readFileSync(planFile(cwd, sessionId), "utf8"));
 }
 
-const widgetLines = (harness: Harness) => harness.ui.widgets.get(STATUS_KEY) as string[] | undefined;
+const widgetLines = (harness: Harness) => renderedWidget(harness.ui, STATUS_KEY);
 
 describe("/todo — the list, by hand", () => {
   it("adds a step and says which id it got", async () => {
@@ -481,34 +481,162 @@ describe("todos — the list, by the model", () => {
 });
 
 describe("the panel", () => {
-  it("is off until asked for, and the key toggles it", async () => {
+  it("draws nothing until the session has a plan", async () => {
+    const harness = await setup();
+    expect(widgetLines(harness)).toBeUndefined();
+    // Expanding an empty plan still draws nothing: there is no line for the overlay to rise from.
+    await pressPanelKey(harness);
+    expect(harness.ui.overlays).toHaveLength(0);
+    expect(harness.ui.widgets.size).toBe(0);
+  });
+
+  it("is one compact line, and shift+down raises the detail over it", async () => {
     const harness = await setup();
     await runGoal(harness, "ship the plan");
     await runTodo(harness, "restart the pods");
-    expect(widgetLines(harness)).toBeUndefined();
+
+    const compact = widgetLines(harness)!;
+    expect(compact).toHaveLength(1);
+    expect(compact[0]).toContain("Plan:");
+    expect(compact[0]).toContain("ship the plan");
+    expect(compact[0]).toContain("1 open");
+    // The compact line is a counted summary, not the list: the step's text belongs to the expanded panel.
+    expect(compact[0]).not.toContain("restart the pods");
 
     await pressPanelKey(harness);
-    const lines = widgetLines(harness)!;
-    expect(lines[0]).toBe("🎯 ship the plan");
-    expect(lines[1]).toBe("1 open · 0 in progress");
-    expect(lines[2]).toBe("t1 [ ] restart the pods");
+    expect(harness.ui.overlays).toHaveLength(1);
+    const overlay = harness.ui.overlays[0];
+    expect(overlay.options.overlay).toBe(true);
+    // Non-capturing, because this is a panel you keep open while you type, not a dialog.
+    expect(overlay.options.overlayOptions.nonCapturing).toBe(true);
+    const lines = overlay.component.render(120);
+    expect(lines[0]).toContain("borderAccent");
+    expect(lines.join("\n")).toContain("◆ goal");
+    expect(lines.join("\n")).toContain("ship the plan");
+    expect(lines.join("\n")).toContain("restart the pods");
+    expect(lines.join("\n")).toContain("t1");
 
     await pressPanelKey(harness);
-    expect(widgetLines(harness)).toBeUndefined();
+    expect(overlay.closed).toBe(true);
+    expect(widgetLines(harness)).toHaveLength(1);
   });
 
-  it("caps its lines and says what it cut", async () => {
+  it("rises from the compact line and does not cover the editor", async () => {
+    const harness = await setup();
+    await runGoal(harness, "ship the plan");
+    await runTodo(harness, "restart the pods");
+    // A screen in scrollback mode: more rendered lines than the viewport, with the compact line near the bottom.
+    const rows = 24;
+    const markerAt = 30;
+    const screen = Array.from({ length: 40 }, (_, i) => (i === markerAt ? "  ▌ Plan: ◆ ship the plan" : "~"));
+    harness.ui.tui.terminal = { columns: 120, rows };
+    harness.ui.tui.render = () => screen;
+
+    await pressPanelKey(harness);
+    const overlay = harness.ui.overlays[0];
+    const height = overlay.component.render(120).length;
+    const widgetRow = markerAt - (screen.length - rows);
+    // The panel's last row is the compact line's row: everything it draws sits above it, so it cannot reach the
+    // editor or the autocomplete that grows below it.
+    const place = overlay.options.overlayOptions;
+    expect(place.row + place.maxHeight).toBe(widgetRow + 1);
+    expect(place.maxHeight).toBeLessThanOrEqual(height);
+    expect(place.width).toBe("100%");
+    expect(place.anchor).toBe("top-left");
+    expect(place.col).toBe(0);
+  });
+
+  it("trims the compositor's terminal-height padding while it is mounted", async () => {
+    const harness = await setup();
+    await runGoal(harness, "ship the plan");
+    await pressPanelKey(harness);
+    const tui = harness.ui.tui;
+    // A short base render: without the trim, Pi's padding becomes scrollback rows that show as blank lines.
+    expect(tui.compositeOverlays(["a", "b", "c"], 100, 24)).toEqual(["a", "b", "c"]);
+
+    // A shrink redraw is only possible with the overlay off the stack for that frame, and it goes straight back.
+    tui.maxLinesRendered = 30;
+    expect(tui.compositeOverlays(["a"], 100, 24)).toEqual(["a"]);
+    expect(tui.overlayStack).toHaveLength(0);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(tui.overlayStack).toHaveLength(1);
+
+    // Closing the panel restores the compositor, so the next session's renders are Pi's again.
+    harness.ui.overlays[0].close();
+    await Promise.resolve();
+    expect(tui.compositeOverlays(["a"], 100, 24)).toHaveLength(24);
+  });
+
+  it("shows the new state without remounting", async () => {
+    const harness = await setup();
+    await runGoal(harness, "ship the plan");
+    await runTodo(harness, "restart the pods");
+    await pressPanelKey(harness);
+    await callTodos(harness, { action: "add", text: "write the docs", why: "the contract is the docs" });
+
+    // One overlay still, not a close-and-reopen: the panel reads the live record when the terminal asks it to draw.
+    expect(harness.ui.overlays).toHaveLength(1);
+    const lines = harness.ui.overlays[0].component.render(120).join("\n");
+    expect(lines).toContain("restart the pods");
+    expect(lines).toContain("write the docs");
+    expect(lines).toContain("the contract is the docs");
+    expect(lines).toContain("2 open");
+  });
+
+  it("caps what it draws and says what it cut", async () => {
     const harness = await setup();
     for (let i = 1; i <= 12; i += 1) await runTodo(harness, `step ${i}`);
     await pressPanelKey(harness);
-    const lines = widgetLines(harness)!;
-    expect(lines).toHaveLength(PANEL_MAX_LINES);
-    expect(lines.at(-1)).toContain("7 more");
-    expect(lines.join("\n")).toContain("t5 [ ] step 5");
-    expect(lines.join("\n")).not.toContain("step 6");
+    const lines = harness.ui.overlays[0].component.render(200);
+    expect(lines.join("\n")).toContain(`step ${PANEL_MAX_STEPS}`);
+    expect(lines.join("\n")).not.toContain(`step ${PANEL_MAX_STEPS + 1}`);
+    expect(lines.join("\n")).toContain("4 more");
     // Capping the panel is not capping the record: all twelve are still on disk, and still in the prompt.
     expect(planOnDisk(harness.cwd).todos).toHaveLength(12);
     expect((await startTurn(harness))[SECTION_KEY]).toContain("12 open");
+  });
+
+  it("draws the detail into the widget where there is no scrollback", async () => {
+    // Fullscreen (alt-screen) mode has no lines that have already scrolled away, so an overlay rising from the
+    // compact row would cover the viewport for no reason: the widget itself carries the detail there.
+    const harness = await setup();
+    await runGoal(harness, "ship the plan");
+    await runTodo(harness, "restart the pods");
+    harness.ui.tui.mode = "fullscreen";
+    await harness.pi.commands.get("todo")!.handler!("hide", harness.context);
+    await runTodo(harness, "show");
+    expect(harness.ui.overlays).toHaveLength(0);
+    const lines = widgetLines(harness)!;
+    expect(lines.join("\n")).toContain("restart the pods");
+    expect(lines.join("\n")).toContain("◆ goal");
+    expect(lines.length).toBeGreaterThan(1);
+  });
+
+  it("says nothing when it is opened or closed", async () => {
+    const harness = await setup();
+    await runGoal(harness, "ship the plan");
+    const before = harness.ui.notifications.length;
+    await pressPanelKey(harness);
+    await pressPanelKey(harness);
+    expect(harness.ui.notifications).toHaveLength(before);
+    // `/todo show|hide` is the same door, and equally quiet where a panel can actually appear.
+    await runTodo(harness, "show");
+    await runTodo(harness, "hide");
+    expect(harness.ui.notifications).toHaveLength(before);
+  });
+
+  it("falls back to plain lines where there is no overlay", async () => {
+    const harness = await setup({ hasUI: true, mode: "rpc" });
+    await runGoal(harness, "ship the plan");
+    await runTodo(harness, "restart the pods");
+    expect(widgetLines(harness)).toEqual(["◆ ship the plan", "1 open"]);
+    await runTodo(harness, "show");
+    const lines = widgetLines(harness)!;
+    expect(harness.ui.overlays).toHaveLength(0);
+    expect(lines[0]).toContain("Plan");
+    expect(lines.join("\n")).toContain("restart the pods");
+    expect(lines.join("\n")).toContain("1 open · 0 in progress · 0 done · 0 retired");
   });
 
   it("paints nothing without a UI, and still writes", async () => {

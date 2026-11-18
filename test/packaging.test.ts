@@ -173,7 +173,7 @@ const EXPECTED: Record<string, Surface> = {
     tools: ["todos"],
     commands: ["goal", "todo"],
     flags: [],
-    shortcuts: ["shift+left"],
+    shortcuts: ["shift+down"],
     messageRenderers: [],
     entryRenderers: [],
   },

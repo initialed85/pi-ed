@@ -26,9 +26,16 @@
  * list nobody can move reports `[ ]` about things that are finished. The one action there that retires
  * something a human wrote (`supersede`) requires a reason, which is what lets the human overrule it later.
  * Everything in the sequence shares this file for the same reason: one reader of the record, one writer, one paint.
+ *
+ * **Where the panel comes from.** Its style and its mechanism are lifted from the pulse panel in
+ * `initialed85/pi-team-room`, with that project's runtime workarounds included, because those workarounds are about
+ * Pi rather than about the team room: in scrollback mode a short render is padded to the full terminal height before
+ * overlays composite, which leaves blank rows behind, and an above-editor widget cannot uncover lines that have
+ * already scrolled off the top. See the panel section for what is copied and what is deliberately not.
  */
 
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Box, Text, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   addTodo,
@@ -48,6 +55,8 @@ import {
   WHY_MAX_CHARS,
   type Mutation,
   type PlanRecord,
+  type Todo,
+  type TodoState,
 } from "../lib/plan.ts";
 
 /** Status-bar and panel key. Names here are a shared namespace across extensions (`schedules`, `tags`, `auto-resume`). */
@@ -55,13 +64,17 @@ const STATUS_KEY = "plan";
 const WIDGET_KEY = "plan";
 /** The prompt section this extension owns: rendered as `<plan>…</plan>` and patched only when it changes. */
 const SECTION_KEY = "plan";
-/** Toggles the read-only panel. `shift+left` is unclaimed in `docs/keybindings.md` (`left`/`ctrl+b` move the cursor,
- * `alt+left`/`ctrl+left` move by word and fold the tree), so this binds nothing the editor already uses. */
-const PANEL_SHORTCUT = "shift+left";
+/** Toggles the panel. `shift+down` rather than the team room's `shift+up`, so the two panels on one screen open
+ * with different keys: `docs/keybindings.md` claims only `ctrl+shift+down`/`ctrl+down` for alt-screen prompt
+ * navigation, and `shift+down` itself is unbound. */
+const PANEL_SHORTCUT = "shift+down";
 const MARK = "🎯";
-/** Lines the panel shows. Above the editor, every line is screen the prompt does not have. Exported so the test
- * asserts against the real cap rather than a copy of it that can drift. */
-export const PANEL_MAX_LINES = 8;
+/** Written on the compact line, and searched for on the rendered screen, so the expanded panel can find the row it
+ * belongs to. Both halves read this constant, so the two cannot drift apart. */
+const PANEL_MARK = "Plan:";
+/** Steps the expanded panel draws. More than this and the panel is a transcript again; the report and the prompt
+ * block both still show everything. Exported so the test asserts against the real cap, not a copy of it. */
+export const PANEL_MAX_STEPS = 8;
 /** Lines `/todo` prints as a notification. The first is the counts, so a truncated notification still says something. */
 const REPORT_MAX_ITEMS = 8;
 const STATE_MARKS: Record<string, string> = { todo: " ", in_progress: ">", done: "x", superseded: "!" };
@@ -93,12 +106,308 @@ function planReport(plan: PlanRecord): string {
   return [`${header}${history}`, ...lines].join("\n");
 }
 
+// ── the panel ───────────────────────────────────────────────────────────────────────────────────────
+//
+// Lifted from `initialed85/pi-team-room`'s pulse panel, in both senses: the same look (a `Box` on the theme's
+// message background, a `▌` rail down the left edge, role colours and `◆`/`↳`/`●`/`○`/`✓`/`✗` marks instead of
+// prose), and the same mechanism (one compact line as the widget, and the detail as a non-capturing overlay that
+// rises from that line in scrollback mode). The team room already paid for the runtime's sharp edges, so this file
+// pays them the same way: `patchCompositor` trims Pi's terminal-height padding back to the rows the overlay
+// actually needs, `detachOwnedForShrink` lets Pi's clear-on-shrink redraw happen for one frame, and the overlay
+// options are getter-backed because Pi resolves an `overlayOptions` callback once at mount while the compositor
+// reads the stored object on every render.
+//
+// Three differences, all deliberate:
+//
+// - The key is `shift+down`, because `shift+up` is already the team room's panel and both are on screen together.
+// - The compact line appears only when there is something on it. A team is always somewhere, so a presence line is
+//   always true; "no goal" is not, and an empty line about nothing would spend screen on every session.
+// - Opening and closing it says nothing. In the team room the panel *is* the feedback; a notification under it
+//   repeats what the eye has just seen.
+
+/** The subset of Pi's theme the panel needs - which is also what a test can hand it. */
+type PanelTheme = {
+  fg(color: string, text: string): string;
+  bg(color: string, text: string): string;
+  bold(text: string): string;
+};
+
+type OverlayEntry = { component?: unknown };
+type RenderingTui = TUI & {
+  compositeOverlays?: (lines: string[], width: number, height: number) => string[];
+  overlayStack?: OverlayEntry[];
+  previousLines?: string[];
+  maxLinesRendered?: number;
+};
+
+/**
+ * The panel's mutable half. It hangs off one `activate()` rather than the module, because the compositor patch and
+ * the mounted-overlay set are facts about *this* terminal: a process that starts a second session - which is what a
+ * test does on every `import` of a fresh harness - must not inherit an overlay that is no longer on any screen, or a
+ * patch installed on a terminal it no longer has.
+ */
+type PanelState = {
+  /** What the panel draws. Read at render time, so a mutation under an open panel shows without remounting. */
+  data?: PlanRecord;
+  widgetTui?: TUI;
+  overlayTui?: TUI;
+  overlayDone?: () => void;
+  overlayComponent?: { render(width: number): string[] };
+  owned: Set<unknown>;
+  restoreCompositorPatch?: () => void;
+};
+
+const newPanelState = (): PanelState => ({ owned: new Set() });
+
+const truncate = (text: string, width: number): string =>
+  text.length <= width ? text : `${text.slice(0, Math.max(0, width - 1))}…`;
+
+function countText(plan: PlanRecord): string {
+  const c = countTodos(plan);
+  return `${c.open} open · ${c.inProgress} in progress · ${c.done} done · ${c.superseded} retired`;
+}
+
+/** Compact counts drop the zeroes: "1 open · 0 in progress · 0 done · 0 retired" is a lot of nothing. */
+function shortCountText(plan: PlanRecord): string {
+  const c = countTodos(plan);
+  const parts: string[] = [];
+  if (c.open) parts.push(`${c.open} open`);
+  if (c.inProgress) parts.push(`${c.inProgress} in progress`);
+  if (c.done) parts.push(`${c.done} done`);
+  if (c.superseded) parts.push(`${c.superseded} retired`);
+  return parts.join(" · ") || "nothing open";
+}
+
+/** A step's mark, in the colour that means the same thing everywhere else in this terminal. */
+function stepMark(theme: PanelTheme, state: TodoState): string {
+  if (state === "in_progress") return theme.fg("warning", "●");
+  if (state === "done") return theme.fg("success", "✓");
+  if (state === "superseded") return theme.fg("error", "✗");
+  return theme.fg("dim", "○");
+}
+
+function buildPlanBox(plan: PlanRecord, theme: PanelTheme, expanded: boolean, includeTrailingSpacer = false): Box {
+  const box = new Box(1, 0, (text) => theme.bg("customMessageBg", text));
+  const addLine = (line: string): void => box.addChild(new Text(line, 0, 0));
+  const rail = theme.fg("accent", "▌ ");
+  if (expanded) {
+    // Pi's highlighted divider, drawn rather than imported: this file also loads in hosts without the
+    // interactive runtime.
+    box.addChild({
+      render: (width: number) => [theme.fg("borderAccent", "─".repeat(Math.max(1, width)))],
+      invalidate: () => undefined,
+    });
+  }
+
+  if (!expanded) {
+    const aim = plan.goal ?? plan.direction;
+    const bits = [
+      aim ? theme.fg("accent", `◆ ${truncate(aim, 44)}`) : theme.fg("dim", "◆ no goal"),
+      plan.todos.length === 0 ? theme.fg("dim", "no steps") : theme.fg("dim", shortCountText(plan)),
+    ];
+    if (plan.direction && plan.goal) bits.splice(1, 0, theme.fg("warning", `↳ ${truncate(plan.direction, 32)}`));
+    addLine(`${rail}${theme.bold(theme.fg("accent", PANEL_MARK))} ${bits.join(theme.fg("borderMuted", " | "))}`);
+    return box;
+  }
+
+  addLine(`${rail}${theme.bold(theme.fg("accent", "Plan"))} ${theme.fg("dim", "— this session")} ${theme.fg("muted", `(${PANEL_SHORTCUT} to close)`)}`);
+  addLine(`${rail}${theme.fg("accent", "◆ goal")} ${plan.goal ? theme.fg("text", truncate(plan.goal, 140)) : theme.fg("dim", "/goal <text> sets it")}`);
+  if (plan.direction) {
+    addLine(`${rail}${theme.fg("warning", "↳ direction")} ${theme.fg("text", truncate(plan.direction, 140))}`);
+  }
+  if (plan.todos.length === 0) {
+    addLine(`${rail}${theme.fg("dim", "no steps yet · /todo <text> adds one")}`);
+  }
+  for (const todo of plan.todos.slice(0, PANEL_MAX_STEPS)) {
+    const detail = todo.state === "superseded" ? todo.note : todo.why;
+    const faded = todo.state === "done" || todo.state === "superseded";
+    addLine([
+      rail,
+      stepMark(theme, todo.state),
+      theme.fg("muted", todo.id),
+      theme.fg(faded ? "dim" : "text", truncate(todo.text, 100)),
+      detail ? theme.fg("dim", `— ${truncate(detail, 70)}`) : "",
+    ].filter(Boolean).join(" "));
+  }
+  const hidden = plan.todos.length - Math.min(plan.todos.length, PANEL_MAX_STEPS);
+  // The notice gets its own row even when everything else fit: a panel that silently stops at eight steps leaves a
+  // reader believing eight was the whole list.
+  if (hidden > 0) addLine(`${rail}${theme.fg("muted", `… ${hidden} more · /todo lists them all`)}`);
+  addLine(`${rail}${theme.fg("dim", countText(plan))}`);
+  if (includeTrailingSpacer) addLine("");
+  return box;
+}
+
+/** The same content as plain lines, for RPC and print mode, where there is no overlay and no theme. */
+function planLines(plan: PlanRecord, expanded: boolean): string[] {
+  const aim = plan.goal ?? plan.direction;
+  const lines: string[] = [];
+  if (expanded) lines.push(`─── Plan ───`);
+  lines.push(`◆ ${aim ?? "no goal · /goal <text> sets it"}`);
+  if (plan.direction && plan.goal) lines.push(`↳ ${plan.direction}`);
+  if (expanded) {
+    if (plan.todos.length === 0) lines.push("no steps yet · /todo <text> adds one");
+    for (const todo of plan.todos) {
+      const detail = todo.state === "superseded" ? todo.note : todo.why;
+      lines.push(`${todo.state[0]?.toUpperCase()} ${todo.id} ${todo.text}${detail ? ` — ${detail}` : ""}`);
+    }
+    lines.push(countText(plan));
+  } else if (plan.todos.length > 0) {
+    lines.push(shortCountText(plan));
+  }
+  return lines.map((line) => line.slice(0, 200));
+}
+
+/**
+ * Where the expanded panel goes in scrollback mode: the rows directly above the compact line, found by searching the
+ * rendered screen for `PANEL_MARK`. Clamped so a tall panel cannot run past that row into the editor, or down into
+ * the autocomplete that grows below it.
+ */
+function panelOverlayPosition(tui: TUI, height: number, renderedLines?: string[]): { row: number; maxHeight: number } {
+  const lines = renderedLines || tui.render(tui.terminal.columns);
+  // The last line carrying the compact widget - a forward scan rather than `findLastIndex`, because this repo
+  // typechecks against an older `lib` and a screenful of lines is small either way.
+  let widgetLine = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (lines[i].includes(PANEL_MARK)) widgetLine = i;
+  }
+  const viewportTop = Math.max(0, lines.length - tui.terminal.rows);
+  const widgetRow = widgetLine >= 0 ? widgetLine - viewportTop : undefined;
+  const targetLine = widgetLine >= 0 ? widgetLine - height + 1 : tui.terminal.rows - height;
+  const row = Math.max(0, Math.min(tui.terminal.rows - 1, targetLine - viewportTop));
+  const availableAboveWidget = widgetRow === undefined ? tui.terminal.rows - row : widgetRow - row + 1;
+  return {
+    row,
+    maxHeight: Math.max(1, Math.min(tui.terminal.rows - row, availableAboveWidget)),
+  };
+}
+
+/**
+ * While one of our overlays is mounted, cut `TuiBase`'s terminal-height padding back to the base render plus the
+ * rows the overlay needs. Keeping the padding makes the next ordinary render look shorter and reflows the
+ * scrollback into blank rows.
+ */
+function patchCompositor(state: PanelState, tui: TUI): void {
+  if (state.restoreCompositorPatch) return;
+  const renderingTui = tui as RenderingTui;
+  // `widgetTui` is normally Pi's stable TUI proxy. Read the method off the prototype chain instead of retaining the
+  // proxy's per-access wrapper, so repeated open/close cycles cannot build a chain of wrappers around their copies.
+  let owner = Object.getPrototypeOf(renderingTui) as object | null;
+  while (owner && !Object.prototype.hasOwnProperty.call(owner, "compositeOverlays")) {
+    owner = Object.getPrototypeOf(owner) as object | null;
+  }
+  const inherited = owner && (owner as Partial<RenderingTui>).compositeOverlays;
+  const original = inherited || renderingTui.compositeOverlays;
+  if (!original) return;
+  const owned = state.owned;
+  const patched = function (this: RenderingTui, lines: string[], width: number, height: number): string[] {
+    const composed = original.call(this, lines, width, height);
+    const stack = this.overlayStack;
+    const mounted = !stack || stack.some((entry) => owned.has(entry.component));
+    const trimmed = mounted && composed.length > lines.length ? composed.slice(0, lines.length) : composed;
+    if (mounted) detachOwnedForShrink(state, this, stack, lines);
+    return trimmed;
+  };
+  renderingTui.compositeOverlays = patched;
+  state.restoreCompositorPatch = () => {
+    renderingTui.compositeOverlays = original;
+    state.restoreCompositorPatch = undefined;
+  };
+}
+
+/**
+ * Pi skips its clear-on-shrink redraw while an overlay is mounted, because a modal overlay needs the padding. Ours
+ * is non-capturing and already composited into the base render and trimmed above, so taking it off the stack for one
+ * frame lets the normal shrink redraw happen; the current frame still contains the panel.
+ */
+function detachOwnedForShrink(state: PanelState, tui: RenderingTui, stack: OverlayEntry[] | undefined, lines: string[]): void {
+  if (!stack || stack.length === 0) return;
+  const previousLength = Math.max(
+    Array.isArray(tui.previousLines) ? tui.previousLines.length : 0,
+    typeof tui.maxLinesRendered === "number" ? tui.maxLinesRendered : 0,
+  );
+  if (lines.length >= previousLength) return;
+  const owned = stack.filter((entry) => state.owned.has(entry.component));
+  if (owned.length === 0 || owned.length !== stack.length) return;
+  stack.splice(0, stack.length);
+  queueMicrotask(() => {
+    const currentStack = tui.overlayStack;
+    if (!currentStack) return;
+    for (const entry of owned) {
+      if (state.owned.has(entry.component) && !currentStack.includes(entry)) currentStack.push(entry);
+    }
+  });
+}
+
+function closePanelOverlay(state: PanelState): void {
+  const done = state.overlayDone;
+  state.overlayDone = undefined;
+  state.overlayTui = undefined;
+  if (state.overlayComponent) state.owned.delete(state.overlayComponent);
+  state.overlayComponent = undefined;
+  if (state.owned.size === 0) state.restoreCompositorPatch?.();
+  done?.();
+}
+
+function openPanelOverlay(state: PanelState, ctx: ExtensionContext | ExtensionCommandContext): void {
+  if (ctx.mode !== "tui" || state.overlayDone) return;
+  if (state.widgetTui) patchCompositor(state, state.widgetTui);
+  let theme: PanelTheme = ctx.ui.theme as unknown as PanelTheme;
+  const component = {
+    // Drawn from `state.data` rather than a captured plan, so a mutation while the panel is open shows up on the
+    // next frame without remounting the overlay.
+    render: (width: number): string[] => (state.data ? buildPlanBox(state.data, theme, true, true).render(width) : []),
+    invalidate: (): void => {
+      theme = ctx.ui.theme as unknown as PanelTheme;
+    },
+  };
+  state.owned.add(component);
+  state.overlayComponent = component;
+  const overlay = ctx.ui.custom<void>((tui, initialTheme, _keybindings, done) => {
+    state.overlayTui = tui;
+    theme = initialTheme as unknown as PanelTheme;
+    state.overlayDone = () => done(undefined);
+    return component;
+  }, {
+    overlay: true,
+    // Getter-backed, because Pi resolves an `overlayOptions` callback once at mount while the compositor reads the
+    // stored object on every render. The panel follows editor and autocomplete growth without holding
+    // terminal-height padding in the scrollback.
+    overlayOptions: {
+      anchor: "top-left",
+      get row(): number {
+        const tui = state.overlayTui || state.widgetTui;
+        const height = state.overlayComponent?.render(tui?.terminal.columns ?? 80).length ?? 1;
+        return tui ? panelOverlayPosition(tui, height).row : 0;
+      },
+      col: 0,
+      width: "100%",
+      get maxHeight(): number {
+        const tui = state.overlayTui || state.widgetTui;
+        const height = state.overlayComponent?.render(tui?.terminal.columns ?? 80).length ?? 1;
+        return tui ? panelOverlayPosition(tui, height).maxHeight : 1;
+      },
+      nonCapturing: true,
+    },
+  });
+  void overlay.catch(() => undefined).finally(() => {
+    state.owned.delete(component);
+    if (state.overlayComponent === component) {
+      state.overlayComponent = undefined;
+      state.overlayDone = undefined;
+      state.overlayTui = undefined;
+    }
+    if (state.owned.size === 0) state.restoreCompositorPatch?.();
+  });
+}
+
 export default function activate(pi: ExtensionAPI) {
   /** The record for the session that is currently loaded, or undefined until a session starts. */
   let loaded: Loaded | undefined;
-  /** Whether the panel is showing. Per process, and off by default: a plan the human did not ask to see should not
-   * spend screen, and the whole point of the file is that the state is there whether or not it is on screen. */
+  /** Whether the panel is expanded. Per process, and off by default: the file is the state, the panel is a view. */
   let panelVisible = false;
+  /** Which terminal this activation drew itself onto, and what it has mounted there. */
+  const panel = newPanelState();
 
   const now = () => new Date().toISOString();
 
@@ -126,9 +435,9 @@ export default function activate(pi: ExtensionAPI) {
   };
 
   /**
-   * The status line, and the panel if it is toggled on. Deliberately short: the goal and the list are also in the
-   * prompt where the model reads them in full, and the status line exists to answer "which session am I in, and
-   * what is it for" without being looked at directly.
+   * The status line and the panel. Deliberately short: the goal and the list are also in the prompt, where the model
+   * reads them in full, and the compact line exists to answer "what is this session for" without being looked at
+   * directly.
    */
   const paint = (ctx: ExtensionContext | ExtensionCommandContext) => {
     if (!ctx.hasUI) return;
@@ -136,6 +445,8 @@ export default function activate(pi: ExtensionAPI) {
     if (!record) return;
     if (record.problem) {
       ctx.ui.setStatus(STATUS_KEY, `⚠️ ${record.problem.slice(0, 60)}`);
+      panel.data = undefined;
+      closePanelOverlay(panel);
       ctx.ui.setWidget(WIDGET_KEY, undefined);
       return;
     }
@@ -144,26 +455,53 @@ export default function activate(pi: ExtensionAPI) {
     const aim = plan.goal ?? plan.direction;
     const open = counts.open + counts.inProgress;
     const tally = plan.todos.length > 0 ? `${open} step${open === 1 ? "" : "s"} open` : "";
-    const line = [aim ? `${MARK} ${aim.length > 46 ? `${aim.slice(0, 45)}…` : aim}` : "", tally].filter(Boolean).join(" · ");
+    const line = [aim ? `${MARK} ${truncate(aim, 46)}` : "", tally].filter(Boolean).join(" · ");
     ctx.ui.setStatus(STATUS_KEY, line || undefined);
 
-    if (!panelVisible) {
+    panel.data = plan;
+    // Nothing to say, nothing drawn. See the panel section for why this differs from the team room.
+    const hasContent = Boolean(plan.goal || plan.direction || plan.todos.length > 0);
+    if (!hasContent) {
+      closePanelOverlay(panel);
       ctx.ui.setWidget(WIDGET_KEY, undefined);
       return;
     }
-    // The panel is the report, cut shorter, with the aim on top. It is built from the same `todoLine` as the
-    // notification so the two can never disagree about what a step says.
-    // Two lines are spoken for (the aim and the counts), and one more is reserved for the truncation notice: a
-    // panel that cut its "and N more" line off would leave a reader believing five steps was the whole list.
-    const itemBudget = PANEL_MAX_LINES - 3;
-    const shown = plan.todos.slice(0, itemBudget);
-    const items = shown.map(todoLine);
-    if (plan.todos.length > shown.length) items.push(`… ${plan.todos.length - shown.length} more · /todo for all, ${PANEL_SHORTCUT} to hide`);
-    ctx.ui.setWidget(WIDGET_KEY, [
-      aim ? `${MARK} ${aim}` : `${MARK} no goal`,
-      plan.todos.length === 0 ? `${MARK} no steps yet · /todo <text> adds one` : `${counts.open} open · ${counts.inProgress} in progress`,
-      ...items,
-    ]);
+
+    if (ctx.mode !== "tui") {
+      // RPC and print have no overlay surface and no theme, so the widget is the panel: plain lines, expanded or
+      // not, capped by the same rules.
+      closePanelOverlay(panel);
+      ctx.ui.setWidget(WIDGET_KEY, planLines(plan, panelVisible));
+      return;
+    }
+
+    // In scrollback ("regular") mode an expanded widget cannot uncover lines that have already scrolled past, so
+    // the widget stays one line and the detail goes into the overlay that rises from it. Anywhere else the widget
+    // itself draws the expanded box. Pi hands us its terminal when it builds the widget, which is not necessarily
+    // before this runs, so an unknown mode is read as scrollback: that is Pi's interactive default, and the widget
+    // factory below re-decides with the terminal it was actually given.
+    const widgetMode = (panel.widgetTui as (TUI & { mode?: string }) | undefined)?.mode;
+    const regularMode = widgetMode === undefined ? true : widgetMode === "regular";
+    if (panelVisible && regularMode) openPanelOverlay(panel, ctx);
+    else closePanelOverlay(panel);
+
+    ctx.ui.setWidget(WIDGET_KEY, (tui: TUI, theme: unknown) => {
+      panel.widgetTui = tui;
+      const regular = (tui as TUI & { mode?: string }).mode === "regular";
+      // Decided here, from the terminal Pi actually handed us, so the widget and the overlay cannot both carry the
+      // detail: in scrollback the widget is always the compact line.
+      const drawExpanded = panelVisible && !regular;
+      const panelTheme = theme as PanelTheme;
+      let box = buildPlanBox(panel.data ?? plan, panelTheme, drawExpanded);
+      return {
+        render: (width: number) => box.render(width),
+        // Rebuilt on invalidate so a theme change (or a plan mutation redrawn by Pi) does not leave the panel
+        // painted in last frame's colours.
+        invalidate: () => {
+          box = buildPlanBox(panel.data ?? plan, ctx.ui.theme as unknown as PanelTheme, drawExpanded);
+        },
+      };
+    }, { placement: "aboveEditor" });
   };
 
   /** Commit a mutation: write it first, only then make it the loaded record. A failed write leaves the old one intact. */
@@ -319,7 +657,8 @@ export default function activate(pi: ExtensionAPI) {
       if (word === "show" || word === "hide") {
         panelVisible = word === "show";
         paint(ctx);
-        show(`${MARK} plan ${panelVisible ? "shown" : "hidden"} · ${PANEL_SHORTCUT} toggles it`);
+        // In a terminal the panel is its own answer. Only say something where nothing can appear on screen.
+        if (ctx.hasUI && ctx.mode !== "tui") show(`${MARK} plan ${panelVisible ? "shown" : "hidden"}`);
         return;
       }
       if (word === "help") {
@@ -451,11 +790,10 @@ export default function activate(pi: ExtensionAPI) {
   });
 
   pi.registerShortcut(PANEL_SHORTCUT, {
-    description: "Show or hide this session's plan panel",
+    description: "Expand or collapse this session's plan panel",
     handler: (ctx) => {
       panelVisible = !panelVisible;
       paint(ctx);
-      if (ctx.hasUI) ctx.ui.notify(`${MARK} plan ${panelVisible ? "shown" : "hidden"}`, "info");
     },
   });
 }

@@ -245,17 +245,64 @@ export interface FakeUi {
   notifications: RecordedNotification[];
   widgets: Map<string, unknown>;
   statuses: Map<string, string | undefined>;
+  /** What a widget factory built against this double's terminal. `widgets` keeps the factory itself. */
+  builtWidgets: Map<string, unknown>;
+  /** Overlays `ui.custom` has mounted, oldest first. `close()` runs the `done` callback Pi hands the factory. */
+  overlays: FakeOverlay[];
+  /** The terminal handed to widget factories and to `ui.custom`. Tests adjust `terminal`, `mode`, and `render`. */
+  tui: any;
+  theme: typeof fakeTheme;
   notify: (message: string | undefined, level?: string) => void;
   setWidget: (key: string, value: unknown) => void;
   setStatus: (key: string, value: string | undefined) => void;
+  custom: (factory: (tui: any, theme: any, keybindings: any, done: (result: any) => void) => any, options?: any) => Promise<void>;
   [key: string]: unknown;
+}
+
+export type FakeOverlay = {
+  options: any;
+  component: any;
+  tui: any;
+  closed: boolean;
+  close: () => void;
+};
+
+/**
+ * A terminal double: enough for a `Box`/`Text` tree to render, and enough for overlay layout code to run. The
+ * prototype carries `compositeOverlays` because Pi defines it there - an extension that patches it must find it on
+ * a prototype and write its own override on the instance, which is what this shape makes testable.
+ */
+export function createFakeTui(options: { columns?: number; rows?: number; mode?: string; lines?: string[] } = {}) {
+  const base = {
+    /** Mimics `TuiBase`: while an overlay is mounted, a short render comes back padded to the terminal height. */
+    compositeOverlays(lines: string[], _width: number, height: number): string[] {
+      const padded = [...lines];
+      while (padded.length < height) padded.push("");
+      return padded;
+    },
+  };
+  const tui: any = Object.create(base);
+  tui.terminal = { columns: options.columns ?? 100, rows: options.rows ?? 24 };
+  tui.mode = options.mode ?? "regular";
+  tui.render = () => options.lines ?? [];
+  tui.overlayStack = [] as Array<{ component?: unknown }>;
+  tui.previousLines = [] as string[];
+  tui.maxLinesRendered = 0;
+  return tui;
 }
 
 export function createFakeUi(): FakeUi {
   const ui: FakeUi = {
     notifications: [],
     widgets: new Map(),
+    builtWidgets: new Map(),
     statuses: new Map(),
+    overlays: [],
+    // A wide terminal on purpose: `fakeTheme` writes literal tags into the string, so a component that measures
+    // "visible width" sees a longer line than a human would and would wrap at 80 columns. Tests that care about
+    // wrapping set `ui.tui.terminal` themselves.
+    tui: createFakeTui({ columns: 240 }),
+    theme: fakeTheme,
     notify: (message, level) => {
       ui.notifications.push({ message, level });
     },
@@ -263,17 +310,59 @@ export function createFakeUi(): FakeUi {
       // Pi's contract is that `setWidget(key, undefined)` clears. A double that keeps the key holding an undefined
       // value lets a test pass on a panel that is still registered and merely empty, which is the difference between
       // "hidden" and "taking up the space anyway".
-      if (value === undefined) ui.widgets.delete(key);
-      else ui.widgets.set(key, value);
+      if (value === undefined) {
+        ui.widgets.delete(key);
+        return;
+      }
+      // Pi builds a widget by calling the factory with its terminal, so the double calls it too. An extension that
+      // decides what to draw from the terminal it is handed - which is the only honest way to do it - would
+      // otherwise never see one, and would quietly take a different branch in tests than on screen.
+      // Pi builds a component by calling the factory with its terminal, so the double calls it too: an extension
+      // that decides what to draw from the terminal it is handed - the only honest way to do it - would otherwise
+      // never see one and would quietly take a different branch in tests than on screen. The raw value stays in
+      // `widgets` (renderer tests build their own component from it), and what Pi would have mounted goes in
+      // `builtWidgets`.
+      ui.widgets.set(key, value);
+      if (!Array.isArray(value) && typeof value === "function") {
+        ui.builtWidgets.set(key, (value as (tui: any, theme: any) => any)(ui.tui, ui.theme));
+      } else {
+        ui.builtWidgets.delete(key);
+      }
     },
     setStatus: (key, value) => {
       ui.statuses.set(key, value);
+    },
+    custom: (factory, options) => {
+      // Modelled the way Pi behaves for the one shape an extension uses this for: an overlay that stays until its
+      // `done` is called, and which mounts on the terminal the widget factory was last handed. The promise resolves
+      // when it closes, so an extension's `finally` cleanup runs on close rather than on open.
+      const tui = ui.tui;
+      let settle!: () => void;
+      const promise = new Promise<void>((resolve) => {
+        settle = () => {
+          if (overlay.closed) return;
+          overlay.closed = true;
+          resolve();
+        };
+      });
+      const component = factory(tui, ui.theme, {}, () => settle());
+      const overlay: FakeOverlay = { options, component, tui, closed: false, close: () => settle() };
+      ui.overlays.push(overlay);
+      // Pi keeps mounted overlays on a stack that the compositor reads; layout code that inspects it needs one.
+      if (Array.isArray(tui.overlayStack)) tui.overlayStack.push({ component });
+      void promise.finally(() => {
+        const stack = tui.overlayStack;
+        if (!Array.isArray(stack)) return;
+        const at = stack.findIndex((entry: { component?: unknown }) => entry.component === component);
+        if (at >= 0) stack.splice(at, 1);
+      });
+      return promise;
     },
   };
   // setFooter is here rather than modelled because an extension that wants right-aligned per-message
   // stats now writes them as a session entry instead of owning the footer. A future footer call should
   // fail the test rather than draw into a double that is not watching.
-  for (const method of ["select", "confirm", "input", "custom", "setEditorText", "addAutocompleteProvider", "setFooter"]) {
+  for (const method of ["select", "confirm", "input", "setEditorText", "addAutocompleteProvider", "setFooter"]) {
     ui[method] = UNIMPLEMENTED(`ui.${method}`);
   }
   return ui;
@@ -483,6 +572,20 @@ export function painted(rendered: any): string {
   const own = typeof rendered.text === "string" ? rendered.text : "";
   if (!children.length) return own;
   return [own, ...children.map(painted)].filter(Boolean).join("\n");
+}
+
+/**
+ * What a widget would paint, whether the extension stored plain lines or handed Pi a component factory: the
+ * factory runs against the fake terminal and theme, and its rows come back tagged by `fakeTheme` so a test can see
+ * which colour produced which fragment.
+ */
+export function renderedWidget(ui: FakeUi, key: string, width = ui.tui?.terminal?.columns ?? 240): string[] | undefined {
+  const stored = ui.widgets.get(key);
+  if (stored === undefined) return undefined;
+  if (Array.isArray(stored)) return stored.map(String);
+  const built = ui.builtWidgets.get(key);
+  const component = built ?? (stored as (tui: any, theme: any) => any)(ui.tui, ui.theme);
+  return component.render(width);
 }
 
 /** Load an extension module with the module registry cleared, so module-level state is fresh. */
