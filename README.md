@@ -36,7 +36,7 @@ class registries.
 
 ## The extensions
 
-Twelve of them live in `extensions/` and are what `pi install git:github.com/initialed85/pi-ed` loads. One more,
+Thirteen of them live in `extensions/` and are what `pi install git:github.com/initialed85/pi-ed` loads. One more,
 `memory.ts`, is in **`parked/`**: compiled, tested and swept against the live store, but outside the directory Pi
 discovers, so no session is given its tools. Ed turned Postgres memory off on 2026-11-10 to make a graph memory door
 the fleet's only memory; `parked/README.md` keeps the measurements taken while that call was being made, and how to
@@ -108,6 +108,27 @@ summary that happened to be a bit long.
 | | |
 | --- | --- |
 | Knobs | `SUMMARY_OUTPUT_TOKENS` (8192), `SUMMARY_TARGET_TOKENS` (4000, so 16000 characters), `SOFT_OVERLIMIT_RATIO` (1.3, accept without retrying), `TRIM_OVERLIMIT_RATIO` (2, trim rather than pass through), `RETRY_POLICY` (`maxRetries: 2`, `baseDelayMs: 2000`, `maxAgentDelayMs: 15000`) |
+
+### `plan.ts` — `/goal`: what this session is for
+
+An intent is the first thing a long session loses. It is stated at the top, it survives the first twenty turns by
+being obvious, and then it is buried under everything the session did about it - and the summary that replaces it is
+written by a model preserving *events*, which is the wrong shape for a purpose. `/goal` puts the aim somewhere that
+does not depend on the transcript still containing the sentence where it was first said.
+
+The record lives in `lib/plan.ts` (pure: no clock of its own, no UI, no tools, nothing Pi-specific beyond
+`CONFIG_DIR_NAME`) as one file per session id. `/direction` and `/todo` are the next two steps on the same record and
+the same file, which is why this is `plan.ts` rather than `goal.ts`: one reader of the record, one writer, one paint.
+
+| Command | `/goal <text>` sets it, overwriting; the replaced line is kept one deep, so a change of aim is visible. `/goal` alone reports the goal and where it is stored. `/goal clear` clears it — matched against the whole argument, so a goal may contain the word |
+| State | `.pi/plan/<session-id>.json`, written temp-then-rename in the same directory (a cross-filesystem `rename` is `EXDEV`, and `/workspace` is NFS). `.pi/plan/.gitignore` (`*`, `!.gitignore`) is created on demand, because this repository is public, `/workspace` is mounted into every agent pod at once, and `git add -A` has committed a session artifact before (`cdfbaa5`) |
+| Inheritance | keyed by session id, which is the rule for free: `pi -c` continues the same id, so it continues the goal and says `goal restored · set <date>`; a fresh `pi` or `/clear` gets a new id and starts blank. No name matching, and therefore no route by which a stale aim walks into an unrelated session |
+| To the model | as a named prompt **section**, rendered as `<plan>`. Pi diffs the sections against what the model already has and patches only the one that changed, so a goal that does not change costs one section and then nothing - not one message per turn. The block is capped at 2600 chars (~650 tokens) and says `+N more in .pi/plan/<id>.json` when it trims |
+| Not coupled to compaction | deliberately. `compaction-summary-guard` has three separate `return { compaction: result }` paths, and both its `overBudget` check and `trimToBudget` act on `result.summary.length` - so a block appended to the summary either inflates the guard's own accounting or gets trimmed by it. The section route needs no hook in there, and a plan reappears by itself after a compaction or a context replay |
+| Authority | human-set only: there is no model-facing tool that writes a goal. The model reading the aim is not the model deciding it, and that split is a decision, not an omission |
+| A damaged plan is reported, never repaired | unreadable, non-JSON, or an unknown schema version means `readPlan` returns a problem, `/goal` refuses to save over it, and the bytes stay on disk for a human. The only writer able to "fix" a corrupt plan is one that no longer has its contents |
+| Tests | `test/plan.test.ts` — the substrate: session ids validated before they reach `path.join`, atomic writes with no temp left behind, a supersede that cannot happen without a reason, the block cap and its token estimate. `test/plan-extension.test.ts` — the wiring: replaced goals keep their predecessor, print mode stays silent and still loads the goal, the section is byte-identical turn to turn so the diff sends it once, and a corrupt file is refused rather than overwritten |
+| Measured live | with all tools disabled (`pi -ne -e extensions/plan.ts -nt`), a model quoted `GOAL      the section route is the one that ships` back verbatim across a process restart — so the section is on the wire, not a lucky retrieval from history |
 
 ### `schedule.ts` — `/at`, `/every`, `/cron`: a prompt that arrives at a wall time
 

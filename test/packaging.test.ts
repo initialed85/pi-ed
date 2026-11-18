@@ -161,6 +161,18 @@ const EXPECTED: Record<string, Surface> = {
     // A session entry, not a custom message: entries stay out of the model's context.
     entryRenderers: ["turn-stats"],
   },
+  "plan.ts": {
+    // No transcript entries and no messages: the goal is handed to the model as a named prompt *section*, which
+    // Pi diffs against what the model already has and patches only when it changes. So the events needed are the
+    // ones where the record must be (re)read, repainted, or delivered - and not the compaction events, because
+    // the section route means a plan reappears after a compaction on its own.
+    events: ["session_start", "session_info_changed", "before_agent_start"],
+    tools: [],
+    commands: ["goal"],
+    flags: [],
+    messageRenderers: [],
+    entryRenderers: [],
+  },
   "tags.ts": {
     // Not bookkeeping for its own sake: the footer has to be rebuilt when the branch changes, because
     // tags are branch-relative and /tree and /resume move the branch out from under it.

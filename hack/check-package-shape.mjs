@@ -29,6 +29,7 @@ const EXPECTED_EXTENSIONS = [
   "graphiti.ts",
   "compaction-summary-guard.ts",
   "loop-guard.ts",
+  "plan.ts",
   "queue-reload.ts",
   "schedule.ts",
   "searxng.ts",
