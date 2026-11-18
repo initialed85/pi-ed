@@ -109,26 +109,36 @@ summary that happened to be a bit long.
 | --- | --- |
 | Knobs | `SUMMARY_OUTPUT_TOKENS` (8192), `SUMMARY_TARGET_TOKENS` (4000, so 16000 characters), `SOFT_OVERLIMIT_RATIO` (1.3, accept without retrying), `TRIM_OVERLIMIT_RATIO` (2, trim rather than pass through), `RETRY_POLICY` (`maxRetries: 2`, `baseDelayMs: 2000`, `maxAgentDelayMs: 15000`) |
 
-### `plan.ts` — `/goal`: what this session is for
+### `plan.ts` — `/goal` and `/todo`: what this session is for, and the steps toward it
 
 An intent is the first thing a long session loses. It is stated at the top, it survives the first twenty turns by
 being obvious, and then it is buried under everything the session did about it - and the summary that replaces it is
 written by a model preserving *events*, which is the wrong shape for a purpose. `/goal` puts the aim somewhere that
-does not depend on the transcript still containing the sentence where it was first said.
+does not depend on the transcript still containing the sentence where it was first said. `/todo` is the same problem
+one level down: a session that has done nine things and plans four more has nowhere to say so, and saying it in prose
+every turn is a paragraph nobody re-reads.
 
 The record lives in `lib/plan.ts` (pure: no clock of its own, no UI, no tools, nothing Pi-specific beyond
-`CONFIG_DIR_NAME`) as one file per session id. `/direction` and `/todo` are the next two steps on the same record and
-the same file, which is why this is `plan.ts` rather than `goal.ts`: one reader of the record, one writer, one paint.
+`CONFIG_DIR_NAME`) as one file per session id. `/direction` is the remaining step on the same record and the same
+file, which is why this is `plan.ts` rather than `goal.ts`: one reader of the record, one writer, one paint.
 
-| Command | `/goal <text>` sets it, overwriting; the replaced line is kept one deep, so a change of aim is visible. `/goal` alone reports the goal and where it is stored. `/goal clear` clears it — matched against the whole argument, so a goal may contain the word |
+| `/goal` | `/goal <text>` sets it, overwriting; the replaced line is kept one deep, so a change of aim is visible. `/goal` alone reports the goal and where it is stored. `/goal clear` clears it — matched against the whole argument, so a goal may contain the word |
+| `/todo` | `/todo` reads the list (counts first, then items with their ids). `/todo <text>` adds, `/todo start\|done <id>` moves, `/todo drop <id> <why>` retires, `/todo note <id> <text>` and `/todo edit <id> <text>` correct, `/todo show\|hide` controls the panel. A duplicate open text is refused by the substrate, and the refusal is the message |
 | State | `.pi/plan/<session-id>.json`, written temp-then-rename in the same directory (a cross-filesystem `rename` is `EXDEV`, and `/workspace` is NFS). `.pi/plan/.gitignore` (`*`, `!.gitignore`) is created on demand, because this repository is public, `/workspace` is mounted into every agent pod at once, and `git add -A` has committed a session artifact before (`cdfbaa5`) |
 | Inheritance | keyed by session id, which is the rule for free: `pi -c` continues the same id, so it continues the goal and says `goal restored · set <date>`; a fresh `pi` or `/clear` gets a new id and starts blank. No name matching, and therefore no route by which a stale aim walks into an unrelated session |
 | To the model | as a named prompt **section**, rendered as `<plan>`. Pi diffs the sections against what the model already has and patches only the one that changed, so a goal that does not change costs one section and then nothing - not one message per turn. The block is capped at 2600 chars (~650 tokens) and says `+N more in .pi/plan/<id>.json` when it trims |
 | Not coupled to compaction | deliberately. `compaction-summary-guard` has three separate `return { compaction: result }` paths, and both its `overBudget` check and `trimToBudget` act on `result.summary.length` - so a block appended to the summary either inflates the guard's own accounting or gets trimmed by it. The section route needs no hook in there, and a plan reappears by itself after a compaction or a context replay |
-| Authority | human-set only: there is no model-facing tool that writes a goal. The model reading the aim is not the model deciding it, and that split is a decision, not an omission |
+| Authority | the aim is human-set only: no tool writes a goal, and the model reading it is not the model deciding it. The list is the opposite case, so `todos` is a model-facing tool — the work on a list is done by the agent, and a list nobody can move reports `[ ]` about things that are finished. Its one action that retires something a human wrote, `supersede`, cannot happen without a reason, which is what lets the human overrule it later. A test pins the split: the tool's schema contains no `goal` or `direction`, and `action: "set_goal"` comes back refused |
+| Names | `/autopilot goal <text>` is not this — that is the goal of an autopilot run and lives in memory for the length of it; `/goal` is the aim of the session and lives in the file |
+| The panel | `shift+left` toggles a read-only panel above the editor: the aim, the counts, five steps, and a `… N more` line. The last slot is reserved for that line rather than filled with an item, because a panel that cut off its own truncation notice would leave a reader believing five steps was the whole list. Off by default and per-process: the record, not the panel, is the state |
 | A damaged plan is reported, never repaired | unreadable, non-JSON, or an unknown schema version means `readPlan` returns a problem, `/goal` refuses to save over it, and the bytes stay on disk for a human. The only writer able to "fix" a corrupt plan is one that no longer has its contents |
-| Tests | `test/plan.test.ts` — the substrate: session ids validated before they reach `path.join`, atomic writes with no temp left behind, a supersede that cannot happen without a reason, the block cap and its token estimate. `test/plan-extension.test.ts` — the wiring: replaced goals keep their predecessor, print mode stays silent and still loads the goal, the section is byte-identical turn to turn so the diff sends it once, and a corrupt file is refused rather than overwritten |
-| Measured live | with all tools disabled (`pi -ne -e extensions/plan.ts -nt`), a model quoted `GOAL      the section route is the one that ships` back verbatim across a process restart — so the section is on the wire, not a lucky retrieval from history |
+| Tests | `test/plan.test.ts` — the substrate: session ids validated before they reach `path.join`, atomic writes with no temp left behind, a supersede that cannot happen without a reason, the block cap and its token estimate. `test/plan-extension.test.ts` — the wiring, 38 of them: replaced goals keep their predecessor, print mode stays silent and still loads the goal, the section is byte-identical turn to turn so the diff sends it once, a corrupt file is refused rather than overwritten by either door, a refused verb writes no file at all, the panel caps its lines and says what it cut, and the tool cannot reach the aim |
+| Measured live | with all tools disabled (`pi -ne -e extensions/plan.ts -nt`), a model quoted `GOAL      the section route is the one that ships` back verbatim across a process restart — so the section is on the wire, not a lucky retrieval from history. With tools on, the same file drove a real `todos` session: two steps added with their whys, one marked done, and the model replying `🎯 1 open · 0 in progress · 1 done · 0 retired` from the list it had just written, with `t1`/`t2`, `state`, `why` and `done_at` correct on disk |
+
+One deliberate deviation from the design sketch: the panel is above the editor rather than right-anchored.
+`ctx.ui.setWidget` places a widget above or below the editor and has no anchored placement; a right-anchored overlay
+would mean a custom `Component` and its own resize handling, which is more machinery than a read-only list of lines
+is worth. Nothing about the record depends on where the lines are drawn.
 
 ### `schedule.ts` — `/at`, `/every`, `/cron`: a prompt that arrives at a wall time
 

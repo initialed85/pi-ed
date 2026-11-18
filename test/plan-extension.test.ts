@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { createFakePi, createContext, type FakePi, type FakeContext, type FakeUi } from "./harness.ts";
+import { createFakePi, createContext, callTool, type FakePi, type FakeContext, type FakeUi } from "./harness.ts";
+import { PANEL_MAX_LINES } from "../extensions/plan.ts";
 import { planDir, PLAN_BLOCK_MAX_CHARS, readPlan } from "../lib/plan.ts";
 
 /**
@@ -64,19 +65,51 @@ async function runGoal(harness: Harness, args: string) {
   await harness.pi.commands.get("goal")!.handler!(args, harness.context);
 }
 
+async function runTodo(harness: Harness, args: string) {
+  await harness.pi.commands.get("todo")!.handler!(args, harness.context);
+}
+
+/** Press the panel key the way the TUI would: the recorded handler, called with a context. */
+async function pressPanelKey(harness: Harness) {
+  await harness.pi.shortcuts.get("shift+left")!.handler(harness.context);
+}
+
+async function callTodos(harness: Harness, params: Record<string, unknown>) {
+  return callTool(harness.pi, "todos", params, harness.context);
+}
+
+const toolText = (result: { content: Array<{ text?: string }> }) => result.content.map((c) => c.text ?? "").join("\n");
+
 const planFile = (cwd: string, sessionId = ID) => path.join(planDir(cwd), `${sessionId}.json`);
 
 describe("the surface", () => {
-  it("registers one command, no tools, and only the events it needs", async () => {
+  it("registers two commands, one tool, one key, and only the events it needs", async () => {
     const harness = await setup();
-    expect([...harness.pi.commands.keys()]).toEqual(["goal"]);
-    // The model reads the goal; it does not write it. A tool would be the difference between a human's aim and
-    // the model's aim, and that question is not answered yet.
-    expect(harness.pi.tools.size).toBe(0);
+    expect([...harness.pi.commands.keys()].sort()).toEqual(["goal", "todo"]);
+    // The aim has no model-facing door; the list does, because the work on a list is done by the agent. The tool is
+    // named for the list and not for the plan, so its name cannot imply it writes the goal too.
+    expect([...harness.pi.tools.keys()]).toEqual(["todos"]);
+    expect([...harness.pi.shortcuts.keys()]).toEqual(["shift+left"]);
     expect(harness.pi.flags.size).toBe(0);
     expect(harness.pi.lifecycleEvents).toEqual(["session_start", "session_info_changed", "before_agent_start"]);
     expect(harness.pi.appendedEntries).toHaveLength(0);
     expect(harness.pi.sentUserMessages).toHaveLength(0);
+  });
+
+  it("gives the model a tool that cannot touch the aim", async () => {
+    const harness = await setup();
+    const tool = harness.pi.tools.get("todos")!;
+    const schema = JSON.stringify(tool.parameters);
+    // The authority split, pinned where a future edit would break it: no action writes goal or direction, and the
+    // guidelines say so out loud rather than relying on the enum alone.
+    expect(schema).not.toMatch(/"goal"/);
+    expect(schema).not.toMatch(/"direction"/);
+    expect(String((tool.promptGuidelines ?? []).join(" "))).toContain("Never set or clear the goal");
+
+    const result = await callTodos(harness, { action: "set_goal", text: "steal the aim" });
+    expect(result.details.ok).toBe(false);
+    expect(toolText(result)).toContain("unknown action");
+    expect(harness.pi.appendedEntries).toHaveLength(0);
   });
 
   it("starts with nothing on disk and nothing in the prompt", async () => {
@@ -164,7 +197,7 @@ describe("/goal", () => {
     const harness = await setup({ sessionId: "../escape" });
     expect(harness.ui.notifications.at(-1)?.message).toContain("refused session id");
     await runGoal(harness, "a goal that cannot be stored");
-    expect(harness.ui.notifications.at(-1)?.message).toContain("goal not saved");
+    expect(harness.ui.notifications.at(-1)?.message).toContain("not saved");
     expect(readdirSync(harness.cwd)).toEqual([]);
   });
 });
@@ -249,7 +282,7 @@ describe("a plan that cannot be read", () => {
     expect(harness.ui.statuses.get(STATUS_KEY)).toContain("⚠️");
 
     await runGoal(harness, "a goal that must not be written");
-    expect(harness.ui.notifications.at(-1)?.message).toContain("goal not saved");
+    expect(harness.ui.notifications.at(-1)?.message).toContain("not saved");
     expect(readFileSync(planFile(cwd), "utf8")).toBe('{ "v": 1, "session_id": "01a1c4d0');
   });
 
@@ -262,7 +295,238 @@ describe("a plan that cannot be read", () => {
     const harness = await setup({ cwd });
     expect(harness.ui.notifications.at(-1)?.message).toContain("schema v9");
     await runGoal(harness, "overwrite the future");
-    expect(harness.ui.notifications.at(-1)?.message).toContain("goal not saved");
+    expect(harness.ui.notifications.at(-1)?.message).toContain("not saved");
     expect(JSON.parse(readFileSync(planFile(cwd), "utf8")).v).toBe(9);
+  });
+});
+
+/** The record on disk, parsed. `readPlan` is the substrate's own reader; this is the test's, so a corrupt file is
+ *  visible as bytes and not silently turned into a problem string. */
+function planOnDisk(cwd: string, sessionId = ID) {
+  return JSON.parse(readFileSync(planFile(cwd, sessionId), "utf8"));
+}
+
+const widgetLines = (harness: Harness) => harness.ui.widgets.get(STATUS_KEY) as string[] | undefined;
+
+describe("/todo — the list, by hand", () => {
+  it("adds a step and says which id it got", async () => {
+    const harness = await setup();
+    await runTodo(harness, "ship the panel");
+    expect(harness.ui.notifications.at(-1)?.message).toContain("added t1");
+    expect(planOnDisk(harness.cwd).todos).toEqual([
+      expect.objectContaining({ id: "t1", text: "ship the panel", state: "todo" }),
+    ]);
+  });
+
+  it("reads the list with counts on the first line", async () => {
+    const harness = await setup();
+    await runTodo(harness, "one");
+    await runTodo(harness, "two — because the goal says so");
+    await runTodo(harness, "");
+    const report = (harness.ui.notifications.at(-1)?.message ?? "").split("\n");
+    expect(report[0]).toBe("🎯 2 open · 0 in progress");
+    expect(report.join("\n")).toContain("t1 [ ] one");
+    expect(report.join("\n")).toContain("t2 [ ] two");
+  });
+
+  it("moves an item, and says so when it is already there", async () => {
+    const harness = await setup();
+    await runTodo(harness, "fix CI");
+    await runTodo(harness, "done t1");
+    expect(planOnDisk(harness.cwd).todos[0]).toEqual(expect.objectContaining({ state: "done", done_at: expect.any(String) }));
+    await runTodo(harness, "done t1");
+    expect(harness.ui.notifications.at(-1)?.message).toContain("t1 is already done");
+  });
+
+  it("refuses to start something already in progress, with the substrate's sentence", async () => {
+    const harness = await setup();
+    await runTodo(harness, "write the tests");
+    await runTodo(harness, "start t1");
+    await runTodo(harness, "start t1");
+    expect(harness.ui.notifications.at(-1)?.level).toBe("warning");
+    expect(harness.ui.notifications.at(-1)?.message).toContain("t1 is already in_progress");
+  });
+
+  it("keeps the reason a step was dropped, and records who dropped it when no reason is given", async () => {
+    const harness = await setup();
+    await runTodo(harness, "append the block to the summary");
+    await runTodo(harness, "add the tool the human did not ask for");
+    await runTodo(harness, "drop t1 superseded by the section route");
+    await runTodo(harness, "drop t2");
+    const todos = planOnDisk(harness.cwd).todos;
+    expect(todos[0]).toEqual(expect.objectContaining({ state: "superseded", note: "superseded by the section route" }));
+    expect(todos[1]).toEqual(expect.objectContaining({ state: "superseded", note: "dropped by /todo" }));
+  });
+
+  it("edits an item without changing its id", async () => {
+    const harness = await setup();
+    await runTodo(harness, "old text");
+    await runTodo(harness, "note t1 CI runs in UTC");
+    await runTodo(harness, "edit t1 new text");
+    expect(planOnDisk(harness.cwd).todos[0]).toEqual(
+      expect.objectContaining({ id: "t1", text: "new text", why: "CI runs in UTC", state: "todo" }),
+    );
+  });
+
+  it("treats an unknown id as a message, not a crash", async () => {
+    const harness = await setup();
+    await runTodo(harness, "done t9");
+    expect(harness.ui.notifications.at(-1)?.level).toBe("warning");
+    expect(harness.ui.notifications.at(-1)?.message).toContain("no todo t9");
+    // A refused verb writes nothing at all: not an empty plan file, not a touched `updated_at`. A session that has
+    // never successfully planned has no file, which is what makes `pi -c` say "no goal" rather than read a stub.
+    expect(existsSync(planFile(harness.cwd))).toBe(false);
+  });
+
+  it("adds one item, not two, when the same text is already open", async () => {
+    const harness = await setup();
+    await runTodo(harness, "land step 2");
+    await runTodo(harness, "land step 2");
+    expect(harness.ui.notifications.at(-1)?.message).toContain("already open");
+    expect(planOnDisk(harness.cwd).todos).toHaveLength(1);
+  });
+
+  it("carries the list into the turn, so the model sees what the human typed", async () => {
+    const harness = await setup();
+    await runGoal(harness, "make memory boring");
+    await runTodo(harness, "restart the pods — the fleet is still on the old build");
+    const sections = await startTurn(harness);
+    expect(sections[SECTION_KEY]).toContain("GOAL      make memory boring");
+    expect(sections[SECTION_KEY]).toContain("t1 restart the pods");
+    expect(sections[SECTION_KEY]).toContain("1 open");
+  });
+});
+
+describe("todos — the list, by the model", () => {
+  it("returns the whole list on a write, ids included", async () => {
+    const harness = await setup();
+    const result = await callTodos(harness, { action: "add", text: "read the list back", why: "the ids are only in the list" });
+    expect(result.details).toEqual(expect.objectContaining({ ok: true, changed: true }));
+    expect(toolText(result)).toContain("t1 [ ] read the list back");
+    expect(toolText(result)).toContain("(the ids are only in the list)");
+    expect(toolText(result)).toContain("🎯 1 open · 0 in progress");
+  });
+
+  it("moves an item through its states and reports the counts", async () => {
+    const harness = await setup();
+    await callTodos(harness, { action: "add", text: "step one" });
+    await callTodos(harness, { action: "add", text: "step two" });
+    expect((await callTodos(harness, { action: "start", id: "t1" })).details.todos).toEqual(
+      expect.objectContaining({ open: 1, inProgress: 1, done: 0 }),
+    );
+    const done = await callTodos(harness, { action: "done", id: "t1" });
+    expect(done.details.todos).toEqual(expect.objectContaining({ open: 1, inProgress: 0, done: 1 }));
+    expect(planOnDisk(harness.cwd).todos[0].state).toBe("done");
+  });
+
+  it("cannot retire a step a human wrote without saying why", async () => {
+    const harness = await setup();
+    await callTodos(harness, { action: "add", text: "written by a human" });
+    const refused = await callTodos(harness, { action: "supersede", id: "t1" });
+    expect(refused.details.ok).toBe(false);
+    expect(toolText(refused)).toContain("superseding needs a one-line reason");
+    expect(planOnDisk(harness.cwd).todos[0].state).toBe("todo");
+
+    const allowed = await callTodos(harness, { action: "supersede", id: "t1", reason: "the section route made it moot" });
+    expect(allowed.details.ok).toBe(true);
+    expect(planOnDisk(harness.cwd).todos[0]).toEqual(
+      expect.objectContaining({ state: "superseded", note: "the section route made it moot" }),
+    );
+  });
+
+  it("says what an action needs instead of guessing", async () => {
+    const harness = await setup();
+    expect(toolText(await callTodos(harness, { action: "add" }))).toContain("add needs text");
+    expect(toolText(await callTodos(harness, { action: "done" }))).toContain("needs an id");
+    expect(toolText(await callTodos(harness, { action: "edit", id: "t1" }))).toContain("edit needs text and/or why");
+    expect(toolText(await callTodos(harness, { action: "start", id: "t7" }))).toContain("no todo t7");
+  });
+
+  it("reads an empty list without writing anything", async () => {
+    const harness = await setup();
+    const result = await callTodos(harness, { action: "list" });
+    expect(toolText(result)).toContain("no steps yet");
+    expect(result.details.ok).toBe(true);
+    expect(widgetLines(harness)).toBeUndefined();
+  });
+
+  it("refuses every write when the record is damaged, and leaves the bytes", async () => {
+    const cwd = mkdtempSync(path.join(tmpdir(), "pi-ed-plan-tool-corrupt-"));
+    dirs.push(cwd);
+    mkdirSync(planDir(cwd), { recursive: true });
+    writeFileSync(planFile(cwd), "{ not json", "utf8");
+
+    const harness = await setup({ cwd });
+    const result = await callTodos(harness, { action: "add", text: "this must not be written" });
+    expect(result.details.ok).toBe(false);
+    expect(toolText(result)).toContain("not valid JSON");
+    expect(readFileSync(planFile(cwd), "utf8")).toBe("{ not json");
+  });
+
+  it("keeps two sessions' lists apart in one checkout", async () => {
+    const harness = await setup();
+    await callTodos(harness, { action: "add", text: "for session A" });
+
+    // A second session in the same cwd: `current()` re-reads because the id changed, so it sees its own empty plan.
+    const other = createContext({ cwd: harness.cwd, sessionId: OTHER, hasUI: true });
+    await harness.pi.emit("session_start", { type: "session_start", reason: "resume" }, other.context);
+    const listed = await callTool(harness.pi, "todos", { action: "list" }, other.context);
+    expect(toolText(listed)).toContain("no steps yet");
+    expect(toolText(await callTool(harness.pi, "todos", { action: "done", id: "t1" }, other.context))).toContain("no todo t1");
+    expect(planOnDisk(harness.cwd).todos).toHaveLength(1);
+    // Reading another session's list must not create a file for this one: a session without a plan has no plan file,
+    // and a `list` is not a write.
+    expect(existsSync(planFile(harness.cwd, OTHER))).toBe(false);
+  });
+});
+
+describe("the panel", () => {
+  it("is off until asked for, and the key toggles it", async () => {
+    const harness = await setup();
+    await runGoal(harness, "ship the plan");
+    await runTodo(harness, "restart the pods");
+    expect(widgetLines(harness)).toBeUndefined();
+
+    await pressPanelKey(harness);
+    const lines = widgetLines(harness)!;
+    expect(lines[0]).toBe("🎯 ship the plan");
+    expect(lines[1]).toBe("1 open · 0 in progress");
+    expect(lines[2]).toBe("t1 [ ] restart the pods");
+
+    await pressPanelKey(harness);
+    expect(widgetLines(harness)).toBeUndefined();
+  });
+
+  it("caps its lines and says what it cut", async () => {
+    const harness = await setup();
+    for (let i = 1; i <= 12; i += 1) await runTodo(harness, `step ${i}`);
+    await pressPanelKey(harness);
+    const lines = widgetLines(harness)!;
+    expect(lines).toHaveLength(PANEL_MAX_LINES);
+    expect(lines.at(-1)).toContain("7 more");
+    expect(lines.join("\n")).toContain("t5 [ ] step 5");
+    expect(lines.join("\n")).not.toContain("step 6");
+    // Capping the panel is not capping the record: all twelve are still on disk, and still in the prompt.
+    expect(planOnDisk(harness.cwd).todos).toHaveLength(12);
+    expect((await startTurn(harness))[SECTION_KEY]).toContain("12 open");
+  });
+
+  it("paints nothing without a UI, and still writes", async () => {
+    const harness = await setup({ hasUI: false, mode: "print" });
+    await runTodo(harness, "quietly added");
+    expect(harness.ui.notifications).toHaveLength(0);
+    expect(harness.ui.statuses.size).toBe(0);
+    expect(harness.ui.widgets.size).toBe(0);
+    expect(planOnDisk(harness.cwd).todos).toEqual([expect.objectContaining({ text: "quietly added" })]);
+  });
+
+  it("shows the aim in the status line alongside what is still open", async () => {
+    const harness = await setup();
+    await runGoal(harness, "operationalize the fleet's memory");
+    await runTodo(harness, "restart the pods");
+    await runTodo(harness, "write the docs");
+    expect(harness.ui.statuses.get(STATUS_KEY)).toBe("🎯 operationalize the fleet's memory · 2 steps open");
+    await runTodo(harness, "done t1");
+    expect(harness.ui.statuses.get(STATUS_KEY)).toBe("🎯 operationalize the fleet's memory · 1 step open");
   });
 });

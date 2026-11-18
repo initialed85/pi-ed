@@ -55,6 +55,8 @@ export interface PiRecord {
   lifecycleEvents: string[];
   tools: Map<string, ToolDefinitionLike>;
   commands: Map<string, CommandDefinitionLike>;
+  /** What `pi.registerShortcut` was called with. A test "presses" the key by calling the handler with a context. */
+  shortcuts: Map<string, { shortcut: string; description?: string; handler: (ctx: any) => any }>;
   flags: Map<string, { options: any; value: boolean | string | undefined }>;
   messageRenderers: Map<string, AnyHandler>;
   entryRenderers: Map<string, AnyHandler>;
@@ -71,6 +73,7 @@ export interface FakePi extends PiRecord {
   on(event: string, handler: AnyHandler): () => void;
   registerTool(tool: ToolDefinitionLike): void;
   registerCommand(name: string, options: CommandDefinitionLike): void;
+  registerShortcut(shortcut: string, options: { description?: string; handler: (ctx: any) => any }): void;
   registerFlag(name: string, options: any): void;
   registerMessageRenderer(customType: string, renderer: AnyHandler): void;
   registerEntryRenderer(customType: string, renderer: AnyHandler): void;
@@ -104,6 +107,7 @@ export function createFakePi(): FakePi {
     lifecycleEvents: [],
     tools: new Map(),
     commands: new Map(),
+    shortcuts: new Map(),
     flags: new Map(),
     messageRenderers: new Map(),
     entryRenderers: new Map(),
@@ -145,6 +149,13 @@ export function createFakePi(): FakePi {
       track("registerCommand")([name, options]);
       if (record.commands.has(name)) throw new Error(`harness: duplicate registerCommand "${name}"`);
       record.commands.set(name, options);
+    },
+    // Recorded rather than dispatched: a key press is a terminal event, and the honest thing a test can do without
+    // one is call the handler the way the TUI would.
+    registerShortcut(shortcut: string, options: { description?: string; handler: (ctx: any) => any }) {
+      track("registerShortcut")([shortcut, options]);
+      if (record.shortcuts.has(shortcut)) throw new Error(`harness: duplicate registerShortcut "${shortcut}"`);
+      record.shortcuts.set(shortcut, { shortcut, ...options });
     },
     registerFlag(name: string, options: any) {
       track("registerFlag")([name, options]);

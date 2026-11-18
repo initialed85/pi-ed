@@ -42,6 +42,11 @@ export const DIRECTION_MAX_CHARS = 200;
 /** A todo's one-line "why". Kept shorter than the item itself: it is context, not documentation. */
 export const WHY_MAX_CHARS = 90;
 /**
+ * One step, one line. The same number the `todos` tool quotes in its own parameter description, so what the model is
+ * told the limit is and what the writer enforces cannot drift apart.
+ */
+export const TODO_MAX_CHARS = 200;
+/**
  * Ceiling on the rendered block. ~4 chars/token at this fleet's models, so 2600 chars is the ~650 tokens the
  * planning conversation priced a twelve-item plan at; the point of the cap is that a very long todo list cannot
  * silently turn the renewal block into a summary-sized one.
@@ -239,7 +244,7 @@ function nextTodoId(todos: Todo[]): string {
 }
 
 export function addTodo(plan: PlanRecord, input: { text: string; why?: string }, at: string): Mutation {
-  const text = clip(input.text, 200);
+  const text = clip(input.text, TODO_MAX_CHARS);
   if (!text) return { plan, changed: false, problem: "a todo needs text" };
   // Same text already open: refuse rather than duplicate. An agent that re-adds what it just added is describing
   // the same thing twice, and two open copies of one item make the count a lie.
@@ -288,7 +293,7 @@ export function supersedeTodo(plan: PlanRecord, id: string, reason: string, at: 
 /** Correct an item's text or why, keeping its id and state. */
 export function editTodo(plan: PlanRecord, id: string, input: { text?: string; why?: string }, at: string): Mutation {
   return mutateTodo(plan, id, at, (todo) => {
-    const text = input.text ? clip(input.text, 200) : todo.text;
+    const text = input.text ? clip(input.text, TODO_MAX_CHARS) : todo.text;
     const why = input.why !== undefined ? clip(input.why, WHY_MAX_CHARS) : todo.why;
     if (text === todo.text && why === todo.why) return undefined;
     return { ...todo, text, why, at };
@@ -389,7 +394,7 @@ function normalizePlan(input: unknown, sessionId: string): { plan: PlanRecord } 
   const todos: Todo[] = [];
   for (const item of Array.isArray(raw.todos) ? raw.todos : []) {
     const todo = item as Partial<Todo>;
-    const text = typeof todo?.text === "string" ? clip(todo.text, 200) : "";
+    const text = typeof todo?.text === "string" ? clip(todo.text, TODO_MAX_CHARS) : "";
     const at = typeof todo?.at === "string" ? todo.at : "";
     if (!text || !at) continue;
     const state: TodoState = todo.state === "in_progress" || todo.state === "done" || todo.state === "superseded" ? todo.state : "todo";

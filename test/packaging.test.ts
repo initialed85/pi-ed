@@ -29,6 +29,9 @@ interface Surface {
   tools: readonly string[];
   commands: readonly string[];
   flags: readonly string[];
+  /** Keys the file binds. A bound key is as much of an install as a command is - it takes a slot in the terminal -
+   * so it is pinned here rather than left to whichever test happens to read the extension. */
+  shortcuts?: readonly string[];
   messageRenderers: readonly string[];
   /** TUI-only renderers for custom entries, which are the ones the model never sees. */
   entryRenderers: readonly string[];
@@ -167,9 +170,10 @@ const EXPECTED: Record<string, Surface> = {
     // ones where the record must be (re)read, repainted, or delivered - and not the compaction events, because
     // the section route means a plan reappears after a compaction on its own.
     events: ["session_start", "session_info_changed", "before_agent_start"],
-    tools: [],
-    commands: ["goal"],
+    tools: ["todos"],
+    commands: ["goal", "todo"],
     flags: [],
+    shortcuts: ["shift+left"],
     messageRenderers: [],
     entryRenderers: [],
   },
@@ -279,6 +283,7 @@ describe("extensions directory", () => {
         expect([...pi.tools.keys()].sort()).toEqual([...EXPECTED[name].tools].sort());
         expect([...pi.commands.keys()].sort()).toEqual([...EXPECTED[name].commands].sort());
         expect([...pi.flags.keys()].sort()).toEqual([...EXPECTED[name].flags].sort());
+        expect([...pi.shortcuts.keys()].sort()).toEqual([...(EXPECTED[name].shortcuts ?? [])].sort());
         expect([...pi.messageRenderers.keys()].sort()).toEqual([...EXPECTED[name].messageRenderers].sort());
         expect([...pi.entryRenderers.keys()].sort()).toEqual([...EXPECTED[name].entryRenderers].sort());
         expect([...new Set(pi.lifecycleEvents)].sort()).toEqual([...EXPECTED[name].events].sort());
