@@ -481,12 +481,24 @@ describe("todos — the list, by the model", () => {
 });
 
 describe("the panel", () => {
-  it("draws nothing until the session has a plan", async () => {
+  it("lists nothing until there is something to list, but opens when asked", async () => {
     const harness = await setup();
     expect(widgetLines(harness)).toBeUndefined();
-    // Expanding an empty plan still draws nothing: there is no line for the overlay to rise from.
-    await pressPanelKey(harness);
     expect(harness.ui.overlays).toHaveLength(0);
+
+    // The keypress is the request. A panel that refuses to appear because the session has not said anything yet
+    // looks identical to a binding that does not work, and reads as a broken shortcut - so an empty session draws
+    // its empty state, which is the one thing worth saying here: what to type. Opening it also puts up the compact
+    // line, because the overlay rises from that line and would otherwise land on the editor.
+    await pressPanelKey(harness);
+    expect(harness.ui.overlays).toHaveLength(1);
+    const lines = harness.ui.overlays[0].component.render(120).join("\n");
+    expect(lines).toContain("/goal");
+    expect(lines).toContain("no steps yet");
+    expect(widgetLines(harness)).toHaveLength(1);
+
+    await pressPanelKey(harness);
+    expect(harness.ui.overlays[0].closed).toBe(true);
     expect(harness.ui.widgets.size).toBe(0);
   });
 
@@ -595,6 +607,18 @@ describe("the panel", () => {
     // Capping the panel is not capping the record: all twelve are still on disk, and still in the prompt.
     expect(planOnDisk(harness.cwd).todos).toHaveLength(12);
     expect((await startTurn(harness))[SECTION_KEY]).toContain("12 open");
+  });
+
+  it("says so when the overlay cannot be mounted", async () => {
+    // A keypress that does nothing is indistinguishable from a binding the terminal never delivered, which is a
+    // support nightmare for a feature whose whole interface is a key. So the failure is named.
+    const harness = await setup();
+    await runGoal(harness, "ship the plan");
+    harness.ui.customError = new Error("overlay stack is full");
+    await pressPanelKey(harness);
+    const warning = harness.ui.notifications.find((n) => n.level === "warning");
+    expect(warning?.message).toContain("plan panel");
+    expect(warning?.message).toContain("overlay stack is full");
   });
 
   it("draws the detail into the widget where there is no scrollback", async () => {

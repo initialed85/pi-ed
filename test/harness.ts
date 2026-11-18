@@ -247,6 +247,8 @@ export interface FakeUi {
   statuses: Map<string, string | undefined>;
   /** What a widget factory built against this double's terminal. `widgets` keeps the factory itself. */
   builtWidgets: Map<string, unknown>;
+  /** When set, `ui.custom` rejects with this instead of mounting - the overlay path's failure mode. */
+  customError?: unknown;
   /** Overlays `ui.custom` has mounted, oldest first. `close()` runs the `done` callback Pi hands the factory. */
   overlays: FakeOverlay[];
   /** The terminal handed to widget factories and to `ui.custom`. Tests adjust `terminal`, `mode`, and `render`. */
@@ -333,6 +335,9 @@ export function createFakeUi(): FakeUi {
       ui.statuses.set(key, value);
     },
     custom: (factory, options) => {
+      // `ui.custom` is the one call in this path that can fail without leaving a trace on screen, so a test can ask
+      // for the failure and check that the extension says so rather than swallowing it.
+      if (ui.customError !== undefined) return Promise.reject(ui.customError);
       // Modelled the way Pi behaves for the one shape an extension uses this for: an overlay that stays until its
       // `done` is called, and which mounts on the terminal the widget factory was last handed. The promise resolves
       // when it closes, so an extension's `finally` cleanup runs on close rather than on open.

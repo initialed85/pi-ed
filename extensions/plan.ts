@@ -390,7 +390,12 @@ function openPanelOverlay(state: PanelState, ctx: ExtensionContext | ExtensionCo
       nonCapturing: true,
     },
   });
-  void overlay.catch(() => undefined).finally(() => {
+  // A rejected `custom()` is the one failure this path can have that is not visible on screen, and "nothing
+  // happened when I pressed the key" is otherwise indistinguishable from a binding the terminal never delivered.
+  // So the reason is said out loud, once, and the cleanup below still runs.
+  void overlay.catch((error: unknown) => {
+    ctx.ui.notify(`\u26a0\ufe0f plan panel \u00b7 ${String(error instanceof Error ? error.message : error).slice(0, 120)}`, "warning");
+  }).finally(() => {
     state.owned.delete(component);
     if (state.overlayComponent === component) {
       state.overlayComponent = undefined;
@@ -459,9 +464,12 @@ export default function activate(pi: ExtensionAPI) {
     ctx.ui.setStatus(STATUS_KEY, line || undefined);
 
     panel.data = plan;
-    // Nothing to say, nothing drawn. See the panel section for why this differs from the team room.
+    // Nothing to say, nothing *listed*: a compact line on every session that never set a goal is a tax, which is the
+    // one place this differs from the team room. An opened panel is a different case - the keypress is the request,
+    // and a panel that refuses to appear because the session is three minutes old just teaches you that the key is
+    // broken. So an empty session draws its empty state, which is the one thing worth saying: what to type.
     const hasContent = Boolean(plan.goal || plan.direction || plan.todos.length > 0);
-    if (!hasContent) {
+    if (!hasContent && !panelVisible) {
       closePanelOverlay(panel);
       ctx.ui.setWidget(WIDGET_KEY, undefined);
       return;
