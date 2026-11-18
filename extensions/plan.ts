@@ -39,6 +39,7 @@ import { Box, Text, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   addTodo,
+  clearDirection,
   clearGoal,
   completeTodo,
   countTodos,
@@ -47,6 +48,7 @@ import {
   planPath,
   readPlan,
   renderPlanBlock,
+  setDirection,
   setGoal,
   startTodo,
   supersedeTodo,
@@ -69,6 +71,8 @@ const SECTION_KEY = "plan";
  * navigation, and `shift+down` itself is unbound. */
 const PANEL_SHORTCUT = "shift+down";
 const MARK = "🎯";
+/** The panel and the messages use this for the route; the aim keeps `MARK`, so a line says which of the two it is. */
+const DIRECTION_MARK = "↳";
 /** Written on the compact line, and searched for on the rendered screen, so the expanded panel can find the row it
  * belongs to. Both halves read this constant, so the two cannot drift apart. */
 const PANEL_MARK = "Plan:";
@@ -200,9 +204,12 @@ function buildPlanBox(plan: PlanRecord, theme: PanelTheme, expanded: boolean, in
   }
 
   if (!expanded) {
+    // The aim's own glyph: on a steered-but-not-aimed session a diamond would claim the direction was the goal,
+    // which is exactly the confusion the two fields exist to avoid.
     const aim = plan.goal ?? plan.direction;
+    const aimGlyph = plan.goal ? "◆" : "↳";
     const bits = [
-      aim ? theme.fg("accent", `◆ ${truncate(aim, 44)}`) : theme.fg("dim", "◆ no goal"),
+      aim ? theme.fg("accent", `${aimGlyph} ${truncate(aim, 44)}`) : theme.fg("dim", "◆ no goal"),
       plan.todos.length === 0 ? theme.fg("dim", "no steps") : theme.fg("dim", shortCountText(plan)),
     ];
     if (plan.direction && plan.goal) bits.splice(1, 0, theme.fg("warning", `↳ ${truncate(plan.direction, 32)}`));
@@ -243,7 +250,7 @@ function planLines(plan: PlanRecord, expanded: boolean): string[] {
   const aim = plan.goal ?? plan.direction;
   const lines: string[] = [];
   if (expanded) lines.push(`─── Plan ───`);
-  lines.push(`◆ ${aim ?? "no goal · /goal <text> sets it"}`);
+  lines.push(`${plan.goal ? "◆" : "↳"} ${aim ?? "no goal · /goal <text> sets it"}`);
   if (plan.direction && plan.goal) lines.push(`↳ ${plan.direction}`);
   if (expanded) {
     if (plan.todos.length === 0) lines.push("no steps yet · /todo <text> adds one");
@@ -460,7 +467,10 @@ export default function activate(pi: ExtensionAPI) {
     const aim = plan.goal ?? plan.direction;
     const open = counts.open + counts.inProgress;
     const tally = plan.todos.length > 0 ? `${open} step${open === 1 ? "" : "s"} open` : "";
-    const line = [aim ? `${MARK} ${truncate(aim, 46)}` : "", tally].filter(Boolean).join(" · ");
+    // The aim's own mark, not always the goal's: a session steered but not aimed reads as `↳`, and a `🎯` in front of
+    // a direction would claim there was a goal when the whole point is that there is not one yet.
+    const aimMark = plan.goal ? MARK : DIRECTION_MARK;
+    const line = [aim ? `${aimMark} ${truncate(aim, 46)}` : "", tally].filter(Boolean).join(" · ");
     ctx.ui.setStatus(STATUS_KEY, line || undefined);
 
     panel.data = plan;
@@ -624,6 +634,68 @@ export default function activate(pi: ExtensionAPI) {
         if (ctx.hasUI) {
           const note = record.plan.goal ? ` · replaced: ${record.plan.goal}` : "";
           ctx.ui.notify(`${MARK} goal set · ${next.plan.goal}${note}`, "info");
+        }
+      }
+    },
+  });
+
+  /**
+   * `/direction` is a second door onto the same record, not a second format: the human sets it, the replaced line is
+   * kept one deep, and it is clipped by the same cap. Where `/goal` is what the session is for, this is the current
+   * line of attack inside it - the thing that changes while the aim does not, when a plan turns out to be the wrong
+   * shape and you want that on the record rather than implied by a deleted todo. That is also why the panel draws it
+   * under the aim in the warning colour rather than beside it: an aim and a route to it are different kinds of thing,
+   * and a reader should be able to tell which of the two they are re-reading.
+   */
+  pi.registerCommand("direction", {
+    description: "Set, show, or clear this session's direction (the aim stays the goal)",
+    handler: async (args, ctx) => {
+      const record = current(ctx);
+      const text = String(args ?? "").trim();
+      const path = planPath(ctx.cwd, record.sessionId) ?? `.pi/plan/<invalid session id>`;
+
+      if (!text) {
+        if (!ctx.hasUI) return;
+        if (record.problem) {
+          ctx.ui.notify(`⚠️ plan · ${record.problem}`, "warning");
+          return;
+        }
+        const aim = record.plan.goal ? `goal: ${record.plan.goal}` : `no goal (${path})`;
+        ctx.ui.notify(
+          record.plan.direction
+            ? `${DIRECTION_MARK} ${record.plan.direction}${record.plan.direction_at ? ` · set ${record.plan.direction_at}` : ""} · toward ${aim}`
+            : `${DIRECTION_MARK} no direction · /direction <text> sets it · ${aim}`,
+          "info",
+        );
+        return;
+      }
+
+      const at = now();
+      if (CLEAR_WORDS.test(text)) {
+        const cleared = clearDirection(record.plan, at);
+        if (!cleared.changed) {
+          if (ctx.hasUI) ctx.ui.notify(`${DIRECTION_MARK} no direction to clear`, "info");
+          return;
+        }
+        if (commit(ctx, { ...record, plan: cleared.plan })) {
+          if (ctx.hasUI) ctx.ui.notify(`${DIRECTION_MARK} direction cleared${record.plan.direction_prev ? ` (was: ${record.plan.direction_prev})` : ""}`, "info");
+        }
+        return;
+      }
+
+      const next = setDirection(record.plan, text, at);
+      if (next.problem) {
+        warn(ctx, `${DIRECTION_MARK} ${next.problem}`);
+        return;
+      }
+      if (!next.changed) {
+        if (ctx.hasUI) ctx.ui.notify(`${DIRECTION_MARK} already the direction`, "info");
+        return;
+      }
+      if (commit(ctx, { ...record, plan: next.plan })) {
+        if (ctx.hasUI) {
+          const note = record.plan.direction ? ` · replaced: ${record.plan.direction}` : "";
+          ctx.ui.notify(`${DIRECTION_MARK} direction set · ${next.plan.direction}${note}`, "info");
         }
       }
     },

@@ -65,6 +65,10 @@ async function runGoal(harness: Harness, args: string) {
   await harness.pi.commands.get("goal")!.handler!(args, harness.context);
 }
 
+async function runDirection(harness: Harness, args: string) {
+  await harness.pi.commands.get("direction")!.handler!(args, harness.context);
+}
+
 async function runTodo(harness: Harness, args: string) {
   await harness.pi.commands.get("todo")!.handler!(args, harness.context);
 }
@@ -85,7 +89,7 @@ const planFile = (cwd: string, sessionId = ID) => path.join(planDir(cwd), `${ses
 describe("the surface", () => {
   it("registers two commands, one tool, one key, and only the events it needs", async () => {
     const harness = await setup();
-    expect([...harness.pi.commands.keys()].sort()).toEqual(["goal", "todo"]);
+    expect([...harness.pi.commands.keys()].sort()).toEqual(["direction", "goal", "todo"]);
     // The aim has no model-facing door; the list does, because the work on a list is done by the agent. The tool is
     // named for the list and not for the plan, so its name cannot imply it writes the goal too.
     expect([...harness.pi.tools.keys()]).toEqual(["todos"]);
@@ -199,6 +203,115 @@ describe("/goal", () => {
     await runGoal(harness, "a goal that cannot be stored");
     expect(harness.ui.notifications.at(-1)?.message).toContain("not saved");
     expect(readdirSync(harness.cwd)).toEqual([]);
+  });
+});
+
+describe("/direction", () => {
+  it("sets the direction without touching the goal it is a route to", async () => {
+    const harness = await setup();
+    await runGoal(harness, "make the fleet's memory usable");
+    harness.ui.notifications.length = 0;
+    await runDirection(harness, "ship the panel before the retrieval rewrite");
+
+    const stored = readPlan(harness.cwd, ID).plan!;
+    expect(stored.direction).toBe("ship the panel before the retrieval rewrite");
+    expect(stored.direction_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(stored.goal).toBe("make the fleet's memory usable"); // the aim is not the route's business
+    expect(harness.ui.notifications.at(-1)?.message).toContain("direction set");
+  });
+
+  it("replaces the direction and keeps what it replaced", async () => {
+    const harness = await setup();
+    await runDirection(harness, "through the UI");
+    await runDirection(harness, "through the CLI");
+    const stored = readPlan(harness.cwd, ID).plan!;
+    expect(stored.direction).toBe("through the CLI");
+    expect(stored.direction_prev).toBe("through the UI");
+    expect(harness.ui.notifications.at(-1)?.message).toContain("replaced: through the UI");
+  });
+
+  it("reports which aim a route belongs to, and says so when there is none", async () => {
+    const harness = await setup();
+    await runDirection(harness, "one step at a time");
+    await runDirection(harness, "");
+    const orphan = harness.ui.notifications.at(-1)!.message!;
+    expect(orphan).toContain("one step at a time");
+    expect(orphan).toContain("no goal");
+    expect(orphan).toContain(`${ID}.json`);
+
+    await runGoal(harness, "operationalize the agent");
+    harness.ui.notifications.length = 0;
+    await runDirection(harness, "   ");
+    const shown = harness.ui.notifications.at(-1)!.message!;
+    expect(shown).toContain("toward goal: operationalize the agent");
+    expect(shown).toMatch(/set \d{4}-\d{2}-\d{2}T/);
+  });
+
+  it("clears only when clear is the whole argument", async () => {
+    const harness = await setup();
+    await runDirection(harness, "clear the stale overlay first");
+    expect(readPlan(harness.cwd, ID).plan!.direction).toBe("clear the stale overlay first");
+
+    await runDirection(harness, "clear");
+    const stored = readPlan(harness.cwd, ID).plan!;
+    expect(stored.direction).toBeUndefined();
+    expect(stored.direction_prev).toBe("clear the stale overlay first");
+    harness.ui.notifications.length = 0;
+    await runDirection(harness, "unset");
+    expect(harness.ui.notifications.at(-1)?.message).toContain("no direction to clear");
+  });
+
+  it("tells a steered session apart from an aimed one in the status line", async () => {
+    const harness = await setup();
+    await runDirection(harness, "panel first");
+    const steered = harness.ui.statuses.get(STATUS_KEY)!;
+    expect(steered).toContain("\u21b3 panel first");
+    expect(steered).not.toContain("\ud83c\udfaf");
+
+    await runGoal(harness, "operationalize pi-ed");
+    expect(harness.ui.statuses.get(STATUS_KEY)!).toContain("\ud83c\udfaf operationalize pi-ed");
+  });
+
+  it("carries a route to the model when there is no aim yet", async () => {
+    const harness = await setup();
+    await runDirection(harness, "port the overlay panel");
+    await runTodo(harness, "lift the compositor patch");
+    const sections = await startTurn(harness);
+    const drawn = sections[SECTION_KEY]!;
+    expect(drawn).toContain("DIRECTION port the overlay panel");
+    expect(drawn).not.toMatch(/^GOAL/m);
+    expect(drawn).toContain("lift the compositor patch");
+  });
+
+  it("cannot be reached by the model through the list tool", async () => {
+    const harness = await setup();
+    await runTodo(harness, "restart the pods");
+    harness.ui.notifications.length = 0;
+    const result = await callTodos(harness, { action: "set_direction", text: "quietly change course" });
+    expect(result.details.ok).toBe(false);
+    expect(toolText(result)).toContain("unknown action");
+    expect(readPlan(harness.cwd, ID).plan!.direction).toBeUndefined();
+    // Refusing must not cost a write either: the record on disk is the one from before the call.
+    expect(harness.ui.notifications).toHaveLength(0);
+  });
+
+  it("draws the route under the aim in the panel", async () => {
+    const harness = await setup();
+    await runGoal(harness, "operationalize pi-ed");
+    await runDirection(harness, "panel before retrieval");
+    const compact = widgetLines(harness)!;
+    expect(compact[0]).toContain("\u25c6 operationalize pi-ed");
+    expect(compact[0]).toContain("\u21b3 panel before retrieval");
+
+    await pressPanelKey(harness);
+    const lines = harness.ui.overlays[0].component.render(140);
+    const goalRow = lines.findIndex((l) => l.includes("\u25c6 goal"));
+    const routeRow = lines.findIndex((l) => l.includes("\u21b3 direction"));
+    expect(goalRow).toBeGreaterThan(-1);
+    expect(routeRow).toBe(goalRow + 1); // the route is drawn under the aim, never beside it
+    expect(lines[routeRow]).toContain("panel before retrieval");
+    // And it is drawn in the colour that means "this changed": a re-read should not have to know the glyph.
+    expect(lines[routeRow]).toContain("warning");
   });
 });
 

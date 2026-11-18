@@ -171,7 +171,9 @@ const EXPECTED: Record<string, Surface> = {
     // the section route means a plan reappears after a compaction on its own.
     events: ["session_start", "session_info_changed", "before_agent_start"],
     tools: ["todos"],
-    commands: ["goal", "todo"],
+    // Both aim doors (`/goal`, `/direction`) are human-only, so neither appears as a tool; `/todo` does, because
+    // moving a step is what the agent is doing when it works.
+    commands: ["direction", "goal", "todo"],
     flags: [],
     shortcuts: ["shift+down"],
     messageRenderers: [],
