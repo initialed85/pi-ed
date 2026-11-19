@@ -39,10 +39,11 @@ interface Surface {
 
 const EXPECTED: Record<string, Surface> = {
   "background.ts": {
-    events: [],
+    events: ["session_start"],
     tools: ["background"],
     commands: ["jobs"],
     flags: [],
+    shortcuts: ["shift+left"],
     messageRenderers: [],
     entryRenderers: [],
   },
