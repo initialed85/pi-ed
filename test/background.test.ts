@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createContext, createFakePi, type FakePi } from "./harness.ts";
+import { readFileSync as readSource } from "node:fs";
 
 const MODULE = path.resolve("extensions/background.ts");
 const SID = "01a1b2c3-4d5e-6f70-8a9b-0c1d2e3f4a5b";
@@ -23,6 +24,11 @@ async function waitFor<T>(read: () => T | undefined, timeout = 3000): Promise<T>
 }
 
 describe("background jobs", () => {
+  it("renders expanded rows as rows, not a literal backslash-n", () => {
+    const source = readSource(path.resolve("extensions/background.ts"), "utf8");
+    expect(source).toContain('.join("\\n")');
+    expect(source).not.toContain('.join("\\\\n")');
+  });
   it("returns immediately, persists completion, and wakes the same session", async () => {
     const { pi, context, cwd } = await setup();
     const tool = pi.tools.get("background")!; const execute = tool.execute!;
