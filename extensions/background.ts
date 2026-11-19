@@ -36,9 +36,10 @@ function wake(api: ExtensionAPI, job: Job) {
 function paint(ctx: any) {
   if (!ctx.hasUI) return;
   const jobs = load(ctx.cwd, sid(ctx));
-  if (!jobs.length) { ctx.ui.setWidget(WIDGET, undefined); return; }
-  const compact = `▌ Jobs · ${jobs.filter((j) => j.state === "running").length} running · ${jobs.length} total (shift+left)`;
-  const lines = expanded ? jobs.map((j) => `${j.state === "succeeded" ? "✓" : j.state === "failed" ? "✗" : j.state === "running" ? "…" : "×"} ${j.id} · ${j.command}`) : [compact];
+  const compact = `Jobs · ${jobs.filter((j) => j.state === "running").length} running · ${jobs.length} total (shift+left)`;
+  const lines = expanded
+    ? (jobs.length ? jobs.map((j) => `${j.state === "succeeded" ? "✓" : j.state === "failed" ? "✗" : j.state === "running" ? "…" : "×"} ${j.id} · ${j.command}`) : ["No background jobs."])
+    : [compact];
   if (ctx.mode !== "tui") { ctx.ui.setWidget(WIDGET, lines, { placement: "aboveEditor" }); return; }
   ctx.ui.setWidget(WIDGET, (tui: any, theme: any) => {
     const box = new Box(1, 0, (text: string) => theme.bg("customMessageBg", text));
