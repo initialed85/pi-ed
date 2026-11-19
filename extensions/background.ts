@@ -42,7 +42,7 @@ function paint(ctx: any) {
   if (ctx.mode !== "tui") { ctx.ui.setWidget(WIDGET, lines, { placement: "aboveEditor" }); return; }
   ctx.ui.setWidget(WIDGET, (tui: any, theme: any) => {
     const box = new Box(1, 0, (text: string) => theme.bg("customMessageBg", text));
-    box.addChild(new Text(lines.map((line) => `▌ ${line}`).join("\n"), 0, 0));
+    box.addChild(new Text(lines.join("\n"), 0, 0));
     return { render: (width: number) => box.render(width), invalidate: () => tui.requestRender?.() };
   }, { placement: "aboveEditor" });
 }
