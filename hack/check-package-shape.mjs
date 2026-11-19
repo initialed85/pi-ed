@@ -26,6 +26,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const EXPECTED_EXTENSIONS = [
   "auto-resume.ts",
   "autopilot.ts",
+  "background.ts",
   "graphiti.ts",
   "compaction-summary-guard.ts",
   "loop-guard.ts",

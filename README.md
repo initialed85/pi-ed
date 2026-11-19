@@ -18,6 +18,20 @@ hack/         check-package-shape.mjs (the CI gate on the package manifest), ci-
 .woodpecker/  CI: workflow lint + typecheck + tests
 ```
 
+## Background jobs
+
+### `background.ts` — slow work without blocking the conversation
+
+The `background` tool starts a shell command and returns immediately. The child keeps running while the agent continues
+the session; when it exits, the extension writes a durable result under `.pi/background/<session-id>/` and injects a
+follow-up user message containing its exit state and capped output. Use `action: "list"` to inspect jobs or
+`action: "cancel"` with the returned id to request `SIGTERM`; `/jobs` is the human-readable list.
+
+This is intentionally not a prompt section: job state and output never enter `systemPromptOptions.sections`, so starting,
+finishing, or listing a job cannot churn the provider's cached system-prompt prefix. The command has Pi's shell
+permissions, so it is an agent tool rather than a sandbox. Results are capped to 12,000 characters and persisted before
+the wake-up is sent.
+
 ## Install
 
 Clone it where Pi discovers packages — a directory under `~/.pi/agent/extensions/` with a

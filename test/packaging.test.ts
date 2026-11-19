@@ -38,6 +38,14 @@ interface Surface {
 }
 
 const EXPECTED: Record<string, Surface> = {
+  "background.ts": {
+    events: [],
+    tools: ["background"],
+    commands: ["jobs"],
+    flags: [],
+    messageRenderers: [],
+    entryRenderers: [],
+  },
   "auto-resume.ts": {
     // It has to see a run begin, see each tool finish, see the run settle and see the process stop:
     // that is the evidence a later resume reads, and none of it can be reconstructed afterwards.
