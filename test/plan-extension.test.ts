@@ -789,15 +789,15 @@ describe("the panel", () => {
 
   it("caps what it draws and says what it cut", async () => {
     const harness = await setup();
-    for (let i = 1; i <= 12; i += 1) await runTodo(harness, `step ${i}`);
+    for (let i = 1; i <= PANEL_MAX_STEPS + 4; i += 1) await runTodo(harness, `step ${i}`);
     await pressPanelKey(harness);
     const lines = harness.ui.overlays[0].component.render(200);
     expect(lines.join("\n")).toContain(`step ${PANEL_MAX_STEPS}`);
     expect(lines.join("\n")).not.toContain(`step ${PANEL_MAX_STEPS + 1}`);
     expect(lines.join("\n")).toContain("4 more");
     // Capping the panel is not capping the record: all twelve are still on disk, and still in the prompt.
-    expect(planOnDisk(harness.cwd).todos).toHaveLength(12);
-    expect((await startTurn(harness))[SECTION_KEY]).toContain("12 open");
+    expect(planOnDisk(harness.cwd).todos).toHaveLength(PANEL_MAX_STEPS + 4);
+    expect((await startTurn(harness))[SECTION_KEY]).toContain(`${PANEL_MAX_STEPS + 4} open`);
   });
 
   it("says so when the overlay cannot be mounted", async () => {

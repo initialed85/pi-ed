@@ -47,6 +47,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import {
   CONFIG_DIR_NAME,
   type CustomEntry,
@@ -93,6 +94,8 @@ export interface Config {
   maxAgeMs: number;
   /** Leave a resume alone when the record already says the session was idle. */
   skipIdle: boolean;
+  /** Optional number of automatic injections remaining; absent means unlimited. */
+  remaining?: number;
 }
 
 /**
@@ -133,6 +136,7 @@ function readConfig(ctx: ExtensionContext): Config {
       if (typeof parsed.enabled === "boolean") cfg.enabled = parsed.enabled;
       if (typeof parsed.maxAgeMs === "number" && Number.isFinite(parsed.maxAgeMs)) cfg.maxAgeMs = Math.max(0, parsed.maxAgeMs);
       if (typeof parsed.skipIdle === "boolean") cfg.skipIdle = parsed.skipIdle;
+      if (parsed.remaining === undefined || (typeof parsed.remaining === "number" && Number.isInteger(parsed.remaining) && parsed.remaining >= 0)) cfg.remaining = parsed.remaining;
     } catch {
       // A settings file we cannot read leaves the feature off rather than guessing.
     }
@@ -596,6 +600,7 @@ function usage(): string {
     "Usage:",
     "  /auto-resume                       toggle on or off for this repository",
     "  /auto-resume on | off | status | why | fire",
+    "  /auto-resume <count>             enable for that many automatic resumes (omit for unlimited)",
     "  /auto-resume max-age <duration|off> leave a resume alone if the last activity is older than this (2h, 45m, 1d)",
     "  /auto-resume skip-idle on|off       drop the turn when the record already says the session was idle",
   ].join("\n");
@@ -663,6 +668,11 @@ export default function (api: ExtensionAPI): void {
       debugLog(ctx, `inject failed ${why2}`);
       return;
     }
+    if (cfg.remaining !== undefined) {
+      cfg = { ...cfg, remaining: Math.max(0, cfg.remaining - 1), enabled: cfg.remaining > 1 };
+      writeConfig(ctx, cfg);
+      if (!cfg.enabled) ctx.ui.notify("auto-resume limit reached; it is now off", "info");
+    }
     showStatus(ctx, statusLine(facts));
     debugLog(ctx, `injected why="${why}" reason=${facts.startReason} state="${facts.state}" source=${facts.source} ago=${facts.ago}`);
   };
@@ -671,6 +681,21 @@ export default function (api: ExtensionAPI): void {
     description: "Do not re-arm a resumed session in this Pi instance",
     type: "boolean",
     default: false,
+  });
+
+  api.registerTool({
+    name: "auto_resume",
+    label: "auto-resume",
+    description: "Arm auto-resume for a bounded number of future automatic resumes. Required count prevents unbounded self-rearming.",
+    parameters: Type.Object({ count: Type.Integer({ minimum: 1, maximum: 32 }) }),
+    execute: async (_id, params, _signal, _onUpdate, ctx) => {
+      load(ctx);
+      cfg = { ...cfg, enabled: true, remaining: params.count };
+      const path = writeConfig(ctx, cfg);
+      cfgFile = path;
+      showStatus(ctx, statusLine(undefined));
+      return { content: [{ type: "text", text: `auto-resume armed for ${params.count} automatic resume${params.count === 1 ? "" : "s"}; settings: ${path}` }], details: { count: params.count, path } };
+    },
   });
 
   api.registerCommand("auto-resume", {
@@ -692,8 +717,19 @@ export default function (api: ExtensionAPI): void {
         ctx.ui.notify(`${note}\nsettings: ${path}`, level);
       };
 
+      if (verb && /^\d+$/.test(verb)) {
+        const count = Number(verb);
+        if (!Number.isSafeInteger(count) || count < 1 || count > 32) {
+          ctx.ui.notify("auto-resume count must be an integer from 1 to 32", "error");
+          return;
+        }
+        cfg = { ...cfg, enabled: true, remaining: count };
+        save(`auto-resume armed for ${count} automatic resume${count === 1 ? "" : "s"}`);
+        return;
+      }
+
       if (!verb) {
-        cfg = { ...cfg, enabled: !cfg.enabled };
+        cfg = { ...cfg, enabled: !cfg.enabled, remaining: undefined };
         save(
           `auto-resume ${cfg.enabled ? "on" : "off"} for ${ctx.cwd}\n${
             cfg.enabled
@@ -708,7 +744,7 @@ export default function (api: ExtensionAPI): void {
       switch (verb) {
         case "on":
         case "off": {
-          cfg = { ...cfg, enabled: verb === "on" };
+          cfg = { ...cfg, enabled: verb === "on", remaining: undefined };
           if (!cfg.enabled) off(ctx);
           save(`auto-resume ${verb} for ${ctx.cwd}`, verb === "on" ? "info" : "warning");
           return;

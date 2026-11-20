@@ -80,9 +80,9 @@ const DIRECTION_MARK = "↳";
 const PANEL_MARK = "Plan:";
 /** Steps the expanded panel draws. More than this and the panel is a transcript again; the report and the prompt
  * block both still show everything. Exported so the test asserts against the real cap, not a copy of it. */
-export const PANEL_MAX_STEPS = 8;
-/** Lines `/todo` prints as a notification. The first is the counts, so a truncated notification still says something. */
-const REPORT_MAX_ITEMS = 8;
+export const PANEL_MAX_STEPS = 32;
+/** `/todo` and the expanded panel show a bounded but generous list; the file remains the source of truth beyond this. */
+const REPORT_MAX_ITEMS = 32;
 const STATE_MARKS: Record<string, string> = { todo: " ", in_progress: ">", done: "x", superseded: "!" };
 const KNOWN_ACTIONS = new Set(["list", "add", "start", "done", "supersede", "edit"]);
 
