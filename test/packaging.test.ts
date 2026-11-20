@@ -109,7 +109,7 @@ const EXPECTED: Record<string, Surface> = {
   },
   "queue-reload.ts": {
     events: [],
-    tools: [],
+    tools: ["queue_reload"],
     commands: ["queue-reload"],
     flags: [],
     messageRenderers: [],

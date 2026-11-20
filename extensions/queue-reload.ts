@@ -1,11 +1,11 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 export default function (pi: ExtensionAPI) {
   let reloadQueued = false;
 
-  pi.registerCommand("queue-reload", {
-    description: "Reload Pi automatically when the current run becomes idle",
-    handler: async (_args, ctx) => {
+  type ReloadContext = ExtensionContext & { waitForIdle(): Promise<void>; reload(): Promise<void> };
+  const queue = async (ctx: ReloadContext): Promise<void> => {
       if (reloadQueued) {
         if (ctx.hasUI) ctx.ui.notify("A reload is already queued; it will run when Pi is idle.", "info");
         return;
@@ -26,6 +26,21 @@ export default function (pi: ExtensionAPI) {
       if (ctx.hasUI) ctx.ui.notify("Pi is idle; reloading now.", "info");
       // Reload replaces this extension runtime; do not use its state after this call.
       await ctx.reload();
+  };
+
+  pi.registerCommand("queue-reload", {
+    description: "Reload Pi automatically when the current run becomes idle",
+    handler: async (_args, ctx) => { await queue(ctx); },
+  });
+
+  pi.registerTool({
+    name: "queue_reload",
+    label: "queue-reload",
+    description: "Queue a Pi reload for when the current agent run becomes idle.",
+    parameters: Type.Object({}),
+    execute: async (_id, _params, _signal, _onUpdate, ctx) => {
+      await queue(ctx as unknown as ReloadContext);
+      return { content: [{ type: "text", text: "Reload queued for idle." }], details: {} };
     },
   });
 }
