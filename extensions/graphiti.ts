@@ -83,12 +83,31 @@ const MAX_FACTS_CAP = 20;
 
 type Config = { url: string; agent: string };
 
-/** Neo4j HTTP endpoint plus credentials; both must be present or expire is not offered. */
+/**
+ * Neo4j HTTP endpoint plus credentials; both must be present or expire is not offered.
+ *
+ * The separator is accepted in either form, because the two sources disagree by nature: the `memory-db` secret
+ * stores it the way Neo4j's own `NEO4J_AUTH` is written (`user/password`), while a human pasting credentials into a
+ * ConfigMap writes `user:password`. Requiring exactly one and registering nothing otherwise is the worst failure
+ * shape this door can have — home-ops hit precisely that wiring it from the secret, and from the agent's side an
+ * absent tool is indistinguishable from an unconfigured pod. So normalise both.
+ */
 export function resolveNeo4j(env: NodeJS.ProcessEnv = process.env): { url: string; auth: string } | null {
   const url = (env[NEO4J_URL_ENV] ?? "").trim().replace(/\/+$/, "");
-  const auth = (env[NEO4J_AUTH_ENV] ?? "").trim();
-  if (!url || !auth || !/^https?:\/\//.test(url) || !auth.includes(":")) return null;
-  return { url, auth };
+  const raw = (env[NEO4J_AUTH_ENV] ?? "").trim();
+  if (!url || !raw || !/^https?:\/\//.test(url)) return null;
+  const colonAt = raw.indexOf(":");
+  const slashAt = raw.indexOf("/");
+  // Whichever separator appears first is the one that split this string, so a password containing the other form
+  // survives intact instead of landing half of itself in the username.
+  const separator = colonAt < 0 ? (slashAt < 0 ? null : "/")
+    : slashAt < 0 ? ":"
+    : slashAt < colonAt ? "/" : ":";
+  if (!separator) return null;
+  const [user, ...rest] = raw.split(separator);
+  const password = rest.join(separator);
+  if (!user || !password) return null;
+  return { url, auth: `${user}:${password}` };
 }
 
 /**
@@ -449,6 +468,18 @@ export default function activate(api: ExtensionAPI): void {
         `group:     ${scoped.agent}`,
         `redaction: lib/redact.ts applied to every write`,
       ];
+      // Say whether expire is wired, and in what shape it would be misconfigured. home-ops spent time discovering
+      // that a secret in `user/password` form had silently registered nothing; an operator reading this line should
+      // not have to derive that from an absent tool.
+      const neo4jNow = resolveNeo4j(process.env);
+      const rawAuth = (process.env[NEO4J_AUTH_ENV] ?? "").trim();
+      if (neo4jNow) {
+        lines.push(`expire:    enabled via ${neo4jNow.url}`);
+      } else if (process.env[NEO4J_URL_ENV] || rawAuth) {
+        lines.push(`expire:    NOT enabled despite ${NEO4J_URL_ENV}/${NEO4J_AUTH_ENV} being set — needs a URL plus credentials as user:pass or user/pass`);
+      } else {
+        lines.push(`expire:    not configured (${NEO4J_URL_ENV}/${NEO4J_AUTH_ENV} unset on this pod), so memory_expire is absent`);
+      }
       try {
         const health = await fetch(`${scoped.url}/healthcheck`, { signal: AbortSignal.timeout(5_000) });
         lines.push(`health:    HTTP ${health.status} ${(await health.text()).replace(/\s+/g, " ").slice(0, 80)}`);

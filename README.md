@@ -318,11 +318,12 @@ jq -r 'select(.customType=="auto-resume")
 
 ### `graphiti.ts` — the fleet's memory, over Graphiti and Neo4j
 
-**The live memory door.** It registers `memory_remember` and `memory_recall` plus a `/graphiti` command, and talks to
-Graphiti (`graphiti_core` 0.31.2) in namespace `memory` on home-dev — home-ops `clusters/dev/applications/memory/`,
-with Neo4j 5.26.2 behind it and `https://graph.dev.initialed85.cc` for humans. An agent's sentence is handed to an
-extract LLM (`sentiment-analyzer`, a small Gemma), which turns it into entities, relationships and facts with valid /
-invalid windows; retrieval combines cosine similarity, BM25 and graph traversal, with no LLM on the read path.
+**The live memory door.** It registers `memory_remember`, `memory_recall` and `memory_expire` plus a `/graphiti`
+command, and talks to Graphiti (`graphiti_core` 0.31.2) in namespace `memory` on home-dev — home-ops
+`clusters/dev/applications/memory/`, with Neo4j 5.26.2 behind it and `https://graph.dev.initialed85.cc` for humans.
+An agent's sentence is handed to an extract LLM (`sentiment-analyzer`, a small Gemma), which turns it into entities,
+relationships and facts with valid / invalid windows; retrieval combines cosine similarity, BM25 and graph traversal,
+with no LLM on the read path.
 
 It replaced `cognee.ts`, which is deleted rather than parked: the Cognee service no longer exists in the cluster
 because its ingest stalled forever retrying schema-invalid graph output. Read that file's git history before doubting
@@ -342,14 +343,15 @@ The two things that make this door different from the Postgres one, and why the 
 
 | | |
 |---|---|
-| Tools | `memory_remember` (note, optional group, optional tags; 20,000 character cap; redaction applied before the wire) and `memory_recall` (query, optional group, `fleetWide`, `maxFacts` default 10 / max 20) |
+| Tools | `memory_remember` (note, optional group, optional tags; 20,000 character cap; redaction applied before the wire), `memory_recall` (query, optional group, `fleetWide`, `maxFacts` default 10 / max 20; each line ends with `id <uuid>`) and `memory_expire` (fact ids, optional group, reason; needs `PI_MEMORY_NEO4J_URL` + `PI_MEMORY_NEO4J_AUTH` on the pod) |
 | Commands | `/graphiti` — the door URL, this agent's group, health, and what the service says it holds for this agent |
-| Configuration | `MEMORY_GRAPH_URL` (required; default in-cluster `http://memory-graph.memory.svc.cluster.local:9999`) and `MEMORY_AGENT` (the group, default the container hostname). **Unset URL means the extension registers nothing at all** — a pod that was never given the door has no graphiti tools rather than a tool that hangs on session start |
+| Configuration | `MEMORY_GRAPH_URL` (required; default in-cluster `http://memory-graph.memory.svc.cluster.local:9999`) and `MEMORY_AGENT` (the group, default the container hostname). **Unset URL means the extension registers nothing at all** — a pod that was never given the door has no graphiti tools rather than a tool that hangs on session start. `PI_MEMORY_NEO4J_URL` + `PI_MEMORY_NEO4J_AUTH` additionally enable `memory_expire`; credentials are accepted as `user:pass` or `user/pass` because the `memory-db` secret stores Neo4j's native slash form while a human types a colon, and picking one silently would look exactly like an unconfigured pod |
 | No credential | The door is cluster-internal and **unauthenticated**: every pod in home-dev can read every group. That is why redaction happens on the way out and is not configurable |
 | Groups are partitions | Group ids are the agent names exactly as the import used them (`camry`, `coral`, `quake`, `fleet-note`, …). `Quake` or `quake-2` silently creates a second brain nobody recalls from, so the extension defaults to this agent's own and only names another when a caller deliberately means the fleet-note corpus |
-| Deliberately absent | Forgetting. `POST /clear` and `DELETE /episode/{uuid}` are real and destructive; a model that asks to forget in the same breath as it asks to remember is an accident waiting to happen. Forgetting lives in `hack/graphiti-live-check.mjs --prove-delete` instead |
+| Deliberately absent | Deleting. `POST /clear`, `DELETE /episode/{uuid}` and `DELETE /group/{group_id}` are real and destructive; a model that asks to forget in the same breath as it asks to remember is an accident waiting to happen, so they live in `hack/graphiti-live-check.mjs --prove-delete` instead. `memory_expire` is the one mutation an agent may call, and the distinction is the point: it closes a validity window and leaves the fact in the graph with `superseded_by` naming what replaced it, so it cannot destroy a record — it just stops a wrong fact from being presented as current |
+| Retracting | With `memory_expire` and the id `memory_recall` prints, never with prose. Measured twice by maclet in their own group: a `SUPERSEDE (invalidated as of …)` note left the false fact `still held`, and the extractor returned the correction with `valid_at == invalid_at` — a zero-length window, i.e. a tombstone of the right answer. 90 of 56,138 fact edges carry that shape fleet-wide across 8 groups, so it is upstream behaviour, not a writer's mistake. Contradiction does not invalidate, and a negation-shaped sentence re-seeds the dead claim as a new live fact, so the rule is: expire by id, then state what is true now |
 | Timeouts | 15 s for a write (the acknowledgement is immediate; the budget covers the cluster being briefly weird) and 20 s for a read (measured under a second, so 20 s is slack for a warming Neo4j, not hope) |
-| Tests | `test/graphiti.test.ts` — the inert-without-URL case, the write body contract (role present, `role_type` present, **never a uuid**: a supplied uuid makes graphiti_core re-raise `NodeNotFoundError` behind a 202), redaction before the network including the `sk-` shape, group scoping, and what a 422 means |
+| Tests | `test/graphiti.test.ts` — the inert-without-URL case, the write body contract (role present, `role_type` present, **never a uuid**: a supplied uuid makes graphiti_core re-raise `NodeNotFoundError` behind a 202), redaction before the network including the `sk-` shape, group scoping, what a 422 means, both credential separator forms, that the fact id reaches the recall output, and that an expire which matches nothing says \"Closed nothing\" instead of reporting a retraction that did not happen |
 | Live check | `hack/graphiti-live-check.mjs` — health route name, an empty group before writing, a write, polled proof that an episode and a fact appear, verbatim storage proof from `/episodes`, and `--prove-delete` which shows a literal is retrievable while the group lives and gone after `DELETE /group/{id}`. It writes only to a `*-probe` group and refuses to write into a real one without `--allow-shared` |
 
 ### `memory.ts` — what an agent remembers tomorrow

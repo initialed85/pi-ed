@@ -72,7 +72,9 @@ const EXPECTED: Record<string, Surface> = {
     // asks nothing of the session. The tool names survived the swap on purpose — an agent that already knows to call
     // memory_remember should not have to learn a new verb because the store behind it changed.
     events: [],
-    tools: ["memory_remember", "memory_recall"],
+    // memory_expire is registered only when the pod has been given Neo4j write access, but it is part of the
+    // extension's surface and a pod without it is a misconfiguration, not a different build.
+    tools: ["memory_remember", "memory_recall", "memory_expire"],
     commands: ["graphiti"],
     flags: [],
     messageRenderers: [],

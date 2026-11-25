@@ -109,6 +109,22 @@ describe("graphiti configuration", () => {
     expect([...withExpire.pi.tools.keys()].sort()).toEqual(["memory_expire", "memory_recall", "memory_remember"]);
   });
 
+  it("accepts credentials in either separator form, because the secret and a human disagree", async () => {
+    // home-ops wired PI_MEMORY_NEO4J_AUTH from the memory-db secret, which stores Neo4j's native `user/password`,
+    // while the colon form is what anybody types by hand. The old code accepted one and registered nothing for the
+    // other, which from the agent's side looks exactly like an unconfigured pod.
+    const { resolveNeo4j } = await import(MODULE);
+    const colon = resolveNeo4j({ PI_MEMORY_NEO4J_URL: "http://n:7474", PI_MEMORY_NEO4J_AUTH: "neo4j:pw" });
+    const slash = resolveNeo4j({ PI_MEMORY_NEO4J_URL: "http://n:7474", PI_MEMORY_NEO4J_AUTH: "neo4j/pw" });
+    expect(colon).toEqual({ url: "http://n:7474", auth: "neo4j:pw" });
+    expect(slash).toEqual({ url: "http://n:7474", auth: "neo4j:pw" });
+    // A password containing the separator survives, which matters because generated ones contain anything.
+    expect(resolveNeo4j({ PI_MEMORY_NEO4J_URL: "http://n:7474", PI_MEMORY_NEO4J_AUTH: "neo4j/pw:with:colons" })?.auth)
+      .toBe("neo4j:pw:with:colons");
+    expect(resolveNeo4j({ PI_MEMORY_NEO4J_URL: "http://n:7474", PI_MEMORY_NEO4J_AUTH: "justaword" })).toBe(null);
+    expect(resolveNeo4j({})).toBe(null);
+  });
+
   it("names this agent's group from MEMORY_AGENT, not from a guess", async () => {
     const { pi } = await load();
     const tool = pi.tools.get("memory_remember") as any;
