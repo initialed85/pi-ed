@@ -26,6 +26,15 @@ function setEnv(url: string): void {
   process.env.MEMORY_GRAPH_URL = url;
   process.env.MEMORY_AGENT = "graphiti-test";
   delete process.env.MEMORY_GRAPH_DISABLED;
+  // Write access is a separate grant, and the expire tool must not appear without it.
+  delete process.env.PI_MEMORY_NEO4J_URL;
+  delete process.env.PI_MEMORY_NEO4J_AUTH;
+}
+
+/** Neo4j write access, as home-ops wires it: an HTTP endpoint plus `user:pass`. */
+function setNeo4j(): void {
+  process.env.PI_MEMORY_NEO4J_URL = "http://neo4j.invalid.test:7474";
+  process.env.PI_MEMORY_NEO4J_AUTH = "neo4j:secret-not-a-real-one";
 }
 
 /** Deleting the variable is the whole test, so it gets its own function rather than a default parameter. */
@@ -57,8 +66,9 @@ function stubTimeout(): void {
   });
 }
 
-async function load() {
+async function load(opts: { neo4j?: boolean } = {}) {
   setEnv(LIVE_URL);
+  if (opts.neo4j) setNeo4j();
   const mod = await import(MODULE);
   const pi = createFakePi();
   await mod.default(pi);
@@ -86,6 +96,17 @@ describe("graphiti configuration", () => {
     const { pi } = await load();
     expect([...pi.tools.keys()].sort()).toEqual(["memory_recall", "memory_remember"]);
     expect([...pi.commands.keys()]).toContain("graphiti");
+  });
+
+  it("offers memory_expire only when the pod has been given Neo4j write access", async () => {
+    // Without the grant the tool is absent rather than failing: a model that reaches for it and always errors
+    // learns to write negation prose instead, which is exactly the behaviour that spread tonight's wrong facts.
+    const without = await load();
+    expect([...without.pi.tools.keys()].sort()).toEqual(["memory_recall", "memory_remember"]);
+
+    setNeo4j();
+    const withExpire = await load({ neo4j: true });
+    expect([...withExpire.pi.tools.keys()].sort()).toEqual(["memory_expire", "memory_recall", "memory_remember"]);
   });
 
   it("names this agent's group from MEMORY_AGENT, not from a guess", async () => {
@@ -171,6 +192,15 @@ describe("reads", () => {
     expect(text).toContain("2 fact(s)");
   });
 
+  it("prints the fact id, because an unaddressable wrong fact cannot be retracted", async () => {
+    // The expire path depends on recall handing back the edge uuid. Without it a session finds a false fact and can
+    // only complain about it in prose, which is how the fleet spent tonight.
+    stubFetch(() => [200, { facts: [{ uuid: "ebf777a5-cf63-465c-a297-fbb69882f41b", fact: "nullfs is absent", valid_at: "2026-11-25T10:29:39Z" }] }]);
+    const { pi } = await load();
+    const result = await callTool(pi, "memory_recall", { query: "nullfs" }, createContext());
+    expect(result.content[0].text).toContain("id ebf777a5-cf63-465c-a297-fbb69882f41b");
+  });
+
   it("warns that a full-looking answer can still be about something else", async () => {
     const { pi } = await load();
     stubFetch(() => [200, { facts: [{ fact: "unrelated", valid_at: "x" }] }]);
@@ -201,6 +231,57 @@ describe("reads", () => {
     stubFetch(() => [200, { facts: [] }]);
     await callTool(pi, "memory_recall", { query: "a", maxFacts: 400 }, createContext());
     expect(captured.at(-1)?.body.max_facts).toBe(20);
+  });
+});
+
+describe("expiry", () => {
+  const FACT_ID = "ebf777a5-cf63-465c-a297-fbb69882f41b";
+
+  /** Neo4j's transactional HTTP endpoint answers with results[0].data[0].row. */
+  function stubNeo4j(row: [number, string[]]): void {
+    stubFetch((p) => p.endsWith("/tx/commit")
+      ? [200, { results: [{ data: [{ row }] }], errors: [] }]
+      : [202, { status: "accepted" }]);
+  }
+
+  it("closes only this group's open window on the named fact", async () => {
+    // The reason prose is not enough: maclet measured a SUPERSEDE note leave the false fact `still held` while the
+    // correction came out with valid_at == invalid_at. This is the directed operation instead.
+    stubNeo4j([1, [FACT_ID]]);
+    const { pi } = await load({ neo4j: true });
+    const result = await callTool(pi, "memory_expire", { ids: [FACT_ID], reason: "nullfs is entitlement-gated" }, createContext());
+    expect(result.content[0].text).toContain("Closed the window on 1 fact(s) in group \"graphiti-test\"");
+    const sent = captured.at(-1)!.body.statements[0];
+    expect(sent.statement).toContain("e.group_id = $group");
+    expect(sent.statement).toContain("e.invalid_at IS NULL");
+    expect(sent.parameters.group).toBe("graphiti-test");
+    expect(sent.parameters.ids).toEqual([FACT_ID]);
+    expect(sent.parameters.reason).toBe("nullfs is entitlement-gated");
+  });
+
+  it("says so plainly when an id matches nothing, rather than reporting a retraction that did not happen", async () => {
+    // Most likely because the fact lives in another partition. Silence here would teach the agent it had fixed a
+    // graph that still holds the wrong claim.
+    stubNeo4j([0, []]);
+    const { pi } = await load({ neo4j: true });
+    const result = await callTool(pi, "memory_expire", { ids: [FACT_ID] }, createContext());
+    expect(result.content[0].text).toContain("Closed nothing");
+    expect(result.content[0].text).not.toContain("Closed the window");
+  });
+
+  it("refuses to run without ids", async () => {
+    stubNeo4j([0, []]);
+    const { pi } = await load({ neo4j: true });
+    const result = await callTool(pi, "memory_expire", { ids: [] }, createContext());
+    expect(result.content[0].text).toContain("needs ids");
+    expect(captured.some((c) => c.url.includes("/tx/commit"))).toBe(false);
+  });
+
+  it("tells the agent to write the replacement fact, since expiry alone leaves the slot empty", async () => {
+    stubNeo4j([1, [FACT_ID]]);
+    const { pi } = await load({ neo4j: true });
+    const result = await callTool(pi, "memory_expire", { ids: [FACT_ID] }, createContext());
+    expect(result.content[0].text).toContain("memory_remember");
   });
 });
 

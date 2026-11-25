@@ -46,6 +46,9 @@
  * Deliberately omitted: `POST /clear` and `DELETE /episode/{uuid}` are real and destructive and an agent asking to
  * "forget" in the same breath as it asks to remember something is an accident waiting to happen. Forgetting is a
  * human command, so it lives in `hack/graphiti-live-check.mjs --prove-delete`, not in a tool a model can call.
+ * `memory_expire` is the exception, and the distinction is the one that matters: it closes a validity window and
+ * leaves the fact in the graph as history, so it cannot destroy a record — which is exactly what a wrong fact
+ * needs, and what prose could not do (see `expireStatement`).
  */
 
 import { hostname } from "node:os";
@@ -60,11 +63,33 @@ const RECALL_TIMEOUT_MS = 20_000;
 /** The write returns a 202 immediately, so this budget only covers the cluster being briefly weird. */
 const WRITE_TIMEOUT_MS = 15_000;
 const URL_ENV = "MEMORY_GRAPH_URL";
+/**
+ * Closing a fact's window is a Neo4j write, not a Graphiti one: the service exposes no invalidate route at all
+ * (`GET /openapi.json` lists `POST /search`, `GET|DELETE /entity-edge/{uuid}`, `POST /entity-node`,
+ * `GET /episodes/{group_id}`, `POST /get-memory`, `POST|DELETE /messages|/episode/{uuid}`, `POST /entity-node`,
+ * `POST /clear`, `DELETE /group/{group_id}` — the only ways to change a fact edge are to delete it or to nuke the
+ * partition). `invalid_at` and `expired_at` are plain properties on `:RELATES_TO`, so the directed operation is one
+ * statement. It lives here because prose is not one: maclet measured, twice, that a `SUPERSEDE` note leaves the
+ * false fact `still held` beside a correction the extractor stamps with a zero-length validity window, which is a
+ * tombstone of the right answer and strictly worse than silence. Unset means the tool is not registered.
+ */
+const NEO4J_URL_ENV = "PI_MEMORY_NEO4J_URL";
+const NEO4J_AUTH_ENV = "PI_MEMORY_NEO4J_AUTH";
+const CLOSE_TIMEOUT_MS = 10_000;
+const MAX_EXPIRE_IDS = 20;
 /** Retrieval returns `max_facts` whatever the relevance; the door's own default is 10 and asking harder changes nothing. */
 const DEFAULT_MAX_FACTS = 10;
 const MAX_FACTS_CAP = 20;
 
 type Config = { url: string; agent: string };
+
+/** Neo4j HTTP endpoint plus credentials; both must be present or expire is not offered. */
+export function resolveNeo4j(env: NodeJS.ProcessEnv = process.env): { url: string; auth: string } | null {
+  const url = (env[NEO4J_URL_ENV] ?? "").trim().replace(/\/+$/, "");
+  const auth = (env[NEO4J_AUTH_ENV] ?? "").trim();
+  if (!url || !auth || !/^https?:\/\//.test(url) || !auth.includes(":")) return null;
+  return { url, auth };
+}
 
 /**
  * The door is configured by exactly one variable. Unset means the extension registers nothing at all: a pod that
@@ -168,6 +193,18 @@ const EMPTY_HINT =
   "so a note written in the last few minutes may still be in the queue (check with memory_recall again shortly, or ask a human to run the episodes door). " +
   "Say that this memory door found nothing, not that the fact does not exist.";
 
+/** The statement that closes a fact's window, kept pure and named so a test can read what it writes. */
+export function expireStatement(ids: string[], group: string, when: string, reason: string): { statement: string; parameters: Record<string, unknown> } {
+  return {
+    // Only edges in the named group, and only ones still open: an id from another partition matches nothing here
+    // rather than quietly closing somebody else's fact.
+    statement: "MATCH ()-[e:RELATES_TO]->() WHERE e.uuid IN $ids AND e.group_id = $group AND e.invalid_at IS NULL "
+      + "SET e.invalid_at = datetime($when), e.expired_at = datetime($when), e.superseded_by = $reason "
+      + "RETURN count(e) AS closed, collect(e.uuid) AS closed_ids",
+    parameters: { ids, group, when, reason },
+  };
+}
+
 /** `fact (valid <valid_at>, invalid <invalid_at>)` — home-ops' contract, so staleness is visible rather than swallowed. */
 export function formatFacts(body: unknown): { hits: number; text: string } {
   const facts = Array.isArray((body as Record<string, unknown>)?.facts)
@@ -180,7 +217,10 @@ export function formatFacts(body: unknown): { hits: number; text: string } {
     const invalid = f?.invalid_at ? `, invalid ${String(f.invalid_at)}` : ", still held";
     const expired = f?.expired_at ? " [expired]" : "";
     const group = f?.group_id ? ` · ${String(f.group_id)}` : "";
-    return `${index + 1}. ${fact} (valid ${valid}${invalid})${expired}${group}`;
+    // The id is printed because it is the address: without it a recalled-but-wrong fact cannot be closed by the
+    // agent that found it, which is the whole reason the fleet has been propagating retractions by prose.
+    const id = f?.uuid ? ` · id ${String(f.uuid)}` : "";
+    return `${index + 1}. ${fact} (valid ${valid}${invalid})${expired}${group}${id}`;
   });
   return { hits: facts.length, text: lines.join("\n") };
 }
@@ -196,6 +236,29 @@ export default function activate(api: ExtensionAPI): void {
   const cfg = resolveConfig();
   if (!cfg) return;
   const client = new Graphiti(cfg);
+  const neo4j = resolveNeo4j();
+
+  /** Close the window on the named fact edges. Returns how many actually moved, which is the only honest report. */
+  async function expireFacts(ids: string[], group: string, reason: string): Promise<{ closed: number; closedIds: string[]; ms: number }> {
+    const when = new Date().toISOString();
+    const started = Date.now();
+    const response = await fetch(`${neo4j!.url}/db/neo4j/tx/commit`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Basic ${Buffer.from(neo4j!.auth).toString("base64")}`,
+      },
+      body: JSON.stringify({ statements: [expireStatement(ids, group, when, reason)] }),
+      signal: AbortSignal.timeout(CLOSE_TIMEOUT_MS),
+    });
+    const body = (await response.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!response.ok) throw new Error(`HTTP ${response.status} from neo4j`);
+    const errors = (body?.errors ?? []) as Array<{ code?: string; message?: string }>;
+    if (errors.length) throw new Error(`${errors[0]?.code ?? "neo4j"}: ${errors[0]?.message ?? "no message"}`);
+    const results = (body?.results ?? []) as Array<{ data?: Array<{ row?: unknown[] }> }>;
+    const row = results[0]?.data?.[0]?.row as [number, string[]] | undefined;
+    return { closed: Number(row?.[0] ?? 0), closedIds: (row?.[1] ?? []) as string[], ms: Date.now() - started };
+  }
 
   api.registerTool({
     name: "memory_remember",
@@ -209,7 +272,12 @@ export default function activate(api: ExtensionAPI): void {
       // the pointer were the parts that were dropped. Extraction distils; it does not summarise on purpose.
       "One fact per note, stated as the sentence you would want back: extraction distils a paragraph into one or two facts and drops the rest, so the load-bearing clause goes first and the evidence goes in a commit, file or message id the note names.",
       "Record who decided and what it supersedes: 'X chose A over B because C, supersedes the note of DATE' survives extraction as an attributable, datable claim, where 'we discussed and it seems better' does not.",
-      "To reverse something already recorded, write the retraction as its own note naming the claim — that closes the old fact's window and marks it [expired]. A contradicted fact that was never written down stays open forever, so say the old thing out loud when you un-say it.",
+      // Measured 2026-11-26 (maclet, group maclet, twice): a `SUPERSEDE (invalidated as of …)` note did not close the
+      // fact it retracted. The false fact stayed `still held`, and the correction came out of the extractor with
+      // valid_at == invalid_at — a zero-length window, i.e. a tombstone of the right answer. Contradiction does not
+      // invalidate, and a negation-shaped sentence re-seeds the myth as a new live fact.
+      "To reverse something already recorded, expire it by id with memory_expire; prose that negates it does not close it and often re-seeds it. If memory_expire is not offered in this pod, name the retracted claim exactly, say it is dead, and ask a human to close the edge.",
+      "State what is true now rather than what is no longer true: 'nullfs is entitlement-gated and returns EPERM' survives extraction as a fact, 'nullfs does NOT fail for a missing module' survives as a negation that keeps the dead theory in circulation.",
     ],
     parameters: Type.Object({
       text: Type.String({ description: `What to remember (${MAX_TEXT_CHARS} characters max). Credential-shaped text is redacted before it is sent.` }),
@@ -273,6 +341,7 @@ export default function activate(api: ExtensionAPI): void {
     promptGuidelines: [
       "Recall before you re-derive: if the answer could already be recorded, ask memory_recall first — it costs about half a second.",
       "A fact is something somebody believed at a time. Quote its valid/invalid window when the timing matters, and treat a fact marked [expired] as history rather than instruction.",
+      "Every line ends with `id <uuid>`: that is the handle memory_expire takes, so a recalled-but-wrong fact is fixable in the same turn you found it. Quote the id when you report one you are about to retract.",
       // Measured 2026-11-24: three consecutive recall calls returned 8-10 confident facts, none of them about the
       // thing asked. The graph fills the quota; relevance is the reader's job.
       "A full-looking answer can be about something else: the graph returns up to maxFacts whether or not they match, so discard what does not address the question and say so rather than paraphrasing a near-miss.",
@@ -313,6 +382,63 @@ export default function activate(api: ExtensionAPI): void {
       }
     },
   });
+
+  // Registered only when the pod has been given Neo4j write access, for the same reason the other doors are: an
+  // unconfigured tool that always fails is worse than no tool, and this one cannot fall back to prose.
+  if (neo4j) {
+    api.registerTool({
+      name: "memory_expire",
+      label: "memory_expire",
+      description: `Close the validity window on fact(s) this group has recorded, by the id memory_recall prints. Use it when a recorded claim is wrong or has stopped being true: writing a contradicting note does NOT expire the old one.`,
+      promptSnippet: "Expire a recorded fact by id instead of leaving a contradiction in the graph",
+      promptGuidelines: [
+        "Expire, do not negate: a wrong fact stays `still held` until its window is closed, and a note that contradicts it just adds a second live claim.",
+        "Take the id from memory_recall's `id <uuid>` suffix. Ids from another group close nothing here, so name the group only when you are deliberately closing that partition's fact.",
+        "Expire is not delete: the fact stays in the graph as history with a closed window, so the record of what was believed and when it was dropped survives.",
+      ],
+      parameters: Type.Object({
+        ids: Type.Array(Type.String(), { description: `Fact edge uuids to close (${MAX_EXPIRE_IDS} max), exactly as memory_recall prints them` }),
+        group: Type.String({ description: `Group the facts belong to (default: ${cfg.agent}). A wrong group matches nothing rather than touching another partition.` }),
+        reason: Type.String({ description: "One line on what replaced it — stored on the edge as superseded_by so a later reader can see why the window closed" }),
+      }),
+      annotations: { readOnlyHint: false, idempotentHint: true },
+
+      async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+        const ids = (Array.isArray(params.ids) ? params.ids : [])
+          .map((id) => String(id ?? "").trim())
+          .filter(Boolean)
+          .slice(0, MAX_EXPIRE_IDS);
+        if (!ids.length) {
+          return { content: [{ type: "text", text: "memory_expire needs ids from memory_recall's `id <uuid>` suffix. Nothing was closed." }], details: { error: "no ids" } };
+        }
+        const group = resolveGroup(cfg, params.group);
+        const reason = String(params.reason ?? "").replace(/\s+/g, " ").trim() || "expired by its writer";
+        const started = Date.now();
+        try {
+          const result = await expireFacts(ids, group, reason);
+          const missed = ids.length - result.closed;
+          const lines = [
+            result.closed
+              ? `Closed the window on ${result.closed} fact(s) in group "${group}" (${result.ms} ms). They stay in the graph as history, marked expired.`
+              : `Closed nothing. ${ids.length} id(s) matched no open fact in group "${group}" — wrong group, already closed, or not a fact edge.`,
+          ];
+          if (missed > 0 && result.closed > 0) lines.push(`  ${missed} of ${ids.length} id(s) matched nothing open in that group.`);
+          lines.push("Write the corrected fact with memory_remember after this; expiry alone leaves the slot empty.");
+          return {
+            content: [{ type: "text", text: lines.join("\n") }],
+            details: { group, closed: result.closed, requested: ids.length, ids: result.closedIds, reason, ms: Date.now() - started },
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return {
+            content: [{ type: "text", text: `memory_expire could not close these facts (${message}). The old claims are still held; retry or ask a human to run the close.`,
+            }],
+            details: { error: message, group, requested: ids.length, ms: Date.now() - started },
+          };
+        }
+      },
+    });
+  }
 
   api.registerCommand("graphiti", {
     description: "Where this agent's memory goes: Graphiti URL, group, health, and what the service says it holds for this agent",
