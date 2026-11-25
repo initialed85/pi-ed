@@ -205,6 +205,11 @@ export default function activate(api: ExtensionAPI): void {
     promptGuidelines: [
       "Remember the settled thing, not the exchange: a decision, a measured number, an incident cause, a blocker. Ask memory_recall before repeating yourself.",
       "Writes are cheap here (the call returns in well under a second), so err toward recording — but one note per fact, and never invent a group name: the group is this agent's name.",
+      // Measured 2026-11-24: a six-paragraph note came back out of the graph as one sentence, and the caveat and
+      // the pointer were the parts that were dropped. Extraction distils; it does not summarise on purpose.
+      "One fact per note, stated as the sentence you would want back: extraction distils a paragraph into one or two facts and drops the rest, so the load-bearing clause goes first and the evidence goes in a commit, file or message id the note names.",
+      "Record who decided and what it supersedes: 'X chose A over B because C, supersedes the note of DATE' survives extraction as an attributable, datable claim, where 'we discussed and it seems better' does not.",
+      "To reverse something already recorded, write the retraction as its own note naming the claim — that closes the old fact's window and marks it [expired]. A contradicted fact that was never written down stays open forever, so say the old thing out loud when you un-say it.",
     ],
     parameters: Type.Object({
       text: Type.String({ description: `What to remember (${MAX_TEXT_CHARS} characters max). Credential-shaped text is redacted before it is sent.` }),
@@ -268,6 +273,10 @@ export default function activate(api: ExtensionAPI): void {
     promptGuidelines: [
       "Recall before you re-derive: if the answer could already be recorded, ask memory_recall first — it costs about half a second.",
       "A fact is something somebody believed at a time. Quote its valid/invalid window when the timing matters, and treat a fact marked [expired] as history rather than instruction.",
+      // Measured 2026-11-24: three consecutive recall calls returned 8-10 confident facts, none of them about the
+      // thing asked. The graph fills the quota; relevance is the reader's job.
+      "A full-looking answer can be about something else: the graph returns up to maxFacts whether or not they match, so discard what does not address the question and say so rather than paraphrasing a near-miss.",
+      "An empty or off-target recall is not evidence it was never recorded. Default scope is this agent's group, so retry with fleetWide before concluding absence — and note that a fresh write is not recallable for minutes, because extraction is asynchronous.",
     ],
     parameters: Type.Object({
       query: Type.String({ description: "What to ask the graph" }),
