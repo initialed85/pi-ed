@@ -479,8 +479,42 @@ describe("idle compaction", () => {
     expect(text).toContain("urgent 20s at 80%");
     expect(text).toContain("deadline 120s");
     expect(text).toContain("cooldown 600s");
-    expect(text).toContain("plan pinned in the summary: yes");
     expect(text).toContain(".pi/idle-compaction/log.jsonl");
+    // The live run this extension first reached printed `plan pinned in the summary: yes` for a session that had no
+    // plan file, one line above its own decision log recording `pinnedPlanChars: 0`.
+    expect(text).toContain("plan pinned in the summary: on, but nothing to pin - this session has no plan file");
+  });
+
+  it("names the plan it would actually pin, in the file it came from", async () => {
+    const h = await setup();
+    mkdirSync(path.join(h.cwd, ".pi", "plan"), { recursive: true });
+    writeFileSync(
+      path.join(h.cwd, ".pi", "plan", `${ID}.json`),
+      JSON.stringify(
+        {
+          v: 1,
+          session_id: ID,
+          goal: "Ship the idle compaction path",
+          todos: [{ id: "t1", text: "Arm compaction on the quiet window", state: "in_progress", at: "2026-11-26T01:00:00.000Z" }],
+          updated_at: "2026-11-26T01:00:00.000Z",
+        },
+        null,
+        2,
+      ),
+    );
+    const text = await status(h);
+    expect(text).toMatch(/plan pinned in the summary: yes, \d+ chars from \.pi\/plan\/.+\.json/);
+    expect(text).toContain(ID);
+  });
+
+  it("says a context is not measured yet rather than printing a question mark", async () => {
+    // Right after a compaction Pi reports no usage at all: it re-measures on the next turn. Asked in that window the
+    // live readout said `context ? of 131072 (?%)`, which reads like a broken extension instead of an answer.
+    const h = await setup({ contextUsage: { percent: null, tokens: null, contextWindow: 131072 } });
+    const text = await status(h);
+    expect(text).toContain("context usage not measured yet");
+    expect(text).not.toContain("?");
+    expect(text).toContain("floor 40%");
   });
 
   it("runs on command when a person asks, and refuses when the arithmetic says no", async () => {

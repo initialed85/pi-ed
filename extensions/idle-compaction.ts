@@ -806,15 +806,32 @@ export default function (pi: ExtensionAPI) {
       const usage = usageOf(ctx);
       const cfg = state.cfg;
       const s = state.stats;
-      const tokens = usage?.tokens;
-      const percent = usage?.percent;
+      const planBlock = pinnedPlan(ctx);
+      /*
+       * Two lines this readout used to get wrong, both caught in a live run rather than in a test.
+       *
+       * Pi has no measurement for `getContextUsage()` right after a compaction - it re-measures on the next turn -
+       * and the readout printed `context ? of 131072 (?%)`, which looks like a broken extension rather than an
+       * answer of "not measured yet". And the plan line said `yes, from .pi/plan/<session-id>.json` for a session
+       * that had no plan file at all, one line above its own decision log recording `pinnedPlanChars: 0`.
+       */
+      const contextLine = !usage
+        ? "context usage unknown: no context window known for this model"
+        : usage.tokens === null || usage.percent === null
+          ? "context usage not measured yet: Pi re-measures on the next turn, which right after a compaction is exactly when it is asked"
+          : `context ${usage.tokens} of ${usage.contextWindow} (${usage.percent.toFixed(1)}%)`;
+      const planLine = !cfg.pinPlan
+        ? "plan pinned in the summary: off"
+        : planBlock
+          ? `plan pinned in the summary: yes, ${planBlock.length} chars from .pi/plan/${ctx.sessionManager.getSessionId()}.json`
+          : "plan pinned in the summary: on, but nothing to pin - this session has no plan file";
       const lines = [
         `${MARK}: ${cfg.enabled && !state.forcedOff ? "on" : "off"}${state.forcedOff ? " (--idle-compaction-off)" : ""}`,
-        `context ${tokens ?? "?"} of ${usage?.contextWindow ?? "?"} (${percent === null || percent === undefined ? "?" : percent.toFixed(1)}%) · floor ${cfg.softPercent}% · quiet ${cfg.quietMs / 1000}s · urgent ${cfg.urgentQuietMs / 1000}s at ${cfg.urgentPercent}% · deadline ${cfg.deadlineMs / 1000}s · cooldown ${Math.round(cfg.cooldownMs / 1000)}s`,
+        `${contextLine} · floor ${cfg.softPercent}% · quiet ${cfg.quietMs / 1000}s · urgent ${cfg.urgentQuietMs / 1000}s at ${cfg.urgentPercent}% · deadline ${cfg.deadlineMs / 1000}s · cooldown ${Math.round(cfg.cooldownMs / 1000)}s`,
         `armed ${s.armed} · not armed ${s.notArmed} · compacted ${s.fired} · skipped ${s.skipped} · failed ${s.failed} · deadline aborts ${s.abortedAtDeadline} · freed ${s.freedTokens} tokens`,
         `last: ${s.lastNote}${s.lastAt ? ` at ${s.lastAt}` : ""}`,
         `stale tool output (${cfg.prune}): ${state.tally.candidates} candidates, about ${state.tally.candidateTokens} tokens reclaimable, ${state.tally.applied} replaced · newest ${cfg.pruneKeepRecentResults} results kept whole, ${cfg.pruneMinChars} char floor`,
-        `plan pinned in the summary: ${cfg.pinPlan ? "yes, from .pi/plan/<session-id>.json" : "no"}`,
+        planLine,
       ];
       if (state.compacting) {
         lines.push(`a compaction started ${Math.round((Date.now() - state.startedAt) / 1000)}s ago; deadline in ${Math.max(0, Math.round((state.startedAt + cfg.deadlineMs - Date.now()) / 1000))}s`);
