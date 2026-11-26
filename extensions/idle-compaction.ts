@@ -81,8 +81,10 @@
  *   `stop`. Every model in this fleet declares no cache lifetime, so warming is inert here today; the rule is
  *   insurance for the day a session runs on a cache-aware provider.
  *
- * Side effects: compactions can happen unasked, at idle, and every decision is logged to
- * `.pi/idle-compaction/log.jsonl`. Delete this file to go back to Pi's behaviour.
+ * Side effects: compactions can happen unasked, at idle. Every compaction decision is logged to
+ * `.pi/idle-compaction/log.jsonl`, and an arm refusal is logged once per reason rather than once per settle, so a
+ * session that never compacts still leaves evidence without filling the log with the same line. Delete this file to go
+ * back to Pi's behaviour.
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -339,6 +341,8 @@ interface State {
   entriesAtCompaction: number | undefined;
   stats: Stats;
   tally: Tally;
+  /** The arm refusal already written to the decision log, so a session that keeps refusing writes one line, not one per settle. */
+  lastLoggedArmReason: string | undefined;
 }
 
 function freshStats(): Stats {
@@ -426,6 +430,7 @@ export default function (pi: ExtensionAPI) {
     entriesAtCompaction: undefined,
     stats: freshStats(),
     tally: freshTally(),
+    lastLoggedArmReason: undefined,
   };
 
   function clearTimer(): void {
@@ -437,6 +442,20 @@ export default function (pi: ExtensionAPI) {
   function clearDeadline(): void {
     if (state.deadline) clearTimeout(state.deadline);
     state.deadline = undefined;
+  }
+
+  /**
+   * An arm refusal goes in the decision log, but only when the reason changes.
+   *
+   * A session that never compacts still has to leave evidence - the live run that first exercised this extension
+   * settled eleven times under the floor and left an empty log, which reads exactly like a broken extension. Logging
+   * every settle would be the other failure: the same line, over and over, pushing the interesting ones out of the
+   * tail the log keeps.
+   */
+  function logArmRefusal(ctx: ExtensionContext, trigger: string, reason: string): void {
+    if (state.lastLoggedArmReason === reason) return;
+    state.lastLoggedArmReason = reason;
+    record(ctx, "skip", { stage: "arm", trigger, reason });
   }
 
   /** Anything that means a turn is happening or about to happen. */
@@ -457,6 +476,7 @@ export default function (pi: ExtensionAPI) {
       state.stats.notArmed += 1;
       state.stats.lastNote = "not armed: a compaction is already in flight";
       debug(ctx, `arm refused (${trigger}): a compaction is already in flight`);
+      logArmRefusal(ctx, trigger, "a compaction is already in flight");
       return;
     }
     // Already armed: keep the window that is already running rather than restarting it.
@@ -466,6 +486,7 @@ export default function (pi: ExtensionAPI) {
       state.stats.notArmed += 1;
       state.stats.lastNote = `not armed: ${blocked}`;
       debug(ctx, `arm refused (${trigger}): ${blocked}`);
+      logArmRefusal(ctx, trigger, blocked);
       return;
     }
     const usage = usageOf(ctx);

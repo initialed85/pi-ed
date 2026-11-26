@@ -504,4 +504,20 @@ describe("idle compaction", () => {
     expect(log).toContain('"kind":"skip"');
     expect(log).toContain('"reason":"the agent is running"');
   });
+
+  it("writes an arm refusal to the log once per reason, not once per settle", async () => {
+    // The live run this extension first reached settled eleven times under the floor and left an empty log, which
+    // reads exactly like a broken extension. Logging every settle would be the other failure.
+    const h = await setup({ contextUsage: { percent: 12, tokens: 16000, contextWindow: 131072 } });
+    for (let i = 0; i < 5; i += 1) {
+      await settle(h);
+      vi.advanceTimersByTime(QUIET_MS);
+    }
+    const log = readFileSync(path.join(h.cwd, ".pi", "idle-compaction", "log.jsonl"), "utf8");
+    const lines = log.split("\n").filter(Boolean);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('"stage":"arm"');
+    expect(lines[0]).toContain("under the 40% floor");
+    expect(h.compacts).toHaveLength(0);
+  });
 });

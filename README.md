@@ -180,7 +180,7 @@ running it: the five-minute figure is measured, the improvement is arithmetic.
 | Flags | `--idle-compaction-off` |
 | Config | `.pi/idle-compaction.json`, with `IDLE_COMPACTION_*` overrides |
 | Knobs | `quietMs` (120000) · `startupQuietMs` (30000) · `urgentPercent` (80) / `urgentQuietMs` (20000) · `softPercent` (40) · `minFreeTokens` (20000) / `keptFloorTokens` (24000, Pi's 20000 keep-recent plus the measured 2565-token median summary) · `deadlineMs` (120000) · `cooldownMs` (600000) · `prune` (`report`) · `pruneKeepRecentResults` (12) · `pruneMinChars` (2000) |
-| Evidence | `.pi/idle-compaction/log.jsonl`, one JSON line per decision including the ones where it chose to do nothing |
+| Evidence | `.pi/idle-compaction/log.jsonl`, one JSON line per compaction decision, plus an arm refusal written once per reason (a session that never compacts still leaves evidence, and the same line is not repeated on every settle) |
 
 ### `plan.ts` — `/goal`, `/direction` and `/todo`: the aim, the route to it, and the steps
 
