@@ -10,6 +10,9 @@ coverage/
 # The idle-compaction decision log (`.pi/idle-compaction/log.jsonl`): one line per compaction decision, including the
 # decisions to do nothing. It is evidence about a session, not a repository artifact, and it grows on every idle run.
 .pi/idle-compaction/
+# Background job state written by extensions/background.ts (`.pi/background/<session-id>/`): a job belongs to the
+# session that started it, and its output log is runtime evidence, not something to commit.
+.pi/background/
 
 # Pi session artifacts: uploads and images the agent was shown. They belong to the session, not
 # to the repository, and `git add -A` will otherwise commit a screenshot of someone’s screen into a public repo -

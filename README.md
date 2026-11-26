@@ -169,10 +169,25 @@ While a compaction is in flight it answers `cache_warming_decision` with `stop`,
 a warm prefix alive that the compaction is about to throw away. Every model in this fleet declares no cache lifetime,
 so that is insurance rather than a saving today.
 
-Tested at the contract boundary rather than inside Pi's loop: 30 cases over fake timers with the shipped defaults
+Tested at the contract boundary rather than inside Pi's loop: 31 cases over fake timers with the shipped defaults
 (arm, cancel, re-check on fire, cooldown, deadline, the plan pin, the prune protections), plus a contract test that
-fails if the scheduler's marker and the guard's marker stop agreeing. What has *not* been done yet is a live pod
-running it: the five-minute figure is measured, the improvement is arithmetic.
+fails if the scheduler's marker and the guard's marker stop agreeing.
+
+It has now run for real. A scratch checkout under `pi --mode rpc` on pi 1.6.1 with this extension and the guard loaded,
+against strata: the run settled at **96791 context tokens (73.8% of a 131072 window)**, the window armed **exactly
+120 s after `agent_settled`**, the compaction wrote **one summary of 3801 characters in 55.2 s**, and the context went
+from 96791 tokens to **6706** — **90085 tokens freed**, one `compaction` entry in the session file, and the 120 s
+deadline never approached. The prune pass reported 4 stale results, about 50875 tokens, and replaced nothing, because
+`report` is the default. `/idle-compact status` reported all of it over RPC as it happened, and the decision log holds
+one line per decision: the arm refusal at session start, the prune report, the compaction, the result.
+
+Two things that measurement settled. First, a single-attempt summarisation of a ~97k-token context on this fleet's
+local backend costs about a minute, so the 120 s deadline is comfortable at this size and the ladder Pi's own guard
+would run is the difference between 55 s and the 100–400 s spread in the table above. Second, no `session_before_compact`
+guard is needed here and there is none: in 1.6.1 `compact()` sets `_compactionAbortController`, `prompt()` refuses
+while a compaction is in flight, and `_checkCompaction()` only runs at turn boundaries — so an automatic compaction
+cannot race an idle one. What a Pi-started compaction does get is the same cooldown, because `session_compact` records
+it: a human `/compact` during an armed window is not followed by a second compaction two minutes later.
 
 | | |
 | --- | --- |
