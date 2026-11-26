@@ -172,9 +172,29 @@ not from the start on purpose: a 107 s attempt would eat a 90 s start-to-start g
 back-to-back. The cost of that is stated rather than hidden — an attempt that dies at its 240 s deadline paces the
 fleet for another 90 s after it fails, so the worst case is about 330 s in which nobody summarises, which is the right
 failure posture when the thing that just failed was a summarisation. The stamp now says `who`, `when` and `why`
-(`compacted`, `aborted at deadline`, `error`, `could not start`, `session shutdown`) and keeps the last 12 of them in
-`prior`, because on 2026-11-26 three agents reconstructed "who claimed when" from four pods' logs and the newest stamp
-alone could not show the pair. The gate is cooperative, and that is its one limit: a pod defers only to peers that
+(`compacted`, `aborted at deadline`, `error`, `could not start`, `Pi threshold completion`, `Pi overflow completion`,
+`Pi manual completion`, `Pi threshold aborted`, `Pi hold expired`, `session shutdown`) and keeps the last 12 of them
+in `prior`, because on 2026-11-26 three agents reconstructed "who claimed when" from four pods' logs and the newest
+stamp alone could not show the pair.
+
+**Pi's own compaction path is gated as a hold, not a refusal.** Of the 21 summarisations this volume completed on
+2026-11-26, **12 arrived through `trigger:"pi:threshold"`** at 114803–119360 tokens — the biggest jobs the fleet runs
+— and none of them left a lease or a stamp, so a gated idle attempt beside them queued for nobody and starved. Pi
+fires that path at 87.5% of the window, and again on overflow, where Pi will summarise *any* session that reached
+131072 input tokens no matter how short the history is. Cancelling it is available from `session_before_compact` and
+is deliberately never used: a session that has already spent its window pays for a refused summarisation at the next
+prompt, and every measured harm here came from starved attempts, never from a summarisation that was refused. So
+`session_before_compact` takes the lease on Pi's behalf, renews it while the summarisation is in flight (Pi's path has
+no `deadlineMs`, and the fleet has never measured one — all 12 came back with no duration because the builds that ran
+them stamped no start), and `session_compact` or `session_compact_failed` hands it back naming which path ran. Idle
+attempts on other pods queue behind it. On the session being compacted the idle attempt stands aside outright — turn
+ends, Pi schedules a summarisation, `agent_settled` arms a quiet timer that fires 120 s later — because calling
+`compact()` behind Pi would log a `compact` line for a summarisation that never appears; `session_compact`,
+`session_compact_failed` and the hold's renewal bound all clear the stand-aside, so it cannot outlive the thing it is
+waiting for. What still cannot be prevented is an attempt already in flight when Pi's path
+fires; that collision is logged as `Pi compacting while the gate is held elsewhere` rather than smoothed over.
+
+The gate is cooperative, and that is its other limit: a pod defers only to peers that
 claim the lease, so a pod running a build without the gate is invisible. Field proof: at 21:08:59Z home-ops, still on
 `ce1e789`, started a 71940-token summarisation 74 s into pi-bot's held lease and died at its own 120 s ceiling. A
 partial rollout protects nobody, which is the argument for moving every pod at once. A lease carries its holder's
@@ -193,9 +213,15 @@ so that is insurance rather than a saving today.
 
 Tested at the contract boundary rather than inside Pi's loop: 42 cases over fake timers with the shipped defaults
 (arm, cancel, re-check on fire, cooldown, deadline, the plan pin, the prune protections), plus a contract test that
-fails if the scheduler's marker and the guard's marker stop agreeing, plus 7 cases for the gate — the nine-sessions
+fails if the scheduler's marker and the guard's marker stop agreeing, plus 14 cases for the gate — the nine-sessions
 -in-one-second layout, one-in-flight, a stale lease taken over, a person asking now not queued, a returning person
-cancelling the wait, a shutdown releasing the lease, and the ungated mode.
+cancelling the wait, a shutdown releasing the lease and recording itself, the ceiling's own spacing stamp, the queue
+cap, Pi's threshold path held and handed back with the path named, that hold renewed past its own expiry, that hold
+released when the summarisation never reports back, a Pi-path compaction that dies releasing the fleet early, a
+recorded collision when Pi forces a summarisation while a peer holds, and the ungated mode — plus three for the
+eligibility bars themselves: a session over its declared window compacting inside its own cooldown (logged
+`overWindow`), the percent bar being unable to refuse what the token bars cleared, and an idle attempt standing aside
+while Pi compacts that same session.
 
 **The field result that changed the defaults.** A deploy stamp restarted every pod in the fleet inside the same
 second, so every session's quiet window opened at the same instant, and nine of them issued a summarisation request
@@ -236,6 +262,25 @@ automatic compaction cannot race an idle one. What a Pi-started compaction does 
 `session_compact` records it: a human `/compact` during an armed window is not followed by a second compaction two
 minutes later.
 
+**Starting at a turn boundary is not finishing at one.** `_checkCompaction()` runs at turn boundaries, but the
+summarisation it starts runs 60–150 s. So "run ends → Pi starts a compaction → `agent_settled` arms → the quiet timer
+fires 120 s later" is a race for the same summarisation after all, and the idle attempt now stands aside whenever
+`session_before_compact` has fired on its own session without reporting back. Without that, the log carries a
+`compact` line for a summarisation that never wrote an entry — the false success pi-bot was told to stop writing on
+2026-11-26, where `home-ops · pi-bot` had the Pi threshold path fire at 21:05:21Z inside a turn the provider had
+already refused, and its own compaction landing on 31480 tokens only to be refilled to 135735 minutes later.
+
+**The window constant is not the window the model ran.** Pi carries a `contextWindow` per alias, and the fleet has two
+measurements showing it is not the number the provider served. `pi-team-room · macker` answered a genuine 186420-token
+prompt (185898 of it `cacheRead`, 457 output, 126 reasoning) under a 131072 constant, which is the 142.23% the status
+line reported — real tokens, wrong denominator, no double-count. And `home-ops · pi-bot` was refused by the provider at
+135735 tokens (103.55%) after refilling from a 31480-token landing 17 minutes earlier, the refusal reading: "This
+endpoint's maximum context length is 131072 tokens. However, you requested about 135838 tokens." Two rules
+follow. The percent bar became advisory — it may arm a session early, which is only waste, but it may not refuse one
+the token bars cleared, because refusing on a wrong denominator skips a legitimate candidate silently. And a session
+at or over its declared window bypasses the cooldown, recording `overWindow` in the log: a cooldown is a brake on
+self-churn, and a refill that outruns it is a session left out of room on purpose.
+
 **What `idle-compact prune` is for, and what it counts.** Compaction needs a model call; dropping stale tool output
 needs an edit entry. Across 305 sessions the transcript is 5.00M characters and **3.40M of it (68%) is tool output**,
 100% of it from `bash`, `read` and `edit`. It is not uniformly reclaimable: 103,297 of 123,377 results are under the
@@ -268,7 +313,7 @@ largest compactions, 116325 and 119360 tokens, had contributed no duration data 
 | Commands | `/idle-compact status` · `on` · `off` · `dry-run` · `run [--force]` · `prune <off\|report\|on>` |
 | Flags | `--idle-compaction-off` |
 | Config | `.pi/idle-compaction.json`, with `IDLE_COMPACTION_*` overrides |
-| Knobs | `quietMs` (120000) · `urgentPercent` (80) / `urgentQuietMs` (20000) · `softPercent` (25, deliberately below where the margin bars bind, so the bar that actually bites at 131072 is 44000 tokens) · `minFreeTokens` (20000) / `keptFloorTokens` (24000, Pi's 20000 keep-recent plus the measured 2565-token median summary) · `deadlineMs` (240000, above the fleet p90 of 226 s) · `cooldownMs` (600000) · `spreadMs` (90000, the gap between fleet compactions) / `gateMaxWaitMs` (5400000, long enough to drain a fleet restarted in one breath: `spreadMs + duration` per session, and durations measured 52.7-151.9 s) · `prune` (`report`) · `pruneKeepRecentResults` (12) · `pruneMinChars` (2000) |
+| Knobs | `quietMs` (120000) · `urgentPercent` (80) / `urgentQuietMs` (20000) · `softPercent` (25, deliberately below where the margin bars bind, so the bar that actually bites at 131072 is 44000 tokens — and **advisory**: percent is computed from whatever `contextWindow` Pi carries for the alias, not the window the model ran, so it may arm a session early but it may not refuse one the token bars cleared) · `minFreeTokens` (20000) / `keptFloorTokens` (24000, Pi's 20000 keep-recent plus the measured 2565-token median summary) · `deadlineMs` (240000, above the fleet p90 of 226 s) · `cooldownMs` (600000, per-session in-memory state: a reload, `/new` or a pod restart erases it, so after a fleet roll the only ordering left is `spreadMs` and the lease — it is a self-churn brake, never a fleet limiter, and **a session at or over its declared window bypasses it**, with `overWindow` recorded in the log so nobody reads it as a missed check) · `spreadMs` (90000, the gap between fleet compactions) / `gateMaxWaitMs` (5400000, long enough to drain a fleet restarted in one breath: `spreadMs + duration` per session, and durations measured 52.7-151.9 s) · `prune` (`report`) · `pruneKeepRecentResults` (12) · `pruneMinChars` (2000) |
 | Gate | `/workspace/.pi/idle-compaction/{lease.json,spacing.json}` — derived from the parent of the checkout, overridable with `IDLE_COMPACTION_GATE_DIR`, disabled with `IDLE_COMPACTION_GATE=off` |
 | Evidence | `.pi/idle-compaction/log.jsonl`, one JSON line per compaction decision, plus an arm refusal written once per reason (a session that never compacts still leaves evidence, and the same line is not repeated on every settle), and a `gate` line for every wait, takeover and forced run |
 

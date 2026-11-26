@@ -24,8 +24,16 @@
  * because their turn ran continuously the whole time. The tool path inherits the same property: it asks on the next
  * settle, and if the agent is mid-turn that settle is however far away the work is. In the common case that calls for
  * it (`pi update --extensions` from bash inside a long turn), tens of minutes between the update and the reload is
- * Pi behaving correctly, not a dispatch that failed. Read a field report against this before concluding the dispatch
- * is broken: the marker that it worked is a `session_shutdown reason=reload` line, not the elapsed time since the ask.
+ * Pi behaving correctly, not a dispatch that failed.
+ *
+ * **What proves it in this fleet's logs.** Builds up to `403cae1` wrote no `session_shutdown` line anywhere - the
+ * marker this file used to point at existed only in a probe's own output, and slopyphus checked all three reload-
+ * armed sessions on their pod and found none. From this commit `idle-compaction.ts` records
+ * `kind:"session-shutdown"` with its `reason`, so a reload is visible at the end of the old session as well as at
+ * the start of the new one. Until every pod is running that build, the observable is the pair slopyphus captured on
+ * 2026-11-27: a `kind:"prune-report"` at the new session start followed by `kind:"compact" trigger:"session_start:
+ * reload"`, with no reload command typed in between (22:03:35Z and 22:05:42Z, nothing typed since 21:39:38Z).
+ * Elapsed time since the ask proves nothing either way.
  */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";

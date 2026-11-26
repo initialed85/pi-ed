@@ -94,6 +94,14 @@ async function setup(
   return { pi, cwd, context: record.context, ui: record.ui, compacts: record.compacts, calls: record.calls };
 }
 
+/** The decision log this session wrote, parsed. Needed by the tests that assert *why* an attempt was refused. */
+function logOf(h: Harness): any[] {
+  return readFileSync(path.join(h.cwd, ".pi", "idle-compaction", "log.jsonl"), "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
 /** A settled run: the turn ends, and the quiet window is what happens next. */
 async function settle(h: Harness, options: { aborted?: boolean } = {}): Promise<void> {
   await h.pi.emit("turn_start", { type: "turn_start", turnIndex: 1 }, h.context);
@@ -381,6 +389,112 @@ describe("idle compaction", () => {
     vi.advanceTimersByTime(QUIET_MS);
     expect(h.compacts).toHaveLength(0);
     expect(await status(h)).toMatch(/cooldown:|nothing new since the last compaction/);
+  });
+
+  it("compacts a session that is over its window even when the cooldown says no", async () => {
+    // pi-bot on 2026-11-26: compacted to 31480 at 21:49, back to 135735 tokens (103.55%) 17 minutes later, and the
+    // answer Ed got was a provider 400 - "This endpoint's maximum context length is 131072 tokens. However, you
+    // requested about 135838 tokens." A long peer turn refills a window faster than a 10 minute cooldown protects
+    // it, and a cooldown is a brake on self-churn, not a reason to leave a session out of room.
+    const branch = [{ type: "message", id: "e1", message: { role: "user", content: "back to work" } }];
+    const h = await setup({
+      contextUsage: { percent: 103.55, tokens: 135735, contextWindow: 131072 },
+      branch,
+    });
+    await h.pi.emit(
+      "session_compact",
+      { type: "session_compact", compactionEntry: { type: "compaction", summary: "pi wrote this one", tokensBefore: 115693 }, reason: "threshold" },
+      h.context,
+    );
+    // Seven minutes of a peer's turn: inside the 600 s cooldown. (pi-bot's refill took 17 minutes, which is past
+    // the cooldown entirely - the fragile window is the one inside it, and that is the one this asserts on.)
+    branch.push({ type: "message", id: "e2", message: { role: "assistant", content: "x".repeat(400) } });
+    vi.advanceTimersByTime(7 * 60 * 1000);
+    await settle(h);
+    vi.advanceTimersByTime(QUIET_MS);
+    expect(h.compacts).toHaveLength(1);
+
+    // And it says so in the log, so a reader does not have to conclude the cooldown was missed.
+    const attempt = logOf(h).find((entry) => entry.kind === "compact");
+    expect(attempt.overWindow).toBe(true);
+    expect(attempt.tokens).toBe(135735);
+
+    // The mirror, so this is a rule and not a free pass: the same shape under its window is still refused.
+    const underBranch = [{ type: "message", id: "u1", message: { role: "user", content: "still busy" } }];
+    const under = await setup({
+      sessionId: "under-window",
+      contextUsage: { percent: 92, tokens: 120000, contextWindow: 131072 },
+      branch: underBranch,
+    });
+    await under.pi.emit(
+      "session_compact",
+      { type: "session_compact", compactionEntry: { type: "compaction", summary: "pi wrote this one", tokensBefore: 110000 }, reason: "threshold" },
+      under.context,
+    );
+    underBranch.push({ type: "message", id: "u2", message: { role: "assistant", content: "more work" } });
+    vi.advanceTimersByTime(60 * 1000);
+    await settle(under);
+    vi.advanceTimersByTime(QUIET_MS);
+    expect(under.compacts).toHaveLength(0);
+    expect(logOf(under).some((entry) => entry.kind === "skip" && String(entry.reason).includes("cooldown"))).toBe(true);
+  });
+
+  it("lets the token bars decide when the percent bar disagrees with them", async () => {
+    // Pi carries a `contextWindow` per alias and it is not always the window the model ran: pi-team-room answered a
+    // genuine 186420-token prompt (185898 of it cacheRead) under a 131072 constant, i.e. 142.23% of too small a
+    // number. Percent may arm a session too eagerly, which is only waste; refusing one the token bars cleared is
+    // the direction where a legitimate candidate is skipped and never learns it was skipped.
+    process.env.IDLE_COMPACTION_SOFT_PERCENT = "40";
+    try {
+      // 34.33% of the declared window, and 45000 - 24000 = 21000 free: the margin bars clear, so the floor does not.
+      const h = await setup({ contextUsage: { percent: 34.33, tokens: 45000, contextWindow: 131072 } });
+      await settle(h);
+      vi.advanceTimersByTime(QUIET_MS);
+      expect(h.compacts).toHaveLength(1);
+
+      // The floor still means something below the margin bars: 20000 tokens frees about -4000, and the reason a
+      // person sees is still the floor they configured.
+      const small = await setup({
+        sessionId: "under-floor",
+        contextUsage: { percent: 15.25, tokens: 20000, contextWindow: 131072 },
+      });
+      await settle(small);
+      vi.advanceTimersByTime(QUIET_MS);
+      expect(small.compacts).toHaveLength(0);
+      const skip = logOf(small).find((entry) => entry.kind === "skip");
+      expect(skip.reason).toContain("under the 40% floor");
+    } finally {
+      delete process.env.IDLE_COMPACTION_SOFT_PERCENT;
+    }
+  });
+
+  it("stands aside while Pi is compacting this session, and does not stay stood aside", async () => {
+    // "Turn ends - Pi schedules an auto-compaction - agent_settled arms - the quiet timer fires 120 s later" is a
+    // race for the same summarisation. Calling compact() behind Pi's own would log a `compact` line for a
+    // summarisation that never appears, which is the false success this fleet has already been burned by.
+    const h = await setup();
+    await h.pi.emit(
+      "session_before_compact",
+      { type: "session_before_compact", preparation: {}, branchEntries: [], reason: "threshold", willRetry: false },
+      h.context,
+    );
+    await settle(h);
+    vi.advanceTimersByTime(QUIET_MS);
+    expect(h.compacts).toHaveLength(0);
+    expect(logOf(h).some((entry) => entry.kind === "skip" && String(entry.reason).includes("stands aside"))).toBe(true);
+
+    // Pi's compaction dies without ever having held the gate here. If the stand-aside were tied to the hold it
+    // would never clear, and the session would refuse to compact for the rest of its life.
+    await h.pi.emit(
+      "session_compact_failed",
+      { type: "session_compact_failed", reason: "threshold", aborted: false, errorMessage: "provider said no" },
+      h.context,
+    );
+    await settle(h);
+    vi.advanceTimersByTime(QUIET_MS);
+    expect(h.compacts).toHaveLength(1);
+    const attempt = logOf(h).find((entry) => entry.kind === "compact");
+    expect(attempt).toBeDefined();
   });
 
   it("counts reclaimable stale tool output without touching the context, which is the shipped default", async () => {

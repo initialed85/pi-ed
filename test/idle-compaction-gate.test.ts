@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -312,6 +312,13 @@ describe("the fleet gate", () => {
     await holder.pi.emit("session_shutdown", { type: "session_shutdown", reason: "quit" }, holder.context);
     expect(() => readFileSync(path.join(gateDir, "lease.json"), "utf8")).toThrow();
 
+    // Recorded in the log, not only debugged. A reload is otherwise invisible in a pod's own log: the line people
+    // look for is the next session's `trigger:"session_start:reload"`, and that only proves a reload happened if
+    // this one is there to show where the previous session ended.
+    const shutdown = log(holder.cwd).find((entry) => entry.kind === "session-shutdown");
+    expect(shutdown?.reason).toBe("quit");
+    expect(shutdown?.gate).toBe("session shutdown");
+
     const next = await pod("camry");
     vi.advanceTimersByTime(QUIET_MS);
     expect(next.compacts).toHaveLength(1);
@@ -349,6 +356,194 @@ describe("the fleet gate", () => {
     } finally {
       delete process.env.IDLE_COMPACTION_GATE_MAX_WAIT_MS;
     }
+  });
+
+  it("gates a summarisation Pi started itself, which is most of what this fleet compacts", async () => {
+    // Counting every `log.jsonl` on the volume on 2026-11-26: 21 completed summarisations, 12 of them
+    // `trigger:"pi:threshold"` at 114803-119360 tokens, and not one of those 12 left a lease or a spacing stamp.
+    // The gate cannot refuse that path - a session at 87.5% of its window that skips a summarisation pays for it at
+    // the next prompt - so it holds the lease on the path's behalf and peers queue behind it.
+    const busy = await pod("home-ops");
+    // Something is running on home-ops: its idle window is closed, so the only summarisation it does is Pi's.
+    await busy.pi.emit("turn_start", { type: "turn_start", turnIndex: 1 }, busy.context);
+    const waiter = await pod("camry");
+
+    await busy.pi.emit(
+      "session_before_compact",
+      { type: "session_before_compact", preparation: {}, branchEntries: [], reason: "threshold", willRetry: false },
+      busy.context,
+    );
+    expect(JSON.parse(readFileSync(path.join(gateDir, "lease.json"), "utf8")).repo).toBe("home-ops");
+
+    // An idle attempt on another pod now queues behind a summarisation it has no visibility into, instead of
+    // starting beside it - which is the contention the fleet's deadline aborts were actually read as.
+    vi.advanceTimersByTime(QUIET_MS);
+    expect(waiter.compacts).toHaveLength(0);
+    expect(
+      log(waiter.cwd).some((entry) => entry.kind === "gate" && String(entry.heldBy ?? "").includes("home-ops")),
+    ).toBe(true);
+
+    await busy.pi.emit(
+      "session_compact",
+      {
+        type: "session_compact",
+        reason: "threshold",
+        compactionEntry: { id: "c1", tokensBefore: 115412, summary: "pi wrote this one" },
+      },
+      busy.context,
+    );
+    expect(existsSync(path.join(gateDir, "lease.json"))).toBe(false);
+
+    // The spacing stamp says *which* path ran, so a reader of the shared directory can tell a gated idle completion
+    // from a Pi threshold completion without reading two pods' logs.
+    const spacing = JSON.parse(readFileSync(path.join(gateDir, "spacing.json"), "utf8"));
+    expect(spacing.repo).toBe("home-ops");
+    expect(spacing.outcome).toBe("Pi threshold completion");
+
+    vi.advanceTimersByTime(SPREAD_MS + POLL_MS * 4);
+    expect(waiter.compacts).toHaveLength(1);
+  });
+
+  it("renews a Pi-path hold so a long summarisation cannot expire the gate out from under itself", async () => {
+    // Pi's own path has no `deadlineMs`: that ceiling bounds the attempts this extension starts. And the fleet has
+    // never measured a threshold summarisation's duration, because the builds that ran them stamped no start - all
+    // 12 came back with no `ms` at all. So the hold is pushed forward while the compaction is in flight, and a pod
+    // that dies simply stops renewing.
+    const busy = await pod("home-ops");
+    await busy.pi.emit("turn_start", { type: "turn_start", turnIndex: 1 }, busy.context);
+    const waiter = await pod("camry");
+    await busy.pi.emit(
+      "session_before_compact",
+      { type: "session_before_compact", preparation: {}, branchEntries: [], reason: "threshold", willRetry: false },
+      busy.context,
+    );
+    const held = JSON.parse(readFileSync(path.join(gateDir, "lease.json"), "utf8"));
+    expect(held.expiresAt - held.startedAt).toBe(DEADLINE_MS + 30000);
+
+    // Longer than that lease was ever written to live, with no completion event in between.
+    vi.advanceTimersByTime(DEADLINE_MS + 120000);
+    const renewed = JSON.parse(readFileSync(path.join(gateDir, "lease.json"), "utf8"));
+    expect(renewed.startedAt).toBe(held.startedAt); // `heldMs` still measures from when the hold actually began
+    expect(renewed.expiresAt).toBeGreaterThan(held.expiresAt + DEADLINE_MS);
+
+    vi.advanceTimersByTime(QUIET_MS);
+    expect(waiter.compacts).toHaveLength(0);
+
+    await busy.pi.emit(
+      "session_compact",
+      {
+        type: "session_compact",
+        reason: "threshold",
+        compactionEntry: { id: "c1", tokensBefore: 119360, summary: "pi wrote this one" },
+      },
+      busy.context,
+    );
+    expect(existsSync(path.join(gateDir, "lease.json"))).toBe(false);
+
+    vi.advanceTimersByTime(SPREAD_MS + POLL_MS * 4);
+    expect(waiter.compacts).toHaveLength(1);
+  });
+
+  it("does not leave the fleet waiting when Pi's own compaction dies", async () => {
+    // A compaction that never completed must not hold the fleet for a TTL nobody has evidence about: without this
+    // path the wait is 240 s plus grace, which is 270 s of queue that could have run at 90.
+    const busy = await pod("home-ops");
+    await busy.pi.emit("turn_start", { type: "turn_start", turnIndex: 1 }, busy.context);
+    const waiter = await pod("macker");
+    await busy.pi.emit(
+      "session_before_compact",
+      { type: "session_before_compact", preparation: {}, branchEntries: [], reason: "threshold", willRetry: false },
+      busy.context,
+    );
+    expect(existsSync(path.join(gateDir, "lease.json"))).toBe(true);
+
+    await busy.pi.emit(
+      "session_compact_failed",
+      { type: "session_compact_failed", reason: "threshold", aborted: true, willRetry: false },
+      busy.context,
+    );
+    expect(existsSync(path.join(gateDir, "lease.json"))).toBe(false);
+    const spacing = JSON.parse(readFileSync(path.join(gateDir, "spacing.json"), "utf8"));
+    expect(spacing.outcome).toBe("Pi threshold aborted");
+    const released = log(busy.cwd).find(
+      (entry) => entry.kind === "gate" && entry.action === "released after Pi's compaction did not complete",
+    );
+    expect(released?.outcome).toBe("Pi threshold aborted");
+    expect(released?.aborted).toBe(true);
+
+    vi.advanceTimersByTime(SPREAD_MS + QUIET_MS + POLL_MS * 4);
+    expect(waiter.compacts).toHaveLength(1);
+  });
+
+  it("lets go of a Pi-path hold that never got a completion, rather than renewing it forever", async () => {
+    // Pi puts no timeout on its own compaction path - `_runAutoCompaction` in dist/core/agent-session.js carries an
+    // `AbortController` and the file contains no `setTimeout` or `AbortSignal.timeout` at all - so a summarisation
+    // that never reports back (cancelled by another extension's `session_before_compact` result, say) would renew
+    // its own lease indefinitely, and every idle session in the fleet would queue behind it indefinitely.
+    const busy = await pod("home-ops");
+    await busy.pi.emit("turn_start", { type: "turn_start", turnIndex: 1 }, busy.context);
+    const waiter = await pod("macker");
+    await busy.pi.emit(
+      "session_before_compact",
+      { type: "session_before_compact", preparation: {}, branchEntries: [], reason: "manual", willRetry: false },
+      busy.context,
+    );
+
+    // Past the bound, with no completion event and no failure event: nothing else could notice.
+    vi.advanceTimersByTime(480000 + POLL_MS * 2);
+    expect(existsSync(path.join(gateDir, "lease.json"))).toBe(false);
+    const spacing = JSON.parse(readFileSync(path.join(gateDir, "spacing.json"), "utf8"));
+    expect(spacing.repo).toBe("home-ops");
+    expect(spacing.outcome).toBe("Pi hold expired");
+    const expired = log(busy.cwd).find(
+      (entry) => entry.kind === "gate" && entry.action === "released because Pi's compaction never reported back",
+    );
+    expect(expired?.heldMs).toBeGreaterThan(480000);
+    expect(expired?.maxHoldMs).toBe(480000);
+
+    vi.advanceTimersByTime(SPREAD_MS + QUIET_MS + POLL_MS * 4);
+    expect(waiter.compacts).toHaveLength(1);
+  });
+
+  it("records that Pi compacted while somebody else held the gate, rather than smoothing it over", async () => {
+    // The one concurrency the gate still cannot prevent: an attempt already in flight when Pi's path fires. Pi is
+    // neither refused nor delayed for it - refusing a session that has already spent its window trades a fleet delay
+    // for a broken prompt - so the collision gets written down instead.
+    const holder = await pod("macker");
+    const busy = await pod("home-ops");
+    await busy.pi.emit("turn_start", { type: "turn_start", turnIndex: 1 }, busy.context);
+
+    vi.advanceTimersByTime(QUIET_MS);
+    expect(holder.compacts).toHaveLength(1); // macker holds the lease
+
+    await busy.pi.emit(
+      "session_before_compact",
+      { type: "session_before_compact", preparation: {}, branchEntries: [], reason: "overflow", willRetry: true },
+      busy.context,
+    );
+    expect(JSON.parse(readFileSync(path.join(gateDir, "lease.json"), "utf8")).repo).toBe("macker");
+    expect(
+      log(busy.cwd).some(
+        (entry) => entry.kind === "gate" && entry.action === "Pi compacting while the gate is held elsewhere" && entry.heldBy === "macker",
+      ),
+    ).toBe(true);
+
+    await busy.pi.emit(
+      "session_compact",
+      {
+        type: "session_compact",
+        reason: "overflow",
+        compactionEntry: { id: "c1", tokensBefore: 134390, summary: "pi wrote this one" },
+      },
+      busy.context,
+    );
+    // It never owned the lease, so it cannot release macker's - and it must not stamp either, since it has nothing
+    // of its own to space the next fleet start after.
+    expect(JSON.parse(readFileSync(path.join(gateDir, "lease.json"), "utf8")).repo).toBe("macker");
+    expect(existsSync(path.join(gateDir, "spacing.json"))).toBe(false);
+
+    holder.compacts[0]!.options.onComplete(completed(31000));
+    expect(JSON.parse(readFileSync(path.join(gateDir, "spacing.json"), "utf8")).outcome).toBe("compacted");
   });
 
   it("runs ungated when there is no fleet to gate", async () => {

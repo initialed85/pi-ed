@@ -57,15 +57,30 @@
  *   summary, and the smallest freeing worth a call. The old 40% was 52429 tokens here, above where the fleet's
  *   sessions live (10 of 11 were 26k-44k at startup) and above the band proven to pay for itself - a 44285-token
  *   compaction on 2026-11-26 freed 14156 tokens in 59 s. With the gate and `spreadMs` serialising the fleet, the
- *   concurrency this bar used to guard against is handled structurally instead. |
- * | `minFreeTokens` / `keptFloorTokens` | 20000 / 24000 | The floor is keepRecentTokens 20000 plus the measured median summary. A compaction that would free less than 20000 tokens is churn. **At this fleet's 131072 window these two are the binding eligibility bar: 44000 tokens.** |
+ *   concurrency this bar used to guard against is handled structurally instead. **And it is advisory**: percent is
+ *   computed from whatever `contextWindow` Pi carries for the alias, which is not necessarily the window the model
+ *   ran - pi-team-room answered a genuine 186420-token prompt (185898 of it `cacheRead`) under a 131072 constant,
+ *   which is 142.23% of too small a number. So percent may arm a session too eagerly, which is only waste, but it
+ *   may not refuse one the token bars already cleared. Refusing on a denominator that is wrong is how a legitimate
+ *   candidate is skipped and never learns it was skipped. |
+ * | `minFreeTokens` / `keptFloorTokens` | 20000 / 24000 | The floor is keepRecentTokens 20000 plus the measured median summary. A compaction that would free less than 20000 tokens is churn. **At this fleet's 131072 window these two are the binding eligibility bar: 44000 tokens.** What a finished compaction *lands* on is 25667-31480 tokens across the five idle-path completions measured on 2026-11-26 (inputs 44285-103142): the landing band is an outcome of `keepRecentTokens`, not of input size. |
  * | `deadlineMs` | 240000 | Sized to the tail, and the tail is not the biggest payload: 109797 tokens took 73.6 s on
  *   2026-11-26 while 55396 took 151.9 s an hour later - duration tracks backend contention, not token count. Pi's own
  *   trigger point runs median 71 s and p90 226 s, 14 of this fleet's attempts died at the old 120 s ceiling, and the
  *   one that died at 240 s ran alongside an ungated neighbour's summarisation. So 240 s is the ceiling for a **spaced**
- *   fleet: after a fleet-wide roll, a `kind:"deadline"` at 240000 is evidence something else is wrong, because nothing
- *   should be hammering the same two backends at the same time any more. |
- * | `cooldownMs` | 600000 | Stop an idle session from summarising itself over and over. |
+ *   fleet: after a fleet-wide roll, a `kind:"deadline"` at 240000 is evidence something else is wrong. The residual
+ *   case is named rather than hidden: this ceiling bounds the attempts *this extension* starts, and Pi's own path has
+ *   no ceiling at all - see the Pi-path bullet under Hazards. |
+ * | `cooldownMs` | 600000 | Stop an idle session from summarising itself over and over. **It is per-session, in-memory
+ *   state: `lastCompactionAt` lives in this runtime, so a reload, a `/new`, or a pod restart erases it completely.
+ *   slopyphus measured it on 2026-11-26: a pre-reload session skipped with `cooldown: 311s left` at 22:03:35Z and the
+ *   post-reload session compacted 184 s inside that same cooldown. That is intended and it matters for a roll - after
+ *   16 pods reload, no pod has any cooldown memory, so the only fleet ordering left is `spreadMs` and the lease. This
+ *   knob is a self-churn brake, never a fleet limiter. **A session at or over its declared window bypasses it**, and
+ *   the log says `overWindow` so nobody reads it as a missed check: pi-bot compacted to 31480 at 21:49Z on
+ *   2026-11-26 and was back to 135735 tokens (103.55%) 17 minutes later, and the refusal left Ed with a provider 400
+ *   - "This endpoint's maximum context length is 131072 tokens. However, you requested about 135838 tokens." A
+ *   cooldown is a brake on self-churn, not a reason to leave a session out of room. |
  * | `spreadMs` | 90000 | The gap between fleet compactions, measured from the moment the previous attempt **let go** |
  *   rather than from the start. A solo run of this feature costs 59-107 s (the same logs that measured the burst), so
  *   a 90 s gap keeps the local backends serving one summarisation at a time without making a session wait for the
@@ -101,6 +116,23 @@
  *   so the next fleet start is at least `spreadMs` later, a bounded poll while waiting, and a takeover path for a
  *   lease left behind by a pod that died mid-compaction. A person who runs `/idle-compact run` is not queued behind
  *   it, and a person who comes back cancels the wait.
+ * - **Pi's own compaction path is the majority of what compacts this fleet, and it cannot be refused.** Counting
+ *   every `log.jsonl` on the volume on 2026-11-26: 21 completed summarisations, **12 of them with
+ *   `trigger:"pi:threshold"`** at 114803-119360 tokens - the biggest jobs the fleet runs - and nine on the gated
+ *   idle path. Pi's path fires at 87.5% of the window, and again on overflow, where `prepareCompaction` returns
+ *   ready for *any* session that reached 131072 input tokens no matter how few history entries it holds. Cancelling
+ *   is available from `session_before_compact` and is deliberately never used: refusing a session that has already
+ *   spent its window trades a fleet delay for a broken prompt, and every measured harm in this fleet came from
+ *   starved attempts, never from a summarisation that was refused. So the gate reaches that path as a **hold**
+ *   instead: `session_before_compact` takes the lease on Pi's behalf, renews it while the summarisation is in
+ *   flight, and `session_compact` or `session_compact_failed` hands it back with an outcome that names which path
+ *   ran (`Pi threshold completion`). Idle attempts on other pods queue behind it. On the session being compacted
+ *   the idle attempt stands aside outright - "turn ends, Pi schedules a summarisation, `agent_settled` arms a quiet
+ *   timer that fires 120 s later" is a race for the same job, and calling `compact()` behind Pi would log a
+ *   `compact` line for a summarisation that never appears. A stand-aside outlives nothing: `session_compact`,
+ *   `session_compact_failed` and the hold's renewal bound all clear it. What still cannot be prevented is
+ *   an attempt already in flight when Pi's path fires - that concurrency is recorded (`Pi compacting while the gate
+ *   is held elsewhere`) rather than smoothed over.
  * - **Summaries compound.** Each compaction re-summarises the previous one, which is the real price of
  *   compacting earlier and more often, and why `minFreeTokens` and `cooldownMs` exist instead of compacting
  *   on every lull. The pinned plan, and the fleet's Graphiti memory, are the counterweights: durable state
@@ -411,6 +443,19 @@ const GATE_GRACE_MS = 30000;
  * filesystem read per session per half minute, which is what `arm` and `blockReason` already cost.
  */
 const GATE_POLL_MS = 30000;
+/**
+ * How long a hold taken for Pi's own compaction may be renewed for. Pi puts no timeout on that path - the only thing
+ * in `dist/core/agent-session.js` around `_runAutoCompaction` is an `AbortController`, with no `setTimeout` or
+ * `AbortSignal.timeout` anywhere in the file - so without a bound here, a Pi-path summarisation that never reports
+ * back (cancelled by another extension's `session_before_compact` result, say, with no completion and no failure
+ * event) would renew its own lease forever and the fleet would queue behind it forever.
+ *
+ * Two ceiling-lengths is the number, with a floor under it: the durations this fleet measured for a summarisation
+ * are 52.7-151.9 s, and Pi's own trigger-point history is median 71 s, p90 226 s. Something still running at 480 s is
+ * not a summarisation that is taking its time, and a pod that had lowered `deadlineMs` must not be able to shrink
+ * this bound under what the fleet already measured.
+ */
+const PI_PATH_HOLD_MAX_MS = 480000;
 
 interface GateLease {
   sessionId: string;
@@ -619,6 +664,78 @@ function releaseGate(dir: string, sessionId: string, repo: string, now: number, 
 }
 
 /**
+ * Take the lease on behalf of a compaction Pi started on its own path.
+ *
+ * That path cannot be refused, deferred or cancelled from here, and it is not tried: Pi summarises at 87.5% of the
+ * window because the alternative is paying for an over-full session at the next prompt. What it *can* do is stop
+ * being invisible. On 2026-11-26 the volume logged 21 completed summarisations and **12 of them arrived through
+ * `pi:threshold`** at 114803-119360 tokens - the biggest jobs the fleet runs - and not one of them left a lease or
+ * a spacing stamp. A gated idle attempt beside them queued for nobody and starved, which is exactly the contention
+ * the deadline aborts were read as. Holding the lease here is what makes those attempts deferrable.
+ *
+ * Two differences from `claimGate` are deliberate. It does not honour the spacing stamp, because the summarisation
+ * is already running and pretending otherwise would only hide it. And it will not stomp a *live* lease held by
+ * another pod: two summarisations running at once is the thing the gate exists to prevent, and Pi's path proceeding
+ * anyway is recorded rather than smoothed over.
+ */
+function holdGateForPiPath(
+  dir: string,
+  sessionId: string,
+  repo: string,
+  deadlineMs: number,
+  now: number,
+): { ok: boolean; heldBy?: string; ioError?: string } {
+  const leasePath = join(dir, LEASE_FILE);
+  const raw = readLease(leasePath);
+  const live = raw && raw.expiresAt + GATE_GRACE_MS > now ? raw : undefined;
+  if (live && live.sessionId !== sessionId) return { ok: false, heldBy: live.repo };
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      leasePath,
+      JSON.stringify({
+        sessionId,
+        repo,
+        // A hold this session already owns keeps its original start, so `heldMs` stays honest across renews.
+        startedAt: live ? live.startedAt : now,
+        expiresAt: now + deadlineMs + GATE_GRACE_MS,
+        deadlineMs,
+      } satisfies GateLease),
+      "utf8",
+    );
+    return { ok: true };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return { ok: false, heldBy: "gate io error", ioError: String(code ?? error) };
+  }
+}
+
+/**
+ * Push a Pi-path hold's expiry forward while the summarisation is still running.
+ *
+ * Pi's own path has no ceiling - `deadlineMs` bounds the attempts this extension starts, not the ones Pi starts -
+ * and the fleet has never measured how long a threshold summarisation takes, because the builds that ran them did
+ * not stamp the start. So the lease is renewed on the poll interval for as long as the compaction is in flight: a
+ * long one cannot expire the gate out from under itself, and a pod that dies stops renewing and expires inside
+ * `deadlineMs + GATE_GRACE_MS`.
+ */
+function renewPiPathHold(dir: string, sessionId: string, repo: string, deadlineMs: number, now: number): boolean {
+  const leasePath = join(dir, LEASE_FILE);
+  const raw = readLease(leasePath);
+  if (!raw || raw.sessionId !== sessionId) return false;
+  try {
+    writeFileSync(
+      leasePath,
+      JSON.stringify({ ...raw, expiresAt: now + deadlineMs + GATE_GRACE_MS } satisfies GateLease),
+      "utf8",
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Stamp when an attempt let go, so peers space their starts after it. `at`/`repo` stay at the top level because
  * that is what the gate reads; `prior` is the history, newest first, for whoever is reading the shared directory.
  */
@@ -690,6 +807,13 @@ interface State {
   gateWaitedMs: number;
   /** Set when a forced run went ahead without holding the lease: it still gets to stamp the spacing. */
   gateStamp: boolean;
+  /** Set while a summarisation *Pi* started is running on this session. The idle attempt stands aside during it. */
+  piPathInFlight: boolean;
+  /** Set while this session holds the gate for a summarisation *Pi* started. Released by `session_compact` or
+   *  `session_compact_failed`, never by a decision this extension makes - it has no authority over that path. */
+  piPathHold: boolean;
+  /** Pushes that hold's expiry forward while the summarisation is in flight, and stops the moment it is not. */
+  piPathRenew: NodeJS.Timeout | undefined;
   /** Set when this session's own deadline aborted an attempt, so the failure that follows is named as ours. */
   deadlineFiredAt: number | undefined;
   /** What was read from `.pi/idle-compaction.json` and when. `readConfig` runs at session start on purpose, and a
@@ -752,13 +876,30 @@ function blockReason(ctx: ExtensionContext, state: State, cfg: RuntimeConfig, op
   if (!usage) return "no context window known";
   if (usage.tokens === null || usage.percent === null) return "context usage unknown (right after a compaction)";
   if (options.force) return undefined;
-  if (usage.percent < cfg.softPercent) return `context at ${usage.percent.toFixed(1)}% is under the ${cfg.softPercent}% floor`;
+  // Pi's own summarisation of this session and this attempt are after the same job, and only one of them can have
+  // it. Without this, the sequence "turn ends - Pi schedules an auto-compaction - `agent_settled` arms - the quiet
+  // timer fires 120 s later" can call `compact()` behind a compaction already running, and the log then carries a
+  // `compact` line for a summarisation that never happens: the false success pi-bot was told to stop writing.
+  if (state.piPathInFlight) return "Pi is compacting this session; the idle attempt stands aside";
+  // The two token bars are computed from provider-reported counts. The percent bar is computed from whatever
+  // `contextWindow` Pi carries for this alias, and pi-bot's 2026-11-26 audit found that constant is wrong in both
+  // directions: pi-team-room ran a genuine 186420-token prompt (185898 of it `cacheRead`) under a 131072 window
+  // constant, i.e. 142.23% of a number that was too small. So percent may arm a session too eagerly, which is
+  // waste, but it must not refuse one the token bars already cleared - that is the direction where a legitimate
+  // candidate is skipped and never learns it was skipped.
   const free = usage.tokens - cfg.keptFloorTokens;
-  if (free < cfg.minFreeTokens) return `would free about ${free} tokens, under the ${cfg.minFreeTokens} minimum`;
+  const clearsMargin = free >= cfg.minFreeTokens;
+  if (usage.percent < cfg.softPercent && !clearsMargin) return `context at ${usage.percent.toFixed(1)}% is under the ${cfg.softPercent}% floor`;
+  if (!clearsMargin) return `would free about ${free} tokens, under the ${cfg.minFreeTokens} minimum`;
   const branch = ctx.sessionManager.getBranch();
   if (branch.length > 0 && branch[branch.length - 1].type === "compaction") return "the last entry is already a compaction";
   if (state.entriesAtCompaction !== undefined && branch.length <= state.entriesAtCompaction) return "nothing new since the last compaction";
-  if (state.lastCompactionAt !== undefined) {
+  // A cooldown is a brake on self-churn, not a protection for a session that is out of room now. pi-bot reached
+  // 135735 tokens (103.55%) on 2026-11-26 after compacting to 31480 only 17 minutes earlier - a long peer turn
+  // refills a window faster than a 10 minute cooldown protects it - and the answer Ed got was a provider 400:
+  // "This endpoint's maximum context length is 131072 tokens. However, you requested about 135838 tokens."
+  const overWindow = usage.tokens >= usage.contextWindow;
+  if (state.lastCompactionAt !== undefined && !overWindow) {
     const since = Date.now() - state.lastCompactionAt;
     if (since < cfg.cooldownMs) return `cooldown: ${Math.ceil((cfg.cooldownMs - since) / 1000)}s left`;
   }
@@ -792,6 +933,9 @@ export default function (pi: ExtensionAPI) {
     gateNote: "not claimed",
     gateWaitedMs: 0,
     gateStamp: false,
+    piPathHold: false,
+    piPathInFlight: false,
+    piPathRenew: undefined,
     deadlineFiredAt: undefined,
     compactionHookAt: undefined,
     lastCompactionAt: undefined,
@@ -1013,6 +1157,9 @@ export default function (pi: ExtensionAPI) {
       deadlineMs: state.cfg.deadlineMs,
       tokens: tokensBefore,
       percent: usage?.percent,
+      // Recorded when it is true, because it is the fact that explains a compaction that ran inside the cooldown:
+      // the cooldown was bypassed on purpose, not missed.
+      ...(usage?.tokens !== undefined && usage.tokens !== null && usage.contextWindow !== undefined && usage.tokens >= usage.contextWindow ? { overWindow: true } : {}),
       pinnedPlanChars: planBlock?.length ?? 0,
     });
 
@@ -1186,13 +1333,108 @@ export default function (pi: ExtensionAPI) {
   });
 
   /**
-   * A compaction is starting, whoever asked for it. No decision is taken here - the guard for Pi's own path is
-   * `compaction-summary-guard.ts`, and this extension's own path already has its ceiling. This exists so the two
-   * biggest compactions in the fleet (116325 and 119360 tokens) stop contributing zero duration data: Pi's own
-   * completion event has no duration, and a start stamp makes the millisecond computable after the fact.
+   * A compaction is starting, whoever asked for it. No decision is taken about *whether* it runs - the guard for
+   * Pi's own path is `compaction-summary-guard.ts`, and this extension's own path already has its ceiling.
+   *
+   * Two things happen. The start stamp makes Pi's duration computable, because Pi's completion event carries none:
+   * the volume logged 12 threshold summarisations on 2026-11-26 and every one reported no duration at all, so the
+   * fleet has never measured how long its biggest summarisations take. And the gate is held on that path's behalf,
+   * so the idle attempts on every other pod queue behind it instead of queueing for nobody.
+   *
+   * Cancelling Pi's compaction is available (`SessionBeforeCompactResult.cancel`) and is deliberately never used.
+   * Pi fires this path at 87.5% of the window, and again on overflow at any input size above it; refusing either
+   * leaves a session that has already spent its window, and the next prompt pays for that. The measured harm in
+   * this fleet came from starved attempts, never from a summarisation that was refused. Hold, renew, hand back.
    */
-  pi.on("session_before_compact", () => {
+  pi.on("session_before_compact", (event, ctx) => {
     state.compactionHookAt = Date.now();
+    state.lastCtx = ctx;
+    // Our own attempt already owns its deadline, its lease and its completion bookkeeping; this event fires for it
+    // too, because `ctx.compact()` enters through Pi's manual path.
+    if (state.compacting) return undefined;
+    // Pi has taken this session's summarisation. The idle attempt stands aside until it reports back, and the
+    // renewal bound below is what guarantees "until" is finite even if it never reports back at all.
+    state.piPathInFlight = true;
+    // Our own attempt already holds the gate when it is mid-flight, and holding it twice would only confuse the
+    // release: the one `handBackGate` would let go of is the one the attempt took at claim time.
+    if (state.gateHeld || !state.gateDir) return undefined;
+    const repo = basename(ctx.cwd);
+    const hold = holdGateForPiPath(state.gateDir, sessionIdOf(ctx), repo, state.cfg.deadlineMs, Date.now());
+    if (hold.ok) {
+      state.gateHeld = true;
+      state.piPathHold = true;
+      state.gateNote = `held for Pi's own ${event.reason} compaction`;
+      state.piPathRenew = setInterval(() => {
+        // Renewing forever is its own failure mode: a Pi-path summarisation that never reports back would keep
+        // pushing a lease nobody can release, and every idle session in the fleet would queue behind it.
+        const age = Date.now() - (state.compactionHookAt ?? Date.now());
+        const maxHoldMs = Math.max(PI_PATH_HOLD_MAX_MS, state.cfg.deadlineMs * 2);
+        if (age > maxHoldMs) {
+          stopPiPathHold();
+          handBackGate(
+            `Pi's compaction held the gate ${Math.round(age / 1000)}s with no completion`,
+            "Pi hold expired",
+          );
+          record(ctx, "gate", {
+            action: "released because Pi's compaction never reported back",
+            heldMs: age,
+            maxHoldMs,
+            ...(state.gateDir ? { dir: state.gateDir } : {}),
+          });
+          return;
+        }
+        const stillOurs =
+          state.gateDir !== undefined &&
+          renewPiPathHold(state.gateDir, sessionIdOf(ctx), repo, state.cfg.deadlineMs, Date.now());
+        if (!stillOurs) stopPiPathHold();
+      }, GATE_POLL_MS);
+      state.piPathRenew.unref?.();
+      record(ctx, "gate", { action: "held for Pi's own compaction", trigger: `pi:${event.reason}`, repo, dir: state.gateDir });
+      debug(ctx, `gate held for Pi's own ${event.reason} compaction; peers queue behind it`);
+    } else if (hold.ioError) {
+      record(ctx, "gate", { action: "Pi compacting ungated", error: hold.ioError, trigger: `pi:${event.reason}`, dir: state.gateDir });
+    } else {
+      // Pi's summarisation runs beside another pod's held lease, and that is recorded rather than smoothed over:
+      // it is the contention a reader would otherwise have to infer from two pods' deadline aborts.
+      record(ctx, "gate", {
+        action: "Pi compacting while the gate is held elsewhere",
+        heldBy: hold.heldBy,
+        trigger: `pi:${event.reason}`,
+        dir: state.gateDir,
+      });
+      debug(ctx, `Pi compacting on its own while ${hold.heldBy} holds the gate`);
+    }
+    return undefined;
+  });
+
+  function stopPiPathHold(): void {
+    if (state.piPathRenew) clearInterval(state.piPathRenew);
+    state.piPathRenew = undefined;
+    state.piPathHold = false;
+    state.piPathInFlight = false;
+  }
+
+  /**
+   * A compaction that never completed. On Pi's path this is where a held gate is let go early: a summarisation
+   * that died must not leave the rest of the fleet waiting out a TTL it has no evidence about.
+   */
+  pi.on("session_compact_failed", (event, ctx) => {
+    state.lastCtx = ctx;
+    // Cleared before the hold check: a failed compaction that never managed to hold the gate still has to stop
+    // this session standing aside for it, or the stand-aside becomes a permanent refusal to compact.
+    state.piPathInFlight = false;
+    if (!state.piPathHold) return undefined;
+    stopPiPathHold();
+    const outcome = `Pi ${event.reason} ${event.aborted ? "aborted" : "failed"}`;
+    handBackGate(`Pi's own compaction ${event.aborted ? "was aborted" : "failed"}`, outcome);
+    record(ctx, "gate", {
+      action: "released after Pi's compaction did not complete",
+      trigger: `pi:${event.reason}`,
+      aborted: event.aborted,
+      outcome,
+      ...(event.errorMessage ? { error: event.errorMessage } : {}),
+      ...(state.gateDir ? { dir: state.gateDir } : {}),
+    });
     return undefined;
   });
 
@@ -1204,6 +1446,7 @@ export default function (pi: ExtensionAPI) {
     if (!state.compacting) {
       const ms = state.compactionHookAt ? Date.now() - state.compactionHookAt : undefined;
       state.compactionHookAt = undefined;
+      state.piPathInFlight = false;
       record(ctx, "compacted", {
         trigger: `pi:${event.reason}`,
         tokensBefore: event.compactionEntry.tokensBefore,
@@ -1213,6 +1456,13 @@ export default function (pi: ExtensionAPI) {
         ...(ms === undefined ? {} : { ms, msSource: "session_before_compact to session_compact" }),
       });
       debug(ctx, `Pi compacted on its own (${event.reason}${ms === undefined ? "" : `, ${ms}ms`}); the idle path did not get there first`);
+      // The hold taken at `session_before_compact` is released here, and the spacing stamp says *which* path ran,
+      // so a reader of the shared directory can tell a gated idle completion from a Pi threshold completion.
+      stopPiPathHold();
+      handBackGate(
+        `Pi compacted on its own${ms === undefined ? "" : ` in ${ms}ms`}`,
+        `Pi ${event.reason} completion`,
+      );
     }
   });
 
@@ -1255,12 +1505,22 @@ export default function (pi: ExtensionAPI) {
     return `fleet gate (${state.gateDir}): ${parts.join(" · ")}`;
   }
 
-  pi.on("session_shutdown", (_event, ctx) => {
+  pi.on("session_shutdown", (event, ctx) => {
     clearTimer();
     clearDeadline();
+    stopPiPathHold();
     // A pod killed mid-compaction would otherwise leave the fleet waiting on a lease nobody can release.
     // The TTL is the backstop; this is the prompt one.
     handBackGate("session shutdown", "session shutdown");
+    // Recorded, not just debugged, because a reload is otherwise invisible in the log: the observable people look
+    // for is the *next* session's `trigger:"session_start:reload"`, and that only proves a reload happened if this
+    // line is there to show where the old session ended.
+    record(ctx, "session-shutdown", {
+      reason: event.reason,
+      gate: state.gateNote,
+      ...(event.targetSessionFile ? { targetSessionFile: event.targetSessionFile } : {}),
+      armed: state.armedFor,
+    });
     const s = state.stats;
     debug(
       ctx,
