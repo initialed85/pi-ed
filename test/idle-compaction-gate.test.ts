@@ -317,6 +317,40 @@ describe("the fleet gate", () => {
     expect(next.compacts).toHaveLength(1);
   });
 
+  it("stops queueing once the wait has outlasted the point of waiting", async () => {
+    // Queueing has to end, and the give-up path is the one nobody had ever run: a session that waits past
+    // gateMaxWaitMs records a skip with a reason instead of re-checking forever behind a stuck holder.
+    process.env.IDLE_COMPACTION_GATE_MAX_WAIT_MS = "120000";
+    try {
+      const holder = await pod("rooter");
+      const waiter = await pod("camry");
+
+      vi.advanceTimersByTime(QUIET_MS);
+      expect(holder.compacts).toHaveLength(1);
+
+      // Nothing ever calls onComplete: this is the holder that will not let go, which is the situation the cap is for.
+      for (let step = 0; step < 8; step += 1) vi.advanceTimersByTime(POLL_MS);
+
+      const gaveUp = log(waiter.cwd).find((entry) => entry.kind === "skip" && String(entry.reason ?? "").includes("gave up after"));
+      expect(gaveUp).toBeDefined();
+      expect(gaveUp!.reason).toContain("gate held by rooter");
+      expect(gaveUp!.queuedMs).toBeGreaterThan(120000);
+      expect(waiter.compacts).toHaveLength(0);
+
+      // Giving up releases nothing it held and does not resume on a timer: the next attempt needs an arm, and an arm
+      // needs something to settle. That is deliberate - a session whose person is away gets one queued attempt, not
+      // an eternal poll loop.
+      vi.advanceTimersByTime(SPREAD_MS + POLL_MS * 4);
+      expect(waiter.compacts).toHaveLength(0);
+
+      await waiter.pi.emit("agent_settled", { type: "agent_settled", aborted: false }, waiter.context);
+      vi.advanceTimersByTime(QUIET_MS + SPREAD_MS + POLL_MS * 4);
+      expect(waiter.compacts).toHaveLength(1);
+    } finally {
+      delete process.env.IDLE_COMPACTION_GATE_MAX_WAIT_MS;
+    }
+  });
+
   it("runs ungated when there is no fleet to gate", async () => {
     delete process.env.IDLE_COMPACTION_GATE;
     process.env.IDLE_COMPACTION_GATE = "off";

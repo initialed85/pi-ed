@@ -160,7 +160,30 @@ describe("idle compaction", () => {
     await settle(h);
     vi.advanceTimersByTime(QUIET_MS * 10);
     expect(h.compacts).toHaveLength(0);
-    expect(await status(h)).toContain("is under the 40% floor");
+    expect(await status(h)).toContain("is under the 25% floor");
+  });
+
+  it("states the eligibility bar that actually bites at this fleet's window", async () => {
+    // `softPercent` 25 of 131072 is 32768 tokens, but the margin bars refuse anything under 44000 (keptFloorTokens
+    // 24000 plus minFreeTokens 20000), so 44000 is the bar in practice - and it is built from measured constants.
+    // The band just above it is worth compacting: a 44285-token session freed 14156 tokens in 59 s on 2026-11-26.
+    const justUnder = await setup({ contextUsage: { percent: 32.8, tokens: 43000, contextWindow: 131072 } });
+    await settle(justUnder);
+    vi.advanceTimersByTime(QUIET_MS * 10);
+    expect(justUnder.compacts).toHaveLength(0);
+    expect(await status(justUnder)).toContain("would free about 19000 tokens, under the 20000 minimum");
+
+    const justOver = await setup({ contextUsage: { percent: 34.4, tokens: 45000, contextWindow: 131072 } });
+    await settle(justOver);
+    vi.advanceTimersByTime(QUIET_MS);
+    expect(justOver.compacts).toHaveLength(1);
+
+    // The percent bar still refuses a session that is simply small, whatever the margin arithmetic says.
+    const small = await setup({ contextUsage: { percent: 22, tokens: 29000, contextWindow: 131072 } });
+    await settle(small);
+    vi.advanceTimersByTime(QUIET_MS * 10);
+    expect(small.compacts).toHaveLength(0);
+    expect(await status(small)).toContain("is under the 25% floor");
   });
 
   it("shortens the window to twenty seconds when the next prompt is going to pay for it anyway", async () => {
@@ -514,7 +537,7 @@ describe("idle compaction", () => {
     const text = await status(h);
     expect(text).toContain("context usage not measured yet");
     expect(text).not.toContain("?");
-    expect(text).toContain("floor 40%");
+    expect(text).toContain("floor 25%");
   });
 
   it("runs on command when a person asks, and refuses when the arithmetic says no", async () => {
@@ -551,7 +574,7 @@ describe("idle compaction", () => {
     const lines = log.split("\n").filter(Boolean);
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain('"stage":"arm"');
-    expect(lines[0]).toContain("under the 40% floor");
+    expect(lines[0]).toContain("under the 25% floor");
     expect(h.compacts).toHaveLength(0);
   });
 });

@@ -50,20 +50,31 @@
  * | --- | --- | --- |
  * | `quietMs` | 120000 | 96% of the gaps inside a working exchange here are under 60 s (11217 gaps under 10 s and 2945 between 10 and 60 s, out of 14802). Two silent minutes means the burst ended. |
  * | `urgentPercent` / `urgentQuietMs` | 80 / 20000 | Above 80% the next prompt pays this cost anyway (the threshold is 87.5%). Starting 20 s after the run settled is never worse than starting when the user types. |
- * | `softPercent` | 40 | Below this there is nothing worth a summarisation call: Pi keeps 20000 tokens verbatim and these summaries measure 2565 tokens median. |
- * | `minFreeTokens` / `keptFloorTokens` | 20000 / 24000 | The floor is keepRecentTokens 20000 plus the measured median summary. A compaction that would free less than 20000 tokens is churn. |
+ * | `softPercent` | 25 | Below this there is nothing worth a summarisation call. The bar is deliberately *below* where |
+ *   the margin bars bind, because a percent bar is a token bar in disguise at a fixed window: 25% of 131072 is 32768
+ *   tokens, while `keptFloorTokens` + `minFreeTokens` refuse anything under 44000. So 44000 is the bar that actually
+ *   bites for this fleet, and it is built from measured constants: Pi's 20000 keep-recent, the 2565-token median
+ *   summary, and the smallest freeing worth a call. The old 40% was 52429 tokens here, above where the fleet's
+ *   sessions live (10 of 11 were 26k-44k at startup) and above the band proven to pay for itself - a 44285-token
+ *   compaction on 2026-11-26 freed 14156 tokens in 59 s. With the gate and `spreadMs` serialising the fleet, the
+ *   concurrency this bar used to guard against is handled structurally instead. |
+ * | `minFreeTokens` / `keptFloorTokens` | 20000 / 24000 | The floor is keepRecentTokens 20000 plus the measured median summary. A compaction that would free less than 20000 tokens is churn. **At this fleet's 131072 window these two are the binding eligibility bar: 44000 tokens.** |
  * | `deadlineMs` | 240000 | A solo attempt measured 27-77 s locally, and this feature's own logs measured 59.2 s for
  *   57181 tokens and 107.2 s for 103142 tokens. Pi's trigger point runs median 71 s and p90 226 s, and every
  *   concurrent attempt died at the old 120 s. A deadline below the p90 cancels work that was going to finish. |
  * | `cooldownMs` | 600000 | Stop an idle session from summarising itself over and over. |
- * | `spreadMs` | 90000 | The gap between fleet compactions, measured from the moment the previous attempt **let go** - |
- *   59-107 s. A 90 s gap keeps the local backends serving one summarisation at a time without making a session wait
- *   for the fleet. Measured from the hand-back rather than the start on purpose: a 107 s attempt plus a 90 s gap is
- *   197 s between heavy calls, whereas a gap measured from the start would be fully consumed by the attempt itself
- *   and the fleet would go back-to-back. The cost is stated plainly in `spacing.json`, which records the outcome: a
- *   summarisation that dies at its 240 s deadline paces the fleet just as hard as one that finished. |
- * | `gateMaxWaitMs` | 1800000 | Queueing has to end. Thirty minutes of waiting is a skip with a reason, not a session
- *   that never compacts. |
+ * | `spreadMs` | 90000 | The gap between fleet compactions, measured from the moment the previous attempt **let go** |
+ *   rather than from the start. A solo run of this feature costs 59-107 s (the same logs that measured the burst), so
+ *   a 90 s gap keeps the local backends serving one summarisation at a time without making a session wait for the
+ *   fleet. Measured from the hand-back on purpose: a 107 s attempt plus a 90 s gap is 197 s between heavy calls,
+ *   whereas a gap measured from the start is fully consumed by the attempt itself and the fleet goes back-to-back.
+ *   The cost is stated rather than hidden, and `spacing.json` records it: a summarisation that dies at its 240 s
+ *   deadline paces the fleet just as hard as one that finished. |
+ * | `gateMaxWaitMs` | 3600000 | Queueing has to end. An hour is a skip with a reason, not a session that never |
+ *   compacts. The number is the drain, not a mood: a fleet restarted in one breath arms every gated session inside
+ *   one second, and a fleet that serialises 13 summarisations at this feature's own measured cost (about 70 s each,
+ *   plus `spreadMs` 90 s between them) drains in roughly 13 x 160 s = 2080 s. A 30-minute cap makes the last one or
+ *   two sessions give up on a backlog that was about to clear. |
  * | `prune` | `report` | `report` counts the reclaimable stale tool output and touches nothing. `on` writes the edits. |
  * | `pruneKeepRecentResults` | 12 | The newest tool results are the working set; everything older is a candidate. |
  * | `pruneMinChars` | 2000 | Under this, the edit entry costs about what it saves. |
@@ -169,13 +180,13 @@ const DEFAULT_CONFIG: Config = {
   quietMs: 120000,
   urgentQuietMs: 20000,
   urgentPercent: 80,
-  softPercent: 40,
+  softPercent: 25,
   minFreeTokens: 20000,
   keptFloorTokens: 24000,
   deadlineMs: 240000,
   cooldownMs: 600000,
   spreadMs: 90000,
-  gateMaxWaitMs: 1800000,
+  gateMaxWaitMs: 3600000,
   prune: "report",
   pruneKeepRecentResults: 12,
   pruneMinChars: 2000,
