@@ -52,8 +52,15 @@
  * | `urgentPercent` / `urgentQuietMs` | 80 / 20000 | Above 80% the next prompt pays this cost anyway (the threshold is 87.5%). Starting 20 s after the run settled is never worse than starting when the user types. |
  * | `softPercent` | 40 | Below this there is nothing worth a summarisation call: Pi keeps 20000 tokens verbatim and these summaries measure 2565 tokens median. |
  * | `minFreeTokens` / `keptFloorTokens` | 20000 / 24000 | The floor is keepRecentTokens 20000 plus the measured median summary. A compaction that would free less than 20000 tokens is churn. |
- * | `deadlineMs` | 120000 | One clean attempt measured 27-77 s locally. Two minutes is the point where an idle compaction has become a wait. |
+ * | `deadlineMs` | 240000 | A solo attempt measured 27-77 s locally, and this feature's own logs measured 59.2 s for
+ *   57181 tokens and 107.2 s for 103142 tokens. Pi's trigger point runs median 71 s and p90 226 s, and every
+ *   concurrent attempt died at the old 120 s. A deadline below the p90 cancels work that was going to finish. |
  * | `cooldownMs` | 600000 | Stop an idle session from summarising itself over and over. |
+ * | `spreadMs` | 90000 | The gap between fleet compactions. The same logs show a solo run of this feature costing
+ *   59-107 s, so a 90 s gap keeps the local backends serving one summarisation at a time without making a session
+ *   wait for the fleet. |
+ * | `gateMaxWaitMs` | 1800000 | Queueing has to end. Thirty minutes of waiting is a skip with a reason, not a session
+ *   that never compacts. |
  * | `prune` | `report` | `report` counts the reclaimable stale tool output and touches nothing. `on` writes the edits. |
  * | `pruneKeepRecentResults` | 12 | The newest tool results are the working set; everything older is a candidate. |
  * | `pruneMinChars` | 2000 | Under this, the edit entry costs about what it saves. |
@@ -66,6 +73,15 @@
  *   at `deadlineMs` this extension calls `ctx.abort()`, which reaches `abortCompaction()` and aborts the controller
  *   the summarisation call is running on, and Pi writes no entry for an aborted compaction - the session keeps
  *   everything it had. A queued prompt, by contrast, is simply processed after the compaction finishes.
+ * - **The contention is the fleet, not the transcript.** Every model in this fleet is served by two backends, and a
+ *   deploy stamp restarts every pod inside the same second, so every session's quiet window opens at the same
+ *   instant. Nine of them did that on 2026-11-26 (58877 to 186420 tokens each) and every one was aborted at the
+ *   deadline having freed nothing, while the sessions that fired outside that burst summarised the same sizes in
+ *   59-107 s. Hence the gate: one lease file at the parent of the checkout
+ *   (`/workspace/.pi/idle-compaction/lease.json`), a spacing stamp
+ *   so the next fleet start is at least `spreadMs` later, a bounded poll while waiting, and a takeover path for a
+ *   lease left behind by a pod that died mid-compaction. A person who runs `/idle-compact run` is not queued behind
+ *   it, and a person who comes back cancels the wait.
  * - **Summaries compound.** Each compaction re-summarises the previous one, which is the real price of
  *   compacting earlier and more often, and why `minFreeTokens` and `cooldownMs` exist instead of compacting
  *   on every lull. The pinned plan, and the fleet's Graphiti memory, are the counterweights: durable state
@@ -87,8 +103,8 @@
  * back to Pi's behaviour.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 
 import {
   CONFIG_DIR_NAME,
@@ -135,6 +151,8 @@ interface Config {
   keptFloorTokens: number;
   deadlineMs: number;
   cooldownMs: number;
+  spreadMs: number;
+  gateMaxWaitMs: number;
   prune: PruneMode;
   pruneKeepRecentResults: number;
   pruneMinChars: number;
@@ -150,8 +168,10 @@ const DEFAULT_CONFIG: Config = {
   softPercent: 40,
   minFreeTokens: 20000,
   keptFloorTokens: 24000,
-  deadlineMs: 120000,
+  deadlineMs: 240000,
   cooldownMs: 600000,
+  spreadMs: 90000,
+  gateMaxWaitMs: 1800000,
   prune: "report",
   pruneKeepRecentResults: 12,
   pruneMinChars: 2000,
@@ -169,6 +189,8 @@ type NumericKey =
   | "keptFloorTokens"
   | "deadlineMs"
   | "cooldownMs"
+  | "spreadMs"
+  | "gateMaxWaitMs"
   | "pruneKeepRecentResults"
   | "pruneMinChars"
   | "pruneMaxPerBoundary";
@@ -182,6 +204,8 @@ const NUMERIC_LIMITS: Record<NumericKey, [number, number]> = {
   keptFloorTokens: [0, 200000],
   deadlineMs: [5000, 900000],
   cooldownMs: [0, 86400000],
+  spreadMs: [1000, 3600000],
+  gateMaxWaitMs: [1000, 21600000],
   pruneKeepRecentResults: [0, 200],
   pruneMinChars: [200, 200000],
   pruneMaxPerBoundary: [1, 100],
@@ -196,6 +220,8 @@ const ENV_NUMBERS: Array<[string, NumericKey]> = [
   ["IDLE_COMPACTION_KEPT_FLOOR_TOKENS", "keptFloorTokens"],
   ["IDLE_COMPACTION_DEADLINE_MS", "deadlineMs"],
   ["IDLE_COMPACTION_COOLDOWN_MS", "cooldownMs"],
+  ["IDLE_COMPACTION_SPREAD_MS", "spreadMs"],
+  ["IDLE_COMPACTION_GATE_MAX_WAIT_MS", "gateMaxWaitMs"],
   ["IDLE_COMPACTION_PRUNE_KEEP_RECENT", "pruneKeepRecentResults"],
   ["IDLE_COMPACTION_PRUNE_MIN_CHARS", "pruneMinChars"],
   ["IDLE_COMPACTION_PRUNE_MAX", "pruneMaxPerBoundary"],
@@ -306,6 +332,247 @@ function debug(ctx: ExtensionContext | undefined, line: string): void {
   }
 }
 
+/* ------------------------------------------------------------------ the fleet gate
+ *
+ * Why this exists is a measured fact, not a guess. On 2026-11-26 a deploy stamp restarted every pod inside the same
+ * second, so every session's quiet window opened at the same instant, and nine of them issued a summarisation
+ * request between 17:09:42Z and 17:09:50Z against `rooter` and `retainer`, which serve every model in this fleet.
+ * Every one of them was aborted at the then-120 s deadline having spent the whole call and freed nothing, and the
+ * session that fired forty-five seconds later was aborted too:
+ *
+ *   session          fired at        tokens summarised   freed
+ *   rooter           17:09:42Z       88190               0
+ *   camry            17:09:42Z       84917               0
+ *   memebrary        17:09:44Z       74039               0
+ *   macgrubernetes   17:09:44Z       90599               0
+ *   pi-team-room     17:09:45Z       186420              0
+ *   macker           17:09:45Z       71229               0
+ *   home-ops         17:09:48Z       86748               0
+ *   pi-bot           17:09:48Z       58877               0
+ *   maclet           17:09:50Z       63058               0
+ *   pi-ed            17:10:37Z       86318               0
+ *
+ * The two attempts in the same logs that did not fire inside that burst show what a solo call costs this feature:
+ * slopyphus summarised 57181 tokens in 59.2 s, and pi-bot summarised 103142 in 107.2 s. Same sizes as the burst,
+ * 59-107 s instead of "never finished". Concurrency is the difference, so the gate makes an idle summarisation a
+ * fleet resource with two rules: **one in flight at a time** (a lease file) and **a minimum gap between
+ * starts** (a spacing stamp), both on the shared `/workspace` root every pod mounts.
+ */
+
+const GATE_DIR_NAME = "idle-compaction";
+const LEASE_FILE = "lease.json";
+const SPACING_FILE = "spacing.json";
+/** A lease older than its deadline plus this is a pod that died mid-compaction, and may be taken over. */
+const GATE_GRACE_MS = 30000;
+/**
+ * How often a waiting session re-checks. The holder usually finishes long before its lease expires, and a waiter
+ * that slept for the whole TTL would sit out a compaction that ended two minutes ago. Polling at 30 s costs one
+ * filesystem read per session per half minute, which is what `arm` and `blockReason` already cost.
+ */
+const GATE_POLL_MS = 30000;
+
+interface GateLease {
+  sessionId: string;
+  repo: string;
+  startedAt: number;
+  expiresAt: number;
+  deadlineMs: number;
+}
+
+interface GateHeld {
+  heldBy: string;
+  heldMs: number;
+  waitMs: number;
+}
+
+/**
+ * Where the gate lives. Every agent checkout in this fleet is a direct child of the shared `/workspace`, so the
+ * gate belongs to the shared root rather than to one repo: `/workspace/.pi/idle-compaction/`. That directory is
+ * outside every git tree, so it cannot dirty a working copy. Anywhere else it stays inside the repo's own `.pi`.
+ * `IDLE_COMPACTION_GATE_DIR` overrides it; `IDLE_COMPACTION_GATE=off` removes it, which is what a single session
+ * on a laptop wants.
+ */
+function gateDir(cwd: string): string | undefined {
+  // Checked before the directory override: `off` is the unambiguous statement, and a leftover directory should
+  // not overrule it.
+  if (process.env.IDLE_COMPACTION_GATE?.trim().toLowerCase() === "off") return undefined;
+  const override = process.env.IDLE_COMPACTION_GATE_DIR?.trim();
+  if (override) return override.startsWith("/") ? override : join(cwd, override);
+  const parent = join(cwd, "..");
+  if (basename(parent) === "workspace" && existsSync(parent)) return join(parent, ".pi", GATE_DIR_NAME);
+  return join(cwd, CONFIG_DIR_NAME, GATE_DIR_NAME);
+}
+
+/** Deterministic, not random: a deferral must be reproducible when it is read back in the log. */
+function jitterMs(seed: string, spreadMs: number): number {
+  let h = 2166136261;
+  for (let i = 0; i < seed.length; i += 1) {
+    h ^= seed.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return Math.abs(h) % Math.max(1, spreadMs);
+}
+
+function readGateFile(path: string): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function gateSpacing(dir: string): { at: number; repo: string } | undefined {
+  const raw = readGateFile(join(dir, SPACING_FILE));
+  if (!raw || typeof raw.at !== "number") return undefined;
+  return { at: raw.at, repo: typeof raw.repo === "string" ? raw.repo : "unknown" };
+}
+
+function readLease(leasePath: string): GateLease | undefined {
+  const raw = readGateFile(leasePath);
+  if (!raw || typeof raw.sessionId !== "string") return undefined;
+  return {
+    sessionId: raw.sessionId,
+    repo: typeof raw.repo === "string" ? raw.repo : "unknown",
+    startedAt: typeof raw.startedAt === "number" ? raw.startedAt : 0,
+    expiresAt: typeof raw.expiresAt === "number" ? raw.expiresAt : 0,
+    deadlineMs: typeof raw.deadlineMs === "number" ? raw.deadlineMs : 0,
+  };
+}
+
+/** A lease that is still being honoured. A dead one is not a holder, it is debris. */
+function gateLease(dir: string, now: number): GateLease | undefined {
+  const lease = readLease(join(dir, LEASE_FILE));
+  if (!lease) return undefined;
+  if (lease.expiresAt + GATE_GRACE_MS <= now) return undefined;
+  return lease;
+}
+
+type GateClaim =
+  | { ok: true; tookOver?: { repo: string; heldMs: number } }
+  | { ok: false; held: GateHeld; ioError?: string };
+
+/**
+ * Claim the gate, or say how long to wait. `O_EXCL` on creation is the mutual exclusion. Whatever a shared
+ * filesystem does under a genuine race, the worst case is two sessions compacting at once, which is exactly what
+ * happens today with no gate at all.
+ */
+function claimGate(
+  dir: string,
+  sessionId: string,
+  repo: string,
+  deadlineMs: number,
+  spreadMs: number,
+  now: number,
+): GateClaim {
+  const leasePath = join(dir, LEASE_FILE);
+  const write = (lease: { startedAt: number }) => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      leasePath,
+      JSON.stringify({
+        sessionId,
+        repo,
+        startedAt: lease.startedAt,
+        expiresAt: now + deadlineMs + GATE_GRACE_MS,
+        deadlineMs,
+      }),
+      { flag: "wx" },
+    );
+  };
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const raw = readLease(leasePath);
+    const live = raw && raw.expiresAt + GATE_GRACE_MS > now ? raw : undefined;
+
+    if (live && live.sessionId !== sessionId) {
+      // Poll rather than sleeping to the TTL, and jitter the poll so a fleet that started together does not
+      // re-check together.
+      return {
+        ok: false,
+        held: {
+          heldBy: live.repo,
+          heldMs: now - live.startedAt,
+          waitMs: Math.min(Math.max(0, live.expiresAt - now), GATE_POLL_MS) + jitterMs(sessionId, GATE_POLL_MS),
+        },
+      };
+    }
+
+    const spacing = gateSpacing(dir);
+    if (!live && spacing && now < spacing.at + spreadMs) {
+      return {
+        ok: false,
+        held: {
+          heldBy: `the spacing stamp left by ${spacing.repo}`,
+          heldMs: now - spacing.at,
+          waitMs: spacing.at + spreadMs - now + jitterMs(sessionId, GATE_POLL_MS),
+        },
+      };
+    }
+
+    // A pod that died mid-compaction leaves a file no one can release, and `wx` would fail on it forever. Debris
+    // is removed, and the takeover is reported so the log says which session was taken over and for how long.
+    let tookOver: { repo: string; heldMs: number } | undefined;
+    if (raw && !live) {
+      tookOver = { repo: raw.repo, heldMs: Math.max(0, now - raw.startedAt) };
+      try {
+        unlinkSync(leasePath);
+      } catch {
+        /* a peer already removed it; the write below will say so */
+      }
+    }
+
+    if (live && live.sessionId === sessionId) {
+      try {
+        unlinkSync(leasePath);
+        write({ startedAt: live.startedAt });
+        return { ok: true };
+      } catch {
+        continue;
+      }
+    }
+
+    try {
+      write({ startedAt: now });
+      return { ok: true, tookOver };
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EEXIST") continue; // a peer won the race; re-read it next iteration
+      return { ok: false, held: { heldBy: "gate io error", heldMs: 0, waitMs: 0 }, ioError: String(code ?? error) };
+    }
+  }
+
+  const live = gateLease(dir, now);
+  return {
+    ok: false,
+    held: {
+      heldBy: live?.repo ?? "unknown",
+      heldMs: live ? now - live.startedAt : 0,
+      waitMs: (live ? Math.min(Math.max(0, live.expiresAt - now), GATE_POLL_MS) : spreadMs) + jitterMs(sessionId, GATE_POLL_MS),
+    },
+  };
+}
+
+/** Give the gate back, and stamp when it was handed back so peers space their starts after it. Only a holder may release it. */
+function releaseGate(dir: string, sessionId: string, repo: string, now: number): void {
+  try {
+    const lease = readGateFile(join(dir, LEASE_FILE));
+    if (lease && lease.sessionId === sessionId) unlinkSync(join(dir, LEASE_FILE));
+    writeFileSync(join(dir, SPACING_FILE), JSON.stringify({ at: now, repo }), "utf8");
+  } catch {
+    // A gate that cannot be released expires by itself; it must never become the reason a session breaks.
+  }
+}
+
+/** Stamp when a compaction let go, so peers space their starts after it. */
+function stampGate(dir: string, repo: string, now: number): void {
+  try {
+    writeFileSync(join(dir, SPACING_FILE), JSON.stringify({ at: now, repo }), "utf8");
+  } catch {
+    /* a stamp that cannot be written costs nothing */
+  }
+}
+
 /* ------------------------------------------------------------------ state */
 
 interface Stats {
@@ -316,6 +583,7 @@ interface Stats {
   skipped: number;
   failed: number;
   abortedAtDeadline: number;
+  gateWaits: number;
   freedTokens: number;
   lastNote: string;
   lastAt: string | undefined;
@@ -337,6 +605,14 @@ interface State {
   deadline: NodeJS.Timeout | undefined;
   compacting: boolean;
   startedAt: number;
+  /** Set while this session holds the shared gate file. */
+  gateHeld: boolean;
+  gateDir: string | undefined;
+  gateNote: string;
+  /** Wall time spent queueing for the gate in the current chain. Reset on release and on session start. */
+  gateWaitedMs: number;
+  /** Set when a forced run went ahead without holding the lease: it still gets to stamp the spacing. */
+  gateStamp: boolean;
   lastCompactionAt: number | undefined;
   entriesAtCompaction: number | undefined;
   stats: Stats;
@@ -353,6 +629,7 @@ function freshStats(): Stats {
     skipped: 0,
     failed: 0,
     abortedAtDeadline: 0,
+    gateWaits: 0,
     freedTokens: 0,
     lastNote: "nothing yet",
     lastAt: undefined,
@@ -426,6 +703,11 @@ export default function (pi: ExtensionAPI) {
     deadline: undefined,
     compacting: false,
     startedAt: 0,
+    gateHeld: false,
+    gateDir: undefined,
+    gateNote: "not claimed",
+    gateWaitedMs: 0,
+    gateStamp: false,
     lastCompactionAt: undefined,
     entriesAtCompaction: undefined,
     stats: freshStats(),
@@ -502,6 +784,34 @@ export default function (pi: ExtensionAPI) {
     debug(ctx, `armed ${quietMs}ms after ${trigger} at ${usage?.tokens ?? "?"} tokens (${(usage?.percent ?? 0).toFixed(1)}%)`);
   }
 
+  function sessionIdOf(ctx: ExtensionContext): string {
+    try {
+      return ctx.sessionManager.getSessionId();
+    } catch {
+      return "unknown-session";
+    }
+  }
+
+  /** Only a holder hands the gate back, and it stamps when it let go. */
+  function handBackGate(note: string): void {
+    const ctx = state.lastCtx;
+    if (!ctx || !state.gateDir) return;
+    if (state.gateHeld) {
+      releaseGate(state.gateDir, sessionIdOf(ctx), basename(ctx.cwd), Date.now());
+      state.gateHeld = false;
+    } else if (state.gateStamp) {
+      // It never owned the lease, so it cannot release one; but a compaction just happened here, and peers
+      // should space their next starts after it all the same.
+      stampGate(state.gateDir, basename(ctx.cwd), Date.now());
+      state.gateStamp = false;
+    } else {
+      return;
+    }
+    state.gateWaitedMs = 0;
+    state.gateNote = note;
+    debug(ctx, `gate released (${note})`);
+  }
+
   function fire(trigger: string, quietMs: number, force: boolean): void {
     const ctx = state.lastCtx;
     if (!ctx) return;
@@ -515,6 +825,75 @@ export default function (pi: ExtensionAPI) {
 
     const usage = usageOf(ctx);
     const tokensBefore = usage?.tokens ?? 0;
+
+    // The gate is claimed here, at the moment of the decision, not when the quiet window opened: ten sessions
+    // that armed in the same second must still end up summarising one at a time.
+    if (state.gateDir && !state.gateHeld) {
+      const claim = claimGate(
+        state.gateDir,
+        sessionIdOf(ctx),
+        basename(ctx.cwd),
+        state.cfg.deadlineMs,
+        state.cfg.spreadMs,
+        Date.now(),
+      );
+      const askedNow = force || trigger.startsWith("command:") || trigger === "command";
+      if (!claim.ok && askedNow) {
+        // A person who asked now is not queued behind a peer. The claim failed, so this session does not hold
+        // the lease and must not remove somebody else's; it only reports that it went ahead.
+        record(ctx, "gate", { trigger, quietMs, action: "asked now", ...claim.held, dir: state.gateDir });
+        state.gateNote = `went ahead while ${claim.held.heldBy} held the gate`;
+        state.gateStamp = true;
+      } else if (!claim.ok) {
+        if (claim.ioError) {
+          record(ctx, "gate", { trigger, error: claim.ioError, dir: state.gateDir });
+          state.gateNote = `gate unavailable (${claim.ioError}); running ungated`;
+        } else {
+          state.stats.gateWaits += 1;
+          state.gateWaitedMs += claim.held.waitMs;
+          if (state.gateWaitedMs > state.cfg.gateMaxWaitMs) {
+            state.stats.skipped += 1;
+            state.stats.lastNote = `skipped: queueing for the gate passed ${Math.round(state.cfg.gateMaxWaitMs / 60000)} minutes`;
+            record(ctx, "skip", {
+              trigger,
+              quietMs,
+              reason: `gate held by ${claim.held.heldBy}; gave up after ${Math.round(state.gateWaitedMs / 1000)}s of queueing`,
+              queuedMs: state.gateWaitedMs,
+            });
+            return;
+          }
+          state.gateNote = `waiting on ${claim.held.heldBy} for ${Math.round(claim.held.waitMs / 1000)}s`;
+          state.stats.lastNote = `gate wait ${state.stats.gateWaits}: ${state.gateNote}`;
+          record(ctx, "gate", { trigger, quietMs, ...claim.held, dir: state.gateDir });
+          debug(ctx, `gate held by ${claim.held.heldBy} (${claim.held.heldMs}ms); waiting ${claim.held.waitMs}ms`);
+          // The wait is cancellable by anything that means a turn is happening, which is the point: a
+          // returning person always beats an idle compaction.
+          state.timer = setTimeout(() => {
+            state.timer = undefined;
+            fire(trigger, quietMs, false);
+          }, claim.held.waitMs);
+          state.timer.unref?.();
+          return;
+        }
+      } else {
+        state.gateHeld = true;
+        state.gateWaitedMs = 0;
+        state.gateNote = "held";
+        if (claim.tookOver) {
+          // Worth reading back: this session started because it took over a lease nobody released.
+          record(ctx, "gate", {
+            trigger,
+            quietMs,
+            action: "took over",
+            from: claim.tookOver.repo,
+            heldForMs: claim.tookOver.heldMs,
+            dir: state.gateDir,
+          });
+          debug(ctx, `took over a stale lease from ${claim.tookOver.repo} (held ${claim.tookOver.heldMs}ms)`);
+        }
+      }
+    }
+
     const planBlock = state.cfg.pinPlan ? pinnedPlan(ctx) : undefined;
     const startedAt = Date.now();
     state.compacting = true;
@@ -554,6 +933,7 @@ export default function (pi: ExtensionAPI) {
           const freed = typeof after === "number" ? Math.max(0, tokensBefore - after) : 0;
           state.compacting = false;
           clearDeadline();
+          handBackGate(`compacted in ${ms}ms`);
           state.stats.fired += 1;
           state.stats.freedTokens += freed;
           state.stats.lastNote = `compacted ${tokensBefore} to ${after ?? "?"} tokens (freed ${freed}) in ${Math.round(ms / 1000)}s`;
@@ -575,6 +955,7 @@ export default function (pi: ExtensionAPI) {
           const ms = Date.now() - startedAt;
           state.compacting = false;
           clearDeadline();
+          handBackGate(`error after ${ms}ms`);
           // "Already compacted" and "Nothing to compact (session too small)" are Pi saying the work was
           // already done or there is none: a skip, not a fault worth a warning.
           const benign = /already compacted|too small|cancelled/i.test(error.message);
@@ -589,6 +970,7 @@ export default function (pi: ExtensionAPI) {
       // A context invalidated by a reload throws instead of acting on the wrong session.
       state.compacting = false;
       clearDeadline();
+      handBackGate("could not start");
       state.stats.failed += 1;
       state.stats.lastNote = `could not start: ${error instanceof Error ? error.message : String(error)}`;
       debug(ctx, state.stats.lastNote);
@@ -646,6 +1028,14 @@ export default function (pi: ExtensionAPI) {
     // the same thing on the second session as on the first.
     state.forcedOff = pi.getFlag("idle-compaction-off") === true;
     state.cfg = readConfig(ctx);
+    // A new session may be starting because a deploy restarted the pod, i.e. at the same instant as every other
+    // session in the fleet. The gate is re-resolved here rather than at load so `IDLE_COMPACTION_GATE_DIR` and a
+    // changed cwd both take effect on reload.
+    state.gateDir = gateDir(ctx.cwd);
+    state.gateHeld = false;
+    state.gateNote = "not claimed";
+    state.gateWaitedMs = 0;
+    state.gateStamp = false;
     clearTimer();
     clearDeadline();
     state.compacting = false;
@@ -696,9 +1086,31 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  /** What the shared gate says right now, read from the filesystem rather than remembered. */
+  function describeGate(): string {
+    if (!state.gateDir) return "fleet gate: off (IDLE_COMPACTION_GATE=off); this session compacts ungated";
+    const now = Date.now();
+    const lease = gateLease(state.gateDir, now);
+    const spacing = gateSpacing(state.gateDir);
+    const parts: string[] = [];
+    if (state.gateHeld) parts.push("held by this session");
+    else if (lease) parts.push(`held by ${lease.repo} for ${Math.round((now - lease.startedAt) / 1000)}s`);
+    else parts.push("free");
+    if (!state.gateHeld && spacing) {
+      const left = spacing.at + state.cfg.spreadMs - now;
+      parts.push(left > 0 ? `next start allowed in ${Math.round(left / 1000)}s (after ${spacing.repo})` : `spacing clear`);
+    }
+    parts.push(`spread ${state.cfg.spreadMs / 1000}s`);
+    if (state.stats.gateWaits) parts.push(`waited ${state.stats.gateWaits}x`);
+    return `fleet gate (${state.gateDir}): ${parts.join(" · ")}`;
+  }
+
   pi.on("session_shutdown", (_event, ctx) => {
     clearTimer();
     clearDeadline();
+    // A pod killed mid-compaction would otherwise leave the fleet waiting on a lease nobody can release.
+    // The TTL is the backstop; this is the prompt one.
+    handBackGate("session shutdown");
     const s = state.stats;
     debug(
       ctx,
@@ -837,6 +1249,7 @@ export default function (pi: ExtensionAPI) {
         lines.push(`a compaction started ${Math.round((Date.now() - state.startedAt) / 1000)}s ago; deadline in ${Math.max(0, Math.round((state.startedAt + cfg.deadlineMs - Date.now()) / 1000))}s`);
       }
       if (state.armedFor) lines.push(`quiet timer armed ${cfg.quietMs / 1000}s after ${state.armedFor}`);
+      lines.push(describeGate());
       if (cfg.problems.length) lines.push(`config problems: ${cfg.problems.join(", ")}`);
       lines.push(`decisions: ${logPath(ctx)}`);
       ctx.ui.notify(lines.join("\n"), "info");

@@ -37,7 +37,7 @@ const ID = "01a1c4d0-2f3a-7b4c-9d5e-1f2a3b4c5d6e";
 
 const QUIET_MS = 120000;
 const URGENT_QUIET_MS = 20000;
-const DEADLINE_MS = 120000;
+const DEADLINE_MS = 240000;
 const COOLDOWN_MS = 600000;
 
 let dirs: string[] = [];
@@ -219,7 +219,7 @@ describe("idle compaction", () => {
     h.context.setIdle(false);
     await settle(h);
     // Still inside the deadline: the refusal is what a person should be able to read back.
-    vi.advanceTimersByTime(QUIET_MS - 1);
+    vi.advanceTimersByTime(DEADLINE_MS - 1);
     expect(h.compacts).toHaveLength(1);
     expect(await status(h)).toContain("a compaction is already in flight");
 
@@ -315,7 +315,7 @@ describe("idle compaction", () => {
     vi.advanceTimersByTime(DEADLINE_MS);
     expect(h.calls.some((call) => call.name === "abort")).toBe(true);
     expect(h.ui.notifications).toEqual([]);
-    expect(await status(h)).toContain("aborted at the 120000ms deadline");
+    expect(await status(h)).toContain("aborted at the 240000ms deadline");
   });
 
   it("stops the deadline once the compaction reports back", async () => {
@@ -477,7 +477,7 @@ describe("idle compaction", () => {
     expect(text).toContain("context 78000 of 131072 (60.0%)");
     expect(text).toContain("quiet 120s");
     expect(text).toContain("urgent 20s at 80%");
-    expect(text).toContain("deadline 120s");
+    expect(text).toContain("deadline 240s");
     expect(text).toContain("cooldown 600s");
     expect(text).toContain(".pi/idle-compaction/log.jsonl");
     // The live run this extension first reached printed `plan pinned in the summary: yes` for a session that had no

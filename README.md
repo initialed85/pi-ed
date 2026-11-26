@@ -149,7 +149,9 @@ the guard honours it with one summarisation call and no ladder), and aborts it i
 
 It arms a quiet window when a run settles — two minutes by default, twenty seconds above 80% of the window, because
 above that the next prompt pays the cost anyway — and cancels it for anything that means a turn is happening or about
-to happen. At session start it arms for 30 s, which is the case a resume near the ceiling needs. What the summary must
+to happen. At session start it arms the same quiet window rather than a shorter one: a session resumed near the
+ceiling is worth compacting before the next exchange, but a person who has just sat down is about to type, and Pi
+refuses a prompt while a compaction is in flight. What the summary must
 keep is named in the instructions, and this session's plan is quoted verbatim out of `.pi/plan/<session-id>.json`
 rather than reconstructed from a summary of a summary.
 
@@ -157,7 +159,17 @@ The deadline is not politeness. Pi's `prompt()` throws `"Cannot submit a prompt 
 Wait for compaction to finish and retry."`, and no extension event runs before that check, so a 226 s compaction is a
 window where the next thing typed fails. At `deadlineMs` this extension calls `ctx.abort()`, which reaches Pi's
 `abortCompaction()` and cancels the in-flight summarisation; an aborted compaction writes nothing, so the session
-keeps everything it had.
+keeps everything it had. It is 240 s and not 120 s because the fleet's own history says a compaction at Pi's trigger
+point takes median 71 s and p90 226 s: a deadline under the p90 is a machine that cancels its own work.
+
+It then queues for a **fleet gate**, because every model here is served by two backends and nine sessions asking at
+once is a different problem from one session asking. The gate is a lease file at
+`/workspace/.pi/idle-compaction/lease.json` — the parent of `/workspace/<repo>` for every checkout on the shared
+volume, which is exactly the scope the contention happens at — plus a spacing stamp recording when the last
+compaction let go. A session may start only when no live lease exists and the last one finished at least `spreadMs`
+ago; otherwise it re-checks on a bounded poll (30 s) and gives up after `gateMaxWaitMs`. A lease carries its holder's
+session id, repo, start time and expiry, so a pod killed mid-compaction leaves something the next session takes over
+instead of a fleet permanently blocked by a corpse.
 
 It also counts stale tool output at `agent_before_settle` — tool results are 3.40M of the 5.00M characters of
 transcript in that session, 68% — and dropping them is the one context reduction that needs no model call and keeps
@@ -169,9 +181,33 @@ While a compaction is in flight it answers `cache_warming_decision` with `stop`,
 a warm prefix alive that the compaction is about to throw away. Every model in this fleet declares no cache lifetime,
 so that is insurance rather than a saving today.
 
-Tested at the contract boundary rather than inside Pi's loop: 31 cases over fake timers with the shipped defaults
+Tested at the contract boundary rather than inside Pi's loop: 42 cases over fake timers with the shipped defaults
 (arm, cancel, re-check on fire, cooldown, deadline, the plan pin, the prune protections), plus a contract test that
-fails if the scheduler's marker and the guard's marker stop agreeing.
+fails if the scheduler's marker and the guard's marker stop agreeing, plus 7 cases for the gate — the nine-sessions
+-in-one-second layout, one-in-flight, a stale lease taken over, a person asking now not queued, a returning person
+cancelling the wait, a shutdown releasing the lease, and the ungated mode.
+
+**The field result that changed the defaults.** A deploy stamp restarted every pod in the fleet inside the same
+second, so every session's quiet window opened at the same instant, and nine of them issued a summarisation request
+between 17:09:42Z and 17:09:50Z against `rooter` and `retainer`, which serve every model here. Every one was aborted
+at the then-120 s deadline, each having spent the whole call and freed nothing. The session that fired forty-five
+seconds later died the same way:
+
+| session | fired at | tokens summarised | freed |
+| --- | --- | --- | --- |
+| rooter · camry | 17:09:42Z | 88190 · 84917 | 0 |
+| memebrary · macgrubernetes | 17:09:44Z | 74039 · 90599 | 0 |
+| pi-team-room · macker | 17:09:45Z | 186420 · 71229 | 0 |
+| home-ops · pi-bot | 17:09:48Z | 86748 · 58877 | 0 |
+| maclet | 17:09:50Z | 63058 | 0 |
+| pi-ed (settled trigger, not startup) | 17:10:37Z | 86318 | 0 |
+
+The two attempts in those same logs that fired outside the burst show what a solo call costs this feature: slopyphus
+summarised 57181 tokens in **59.2 s** and pi-bot summarised 103142 in **107.2 s**. Same backend, same sizes, 59-107 s
+instead of never finishing. Concurrency was the whole difference, so the fix is the gate and the spacing — a longer
+timeout alone would only have moved the failure from "aborted" to "everyone waits". One session per pod also stops
+the doubling: with a resumed session and a new one in the same checkout, only the holder's window can issue the
+request.
 
 It has now run for real. A scratch checkout under `pi --mode rpc` on pi 1.6.1 with this extension and the guard loaded,
 against strata: the run settled at **96791 context tokens (73.8% of a 131072 window)**, the window armed **exactly
@@ -182,20 +218,22 @@ deadline never approached. The prune pass reported 4 stale results, about 50875 
 one line per decision: the arm refusal at session start, the prune report, the compaction, the result.
 
 Two things that measurement settled. First, a single-attempt summarisation of a ~97k-token context on this fleet's
-local backend costs about a minute, so the 120 s deadline is comfortable at this size and the ladder Pi's own guard
-would run is the difference between 55 s and the 100–400 s spread in the table above. Second, no `session_before_compact`
-guard is needed here and there is none: in 1.6.1 `compact()` sets `_compactionAbortController`, `prompt()` refuses
-while a compaction is in flight, and `_checkCompaction()` only runs at turn boundaries — so an automatic compaction
-cannot race an idle one. What a Pi-started compaction does get is the same cooldown, because `session_compact` records
-it: a human `/compact` during an armed window is not followed by a second compaction two minutes later.
+local backend costs about a minute **when it is the only one running**, which is what the gate is for; the 120 s
+deadline that nine sessions hit simultaneously was not a slow model, it was contention. Second, no
+`session_before_compact` guard is needed here and there is none: in 1.6.1 `compact()` sets `_compactionAbortController`,
+`prompt()` refuses while a compaction is in flight, and `_checkCompaction()` only runs at turn boundaries — so an
+automatic compaction cannot race an idle one. What a Pi-started compaction does get is the same cooldown, because
+`session_compact` records it: a human `/compact` during an armed window is not followed by a second compaction two
+minutes later.
 
 | | |
 | --- | --- |
 | Commands | `/idle-compact status` · `on` · `off` · `dry-run` · `run [--force]` · `prune <off\|report\|on>` |
 | Flags | `--idle-compaction-off` |
 | Config | `.pi/idle-compaction.json`, with `IDLE_COMPACTION_*` overrides |
-| Knobs | `quietMs` (120000) · `startupQuietMs` (30000) · `urgentPercent` (80) / `urgentQuietMs` (20000) · `softPercent` (40) · `minFreeTokens` (20000) / `keptFloorTokens` (24000, Pi's 20000 keep-recent plus the measured 2565-token median summary) · `deadlineMs` (120000) · `cooldownMs` (600000) · `prune` (`report`) · `pruneKeepRecentResults` (12) · `pruneMinChars` (2000) |
-| Evidence | `.pi/idle-compaction/log.jsonl`, one JSON line per compaction decision, plus an arm refusal written once per reason (a session that never compacts still leaves evidence, and the same line is not repeated on every settle) |
+| Knobs | `quietMs` (120000) · `urgentPercent` (80) / `urgentQuietMs` (20000) · `softPercent` (40) · `minFreeTokens` (20000) / `keptFloorTokens` (24000, Pi's 20000 keep-recent plus the measured 2565-token median summary) · `deadlineMs` (240000, above the fleet p90 of 226 s) · `cooldownMs` (600000) · `spreadMs` (90000, the gap between fleet compactions) / `gateMaxWaitMs` (1800000) · `prune` (`report`) · `pruneKeepRecentResults` (12) · `pruneMinChars` (2000) |
+| Gate | `/workspace/.pi/idle-compaction/{lease.json,spacing.json}` — derived from the parent of the checkout, overridable with `IDLE_COMPACTION_GATE_DIR`, disabled with `IDLE_COMPACTION_GATE=off` |
+| Evidence | `.pi/idle-compaction/log.jsonl`, one JSON line per compaction decision, plus an arm refusal written once per reason (a session that never compacts still leaves evidence, and the same line is not repeated on every settle), and a `gate` line for every wait, takeover and forced run |
 
 ### `plan.ts` — `/goal`, `/direction` and `/todo`: the aim, the route to it, and the steps
 
