@@ -61,7 +61,8 @@ export interface PiRecord {
   messageRenderers: Map<string, AnyHandler>;
   entryRenderers: Map<string, AnyHandler>;
   busChannels: Map<string, AnyHandler[]>;
-  sentUserMessages: Array<{ content: unknown; options?: { deliverAs?: string } }>;
+  /** `expandPromptTemplates` is what makes Pi dispatch the text as a registered command instead of sending it to the model. */
+  sentUserMessages: Array<{ content: unknown; options?: { deliverAs?: string; expandPromptTemplates?: boolean } }>;
   /** Custom messages an extension injected with pi.sendMessage(), with the delivery options it asked for. */
   sentMessages: Array<{ message: any; options?: { triggerTurn?: boolean; deliverAs?: string } }>;
   appendedEntries: Array<{ type: string; data: unknown }>;
@@ -83,7 +84,7 @@ export interface FakePi extends PiRecord {
   getFlag(name: string): boolean | string | undefined;
   /** Test helper: Pi fills flags in from the CLI after extensions load. */
   setFlag(name: string, value: boolean | string | undefined): void;
-  sendUserMessage(content: unknown, options?: { deliverAs?: string }): void;
+  sendUserMessage(content: unknown, options?: { deliverAs?: string; expandPromptTemplates?: boolean }): void;
   /** pi.sendMessage(): recorded rather than projected, because the assertion that matters is what an
    *  extension injected and how it asked for delivery. */
   sendMessage(message: any, options?: { triggerTurn?: boolean; deliverAs?: string }): void;
@@ -185,7 +186,7 @@ export function createFakePi(): FakePi {
       if (!flag) throw new Error(`harness: cannot set unregistered flag "${name}"`);
       flag.value = value;
     },
-    sendUserMessage(content: unknown, options?: { deliverAs?: string }) {
+    sendUserMessage(content: unknown, options?: { deliverAs?: string; expandPromptTemplates?: boolean }) {
       track("sendUserMessage")([content, options]);
       record.sentUserMessages.push({ content, options });
     },
@@ -396,6 +397,8 @@ export interface ContextOptions {
   apiKeyResult?: { ok: true; apiKey?: string; headers?: Record<string, unknown>; env?: Record<string, string> } | { ok: false; error?: string };
   completeResult?: any;
   completeError?: Error;
+  /** When set, `ctx.reload()` records the attempt and throws this - the shape of a reload Pi refused. */
+  reloadError?: string;
 }
 
 /**
@@ -544,8 +547,10 @@ export function createContext(options: ContextOptions = {}): ContextRecord {
       idle = false;
     },
     reload: async () => {
-      state.reloads++;
       track("reload")([]);
+      // The attempt is recorded either way: what a caller cares about is whether the reload happened.
+      if (options.reloadError) throw new Error(options.reloadError);
+      state.reloads++;
     },
     newSession: async (sessionOptions?: any) => {
       const setupCalls: unknown[] = [];

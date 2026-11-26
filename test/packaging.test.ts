@@ -151,7 +151,9 @@ const EXPECTED: Record<string, Surface> = {
     entryRenderers: [],
   },
   "queue-reload.ts": {
-    events: [],
+    // A settle hook is not optional here: a tool context has no `reload()`, so the tool records the request and
+    // this handler dispatches the command that does. Without `agent_settled` the tool is a no-op.
+    events: ["agent_settled"],
     tools: ["queue_reload"],
     commands: ["queue-reload"],
     flags: [],
