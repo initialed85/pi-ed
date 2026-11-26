@@ -95,6 +95,37 @@ const EXPECTED: Record<string, Surface> = {
     messageRenderers: [],
     entryRenderers: [],
   },
+  "idle-compaction.ts": {
+    // Compaction has no event of its own to hook, so this is the whole idle question: what a run looked like on the
+    // way out (turn_start / agent_settled), what means somebody is busy again (tool_result, message_end, user_bash,
+    // ui_prompt_start, before_agent_start, agent_start), what means a prompt is already queued, where Pi reports a
+    // compaction it started itself (session_compact), and the idle probe that says whether the model is being called
+    // for nothing (cache_warming_decision). agent_before_settle is the context-edit boundary, not a signal.
+    // No turn_end on purpose: agent_settled follows every turn boundary and arms the window there, so a turn_end
+    // handler would only cancel an arm and re-arm the same one.
+    events: [
+      "session_start",
+      "turn_start",
+      "tool_result",
+      "message_end",
+      "user_bash",
+      "ui_prompt_start",
+      "agent_start",
+      "before_agent_start",
+      "agent_settled",
+      "agent_before_settle",
+      "session_compact",
+      "session_shutdown",
+      "cache_warming_decision",
+    ],
+    tools: [],
+    commands: ["idle-compact"],
+    flags: ["idle-compaction-off"],
+    // Deliberately none: a compaction summary is a `compaction` entry Pi already renders, and a mid-run prune is a
+    // `context_edit` entry Pi already renders. Drawing either one here would be drawing Pi's work again.
+    messageRenderers: [],
+    entryRenderers: [],
+  },
   "loop-guard.ts": {
     events: ["input", "session_start", "session_tree", "tool_call", "turn_end"],
     tools: [],
@@ -364,7 +395,15 @@ describe("extensions directory", () => {
           "message_end",
           "context",
           "user_bash",
+          "ui_prompt_start",
+          "cache_warming_decision",
           "model_select",
+          // Verified against the installed pi-coding-agent rather than assumed: `ui_prompt_start` is dispatched from
+          // the extension runner's own emitUIPromptEvent (dist/core/extensions/runner.js) and typed in
+          // dist/core/extensions/types.d.ts; `cache_warming_decision` is emitted by the cache warmer
+          // (dist/core/cache-warmer.js) through `this.decide(...)`, and an extension returning { action: "stop" } is
+          // honoured as "stopped by extension". Both are dispatched to extension handlers, which is the bar this list
+          // exists to hold.
           // The provider-facing events. They are the only place a client can see response headers, and
           // the only honest way to time a call and hear which model a stream actually used.
           "before_provider_request",

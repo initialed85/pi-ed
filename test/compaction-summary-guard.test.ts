@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createFakePi, createContext } from "./harness.ts";
+import { idleCompactionInstructions } from "../lib/compaction.ts";
 
 const MODULE = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -367,5 +368,63 @@ describe("compaction summary guard", () => {
     expect(result).toBeUndefined();
     expect(mockCompact).not.toHaveBeenCalled();
     expect([...event.preparation.fileOps.read]).toEqual(["/work/kept.ts", "/x.ts"]);
+  });
+
+  describe("one attempt, when the request asks for one", () => {
+    it("spends a single summarisation call on the idle scheduler's request", async () => {
+      // Over budget on purpose. The ladder exists to fix that, and declining it is the whole point: the
+      // single-attempt path has to land on the budget handling rather than on a second call.
+      const long = makeCompaction("line: ".repeat(1500), { output: 9000 });
+      mockCompact.mockResolvedValue(long);
+      const { result, ui } = await run(makeEvent({ customInstructions: idleCompactionInstructions() }));
+
+      expect(mockCompact).toHaveBeenCalledTimes(1);
+      expect(result?.compaction.summary).toBe(long.summary);
+      const last = ui.notifications.at(-1);
+      expect(last?.level).toBe("warning");
+      expect(last?.message).toContain("using the");
+    });
+
+    it("trims a single attempt that came back silly", async () => {
+      const huge = makeCompaction("x".repeat(40000), { output: 11000 });
+      mockCompact.mockResolvedValue(huge);
+      const { result } = await run(makeEvent({ customInstructions: idleCompactionInstructions() }));
+
+      expect(mockCompact).toHaveBeenCalledTimes(1);
+      const summary = result?.compaction.summary ?? "";
+      expect(summary).toContain("truncated by compaction-summary-guard");
+      expect(summary.length).toBeLessThan(SUMMARY_MAX_CHARS + 200);
+    });
+
+    it("accepts a slightly over-budget single attempt exactly as it accepts a slightly over-budget ladder run", async () => {
+      // 5000 output tokens is inside the 1.3x tolerance, so this is the same decision the ladder makes after its
+      // first run - which is the only reason declining the ladder is safe.
+      const soft = makeCompaction("y".repeat(5000), { output: 5000 });
+      mockCompact.mockResolvedValue(soft);
+      const { result, ui } = await run(makeEvent({ customInstructions: idleCompactionInstructions() }));
+
+      expect(mockCompact).toHaveBeenCalledTimes(1);
+      expect(result?.compaction.summary).toBe(soft.summary);
+      expect(ui.notifications.at(-1)?.message).toContain("accepted rather than spending two more summarisation calls");
+    });
+
+    it("honours the plain-English request too", async () => {
+      mockCompact.mockResolvedValue(makeCompaction("z".repeat(9000), { output: 9000 }));
+      await run(makeEvent({ customInstructions: "keep it short: single summarisation attempt" }));
+      expect(mockCompact).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps the ladder for a compaction nobody asked to shortcut", async () => {
+      mockCompact.mockResolvedValue(makeCompaction("w".repeat(9000), { output: 9000 }));
+      await run(makeEvent({ customInstructions: "focus on the deployment" }));
+      expect(mockCompact).toHaveBeenCalledTimes(3);
+    });
+
+    it("does not shortcut an aborted run into a call it will not use", async () => {
+      const event = makeEvent({ aborted: true, customInstructions: idleCompactionInstructions() });
+      const { result } = await run(event);
+      expect(result).toBeUndefined();
+      expect(mockCompact).not.toHaveBeenCalled();
+    });
   });
 });

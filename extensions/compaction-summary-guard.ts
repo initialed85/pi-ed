@@ -38,6 +38,8 @@
 
 import { compact, type CompactionResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+import { isSingleAttemptRequest, ONE_ATTEMPT_PHRASE } from "../lib/compaction.ts";
+
 /** Ceiling for one summarization response (Pi clamps this to model.maxTokens too). */
 const SUMMARY_OUTPUT_TOKENS = 8192;
 /** Maximum accepted summary size; checked against provider usage and a conservative chars/4 estimate. */
@@ -59,6 +61,32 @@ const COMPRESS_HARDEST = `The last summary was still over budget. Rewrite it fro
 const SOFT_OVERLIMIT_RATIO = 1.3;
 /** Past this multiple of the budget the summary is trimmed to it rather than passed through whole. */
 const TRIM_OVERLIMIT_RATIO = 2;
+
+/**
+ * Whether this compaction asked for one summarisation call instead of the ladder.
+ *
+ * Asked two ways: the marker `lib/compaction.ts` writes as the first line of an idle compaction's
+ * `customInstructions`, or a person typing the plain-English equivalent into `/compact <text>`. Both reach the same
+ * preparation - `compact(options)` and a manual `/compact` both hand `customInstructions` to
+ * `session_before_compact` verbatim - so this matches on the text rather than on who asked.
+ *
+ * The wording lives in `lib/compaction.ts` so the scheduler and this guard cannot drift apart: the idle path is the
+ * one place where a summarisation call has nobody waiting for it, and that is exactly where the ladder's two extra
+ * calls are worth declining. Measured on this fleet's own sessions, a compaction runs 70 s median and 226 s p90 on
+ * a shared GPU, against 52-77 s for one clean summarisation call; the 48 compactions that went over budget spent
+ * 158 extra summarisation calls between them. The third rung is also where the reasoning structure goes -
+ * `COMPRESS_HARDEST` asks for 1000 tokens of "active task, critical constraints, current state" and drops the
+ * history, which is the point at which a summary stops being a record of what was decided.
+ *
+ * Declining the ladder does not decline the budget: an over-limit summary from the single attempt still lands on the
+ * soft-accept / trim / best-available paths below, so the worst case is a longer summary, never a failed compaction.
+ *
+ * What this deliberately does not touch: Pi's overflow-recovery path, where a failed summarisation costs a turn that
+ * is already in flight. That one keeps the ladder.
+ */
+export function isOneAttemptRequest(customInstructions: string | undefined): boolean {
+	return isSingleAttemptRequest(customInstructions) || ONE_ATTEMPT_PHRASE.test(customInstructions ?? "");
+}
 
 function overBudget(result: CompactionResult): { reason: string; tokens: number } | undefined {
 	const outputTokens = result.usage?.output;
@@ -136,7 +164,11 @@ export default function (pi: ExtensionAPI) {
 			return compact(prepared, model, auth.apiKey, headers, instructions, signal, "off", undefined, auth.env, RETRY_POLICY);
 		};
 
-		const compressionInstructions = [undefined, COMPRESS_HARDER, COMPRESS_HARDEST];
+		const ladder = [undefined, COMPRESS_HARDER, COMPRESS_HARDEST];
+		// One rung when the request asked for one attempt (see isOneAttemptRequest). An over-limit result from that
+		// single attempt then falls through to the soft-accept / trim / best-available paths rather than being paid for
+		// twice more.
+		const compressionInstructions = isOneAttemptRequest(customInstructions) ? ladder.slice(0, 1) : ladder;
 		let lastFailure = "summary was empty";
 		// The smallest summary any attempt produced, kept so the last resort is a real summary rather
 		// than the default path. Each attempt summarises the same input, so any of them is valid.

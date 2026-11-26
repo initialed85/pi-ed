@@ -384,7 +384,9 @@ export interface ContextOptions {
   cwd?: string;
   idle?: boolean;
   model?: any;
-  contextUsage?: { percent: number | null } | undefined;
+  contextUsage?: { percent: number | null; tokens?: number | null; contextWindow?: number } | undefined;
+  /** What `ctx.hasPendingMessages()` answers. A queued prompt is a blocker for idle work. */
+  pendingMessages?: boolean;
   signal?: AbortSignal | undefined;
   sessionFile?: string | undefined;
   sessionId?: string | undefined;
@@ -411,6 +413,11 @@ export interface ContextRecord {
   ui: FakeUi;
   calls: RecordedCall[];
   completed: Array<{ payload: any; options: any }>;
+  /**
+   * What `ctx.compact()` was asked for, in call order. The callbacks are recorded rather than run: Pi compacts
+   * asynchronously and reports through `onComplete`/`onError`, so a test drives the outcome it wants to assert on.
+   */
+  compacts: Array<{ options: any }>;
   newSessionArgs: Array<{ options: any; setupCalls: unknown[] }>;
   /**
    * Live counters, mutated by the context doubles. Handed out as one object rather than as plain
@@ -428,6 +435,7 @@ export interface ContextRecord {
 export function createContext(options: ContextOptions = {}): ContextRecord {
   const calls: RecordedCall[] = [];
   const completed: Array<{ payload: any; options: any }> = [];
+  const compacts: Array<{ options: any }> = [];
   const newSessionArgs: Array<{ options: any; setupCalls: unknown[] }> = [];
   const state = { reloads: 0, waitIdleCalls: 0 };
   let idle = options.idle ?? true;
@@ -459,7 +467,10 @@ export function createContext(options: ContextOptions = {}): ContextRecord {
       idle = value;
     },
     isProjectTrusted: () => true,
-    hasPendingMessages: () => false,
+    hasPendingMessages: () => {
+      track("hasPendingMessages")([]);
+      return options.pendingMessages ?? false;
+    },
     abort: () => {
       track("abort")([]);
     },
@@ -470,8 +481,9 @@ export function createContext(options: ContextOptions = {}): ContextRecord {
       track("getContextUsage")([]);
       return options.contextUsage ?? { percent: 20, tokens: 20000, contextWindow: 100000 };
     },
-    compact: () => {
-      track("compact")([]);
+    compact: (compactOptions?: any) => {
+      track("compact")([compactOptions]);
+      compacts.push({ options: compactOptions });
     },
     getSystemPrompt: () => "system prompt",
     getSystemPromptOptions: () => ({}),
@@ -557,6 +569,7 @@ export function createContext(options: ContextOptions = {}): ContextRecord {
     ui,
     calls,
     completed,
+    compacts,
     newSessionArgs,
     state,
   };

@@ -53,15 +53,15 @@ class registries.
 
 ## The extensions
 
-Thirteen of them live in `extensions/` and are what `pi install git:github.com/initialed85/pi-ed` loads. One more,
+Fifteen of them live in `extensions/` and are what `pi install git:github.com/initialed85/pi-ed` loads. One more,
 `memory.ts`, is in **`parked/`**: compiled, tested and swept against the live store, but outside the directory Pi
 discovers, so no session is given its tools. Ed turned Postgres memory off on 2026-11-10 to make a graph memory door
 the fleet's only memory; `parked/README.md` keeps the measurements taken while that call was being made, and how to
 bring it back.
 
-`turn-stats.ts` is documented in its own file header: it replaces the client's guesses
-about throughput and timing with the numbers Rooter already publishes in response headers, drawn as one
-dim line under each assistant answer.
+`turn-stats.ts`, `tags.ts`, `searxng.ts`, `session-commands.ts`, `session-markers.ts` and `queue-reload.ts` are
+documented in their own file headers rather than below: each one is small, and the header is where the measurement that
+justifies it sits.
 
 ### `autopilot.ts` — the model writes the next prompt from your shoes
 
@@ -125,6 +125,62 @@ summary that happened to be a bit long.
 | | |
 | --- | --- |
 | Knobs | `SUMMARY_OUTPUT_TOKENS` (8192), `SUMMARY_TARGET_TOKENS` (4000, so 16000 characters), `SOFT_OVERLIMIT_RATIO` (1.3, accept without retrying), `TRIM_OVERLIMIT_RATIO` (2, trim rather than pass through), `RETRY_POLICY` (`maxRetries: 2`, `baseDelayMs: 2000`, `maxAgentDelayMs: 15000`) |
+
+### `idle-compaction.ts` — the housekeeping runs while nobody is waiting for it
+
+The complaint this answers: a compaction sits in the middle of a run and takes about five minutes, so the session
+feels slow even though the model was never the problem.
+
+Measured out of 102 compactions across this repository's own session logs, and then out of Pi's source:
+
+| measured | |
+| --- | --- |
+| where Pi compacts | `tokensBefore` median 114688, p10 111031, p90 115577 — a 3.4k spread against a 131072 window, because Pi compacts at `contextWindow − reserveTokens`, which is 87.5% |
+| how long it takes | median 71 s, p90 226 s, p99 337 s, max 399 s — but r² ≤ 0.09 against the summarised span, the summary size and the token counts, so the wait is not the transcript's fault |
+| what it costs | 3.12M of 353.7M tokens in a 56-compaction session: 0.9% |
+| when it happens | every one I could attribute landed inside a run, while 92% of the wall time of those sessions sat in gaps longer than five minutes |
+| what a clean attempt costs locally | 52 s (strata) and 77 s (sushi) at 31k input tokens; an output sweep of 600 / 1500 / 3000 / 4500 tokens took 27 / 48 / 70 / 69 s |
+
+So the tokens were never the issue, and the transcript length does not explain the latency. What explains a *median of
+five minutes* on a shared GPU is a retry ladder — which is what this repository's own guard does when a summary comes
+back oversized: three attempts on a contended backend is a 100–400 s spread, and that is exactly the spread above. The
+idle path asks for **one** attempt (`lib/compaction.ts` puts `pi-ed:compaction-single-attempt` in the instructions and
+the guard honours it with one summarisation call and no ladder), and aborts it if it runs long.
+
+It arms a quiet window when a run settles — two minutes by default, twenty seconds above 80% of the window, because
+above that the next prompt pays the cost anyway — and cancels it for anything that means a turn is happening or about
+to happen. At session start it arms for 30 s, which is the case a resume near the ceiling needs. What the summary must
+keep is named in the instructions, and this session's plan is quoted verbatim out of `.pi/plan/<session-id>.json`
+rather than reconstructed from a summary of a summary.
+
+The deadline is not politeness. Pi's `prompt()` throws `"Cannot submit a prompt while compaction is in progress.
+Wait for compaction to finish and retry."`, and no extension event runs before that check, so a 226 s compaction is a
+window where the next thing typed fails. At `deadlineMs` this extension calls `ctx.abort()`, which reaches Pi's
+`abortCompaction()` and cancels the in-flight summarisation; an aborted compaction writes nothing, so the session
+keeps everything it had.
+
+It also counts stale tool output at `agent_before_settle` — tool results are 3.40M of the 5.00M characters of
+transcript in that session, 68% — and dropping them is the one context reduction that needs no model call and keeps
+the reasoning verbatim. **By default it only counts them.** Set `prune: "on"` to replace stale, text-only, non-recent
+results with a one-line stub through a `context_edit` *replacement* (never an omission, so the tool call keeps a result
+and the pairing survives). That is the mode to watch before trusting it.
+
+While a compaction is in flight it answers `cache_warming_decision` with `stop`, because Pi pays a cache write to keep
+a warm prefix alive that the compaction is about to throw away. Every model in this fleet declares no cache lifetime,
+so that is insurance rather than a saving today.
+
+Tested at the contract boundary rather than inside Pi's loop: 30 cases over fake timers with the shipped defaults
+(arm, cancel, re-check on fire, cooldown, deadline, the plan pin, the prune protections), plus a contract test that
+fails if the scheduler's marker and the guard's marker stop agreeing. What has *not* been done yet is a live pod
+running it: the five-minute figure is measured, the improvement is arithmetic.
+
+| | |
+| --- | --- |
+| Commands | `/idle-compact status` · `on` · `off` · `dry-run` · `run [--force]` · `prune <off\|report\|on>` |
+| Flags | `--idle-compaction-off` |
+| Config | `.pi/idle-compaction.json`, with `IDLE_COMPACTION_*` overrides |
+| Knobs | `quietMs` (120000) · `startupQuietMs` (30000) · `urgentPercent` (80) / `urgentQuietMs` (20000) · `softPercent` (40) · `minFreeTokens` (20000) / `keptFloorTokens` (24000, Pi's 20000 keep-recent plus the measured 2565-token median summary) · `deadlineMs` (120000) · `cooldownMs` (600000) · `prune` (`report`) · `pruneKeepRecentResults` (12) · `pruneMinChars` (2000) |
+| Evidence | `.pi/idle-compaction/log.jsonl`, one JSON line per decision including the ones where it chose to do nothing |
 
 ### `plan.ts` — `/goal`, `/direction` and `/todo`: the aim, the route to it, and the steps
 

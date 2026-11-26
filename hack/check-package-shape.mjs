@@ -29,6 +29,9 @@ const EXPECTED_EXTENSIONS = [
   "background.ts",
   "graphiti.ts",
   "compaction-summary-guard.ts",
+  // The guard retries a summarisation; this is what makes the compaction happen while nobody is waiting for it.
+  // Both are in the load path and the idle path depends on the guard honouring the marker the scheduler asks for.
+  "idle-compaction.ts",
   "loop-guard.ts",
   "plan.ts",
   "queue-reload.ts",

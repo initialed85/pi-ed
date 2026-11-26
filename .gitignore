@@ -3,6 +3,10 @@ coverage/
 .vitest-cache/
 *.log
 .pi/auto-resume.json
+# Per-session plans, written by extensions/plan.ts as `.pi/plan/<session-id>.json`. They belong to a session, not to
+# the repository - a session's own durability comes from Pi's session store and from the summary its compaction writes,
+# not from git - and committing them would put one file per session into a public repo forever.
+.pi/plan/
 
 # Pi session artifacts: uploads and images the agent was shown. They belong to the session, not
 # to the repository, and `git add -A` will otherwise commit a screenshot of someone’s screen into a public repo -
