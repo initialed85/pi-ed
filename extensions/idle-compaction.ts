@@ -56,9 +56,12 @@
  *   57181 tokens and 107.2 s for 103142 tokens. Pi's trigger point runs median 71 s and p90 226 s, and every
  *   concurrent attempt died at the old 120 s. A deadline below the p90 cancels work that was going to finish. |
  * | `cooldownMs` | 600000 | Stop an idle session from summarising itself over and over. |
- * | `spreadMs` | 90000 | The gap between fleet compactions. The same logs show a solo run of this feature costing
- *   59-107 s, so a 90 s gap keeps the local backends serving one summarisation at a time without making a session
- *   wait for the fleet. |
+ * | `spreadMs` | 90000 | The gap between fleet compactions, measured from the moment the previous attempt **let go** - |
+ *   59-107 s. A 90 s gap keeps the local backends serving one summarisation at a time without making a session wait
+ *   for the fleet. Measured from the hand-back rather than the start on purpose: a 107 s attempt plus a 90 s gap is
+ *   197 s between heavy calls, whereas a gap measured from the start would be fully consumed by the attempt itself
+ *   and the fleet would go back-to-back. The cost is stated plainly in `spacing.json`, which records the outcome: a
+ *   summarisation that dies at its 240 s deadline paces the fleet just as hard as one that finished. |
  * | `gateMaxWaitMs` | 1800000 | Queueing has to end. Thirty minutes of waiting is a skip with a reason, not a session
  *   that never compacts. |
  * | `prune` | `report` | `report` counts the reclaimable stale tool output and touches nothing. `on` writes the edits. |
@@ -371,7 +374,14 @@ function debug(ctx: ExtensionContext | undefined, line: string): void {
  * slopyphus summarised 57181 tokens in 59.2 s, and pi-bot summarised 103142 in 107.2 s. Same sizes as the burst,
  * 59-107 s instead of "never finished". Concurrency is the difference, so the gate makes an idle summarisation a
  * fleet resource with two rules: **one in flight at a time** (a lease file) and **a minimum gap between
- * starts** (a spacing stamp), both on the shared `/workspace` root every pod mounts.
+ * starts** (a spacing stamp, written when the previous attempt hands the gate back, whatever its outcome), both on
+ * the shared `/workspace` root every pod mounts.
+ *
+ * The gate is cooperative, and that is its one real limit: a pod only defers to peers that claim the lease. A pod
+ * running a build without the gate is invisible to it - not a leak, just nothing to read. Field proof from
+ * 2026-11-26T21:08:59Z: pi-bot held the lease on a 98484-token attempt when home-ops, still on `ce1e789`, started a
+ * 71940-token summarisation 74 s into it and died at its own 120 s ceiling. So a partial rollout protects nobody,
+ * which is the argument for moving every pod at once.
  */
 
 const GATE_DIR_NAME = "idle-compaction";
@@ -568,21 +578,54 @@ function claimGate(
   };
 }
 
+/**
+ * How many releases one spacing file remembers. Tonight's rollout questions were all "who claimed when", and three
+ * agents had to read four pods' logs to answer them; the newest stamp alone cannot show a pair.
+ */
+const SPACING_HISTORY = 12;
+
+interface SpacingStamp {
+  at: number;
+  repo: string;
+  /** Why the stamp exists. A dead attempt paces the fleet as hard as a finished one, and a reader should be able to tell. */
+  outcome: string;
+}
+
 /** Give the gate back, and stamp when it was handed back so peers space their starts after it. Only a holder may release it. */
-function releaseGate(dir: string, sessionId: string, repo: string, now: number): void {
+function releaseGate(dir: string, sessionId: string, repo: string, now: number, outcome: string): void {
   try {
     const lease = readGateFile(join(dir, LEASE_FILE));
     if (lease && lease.sessionId === sessionId) unlinkSync(join(dir, LEASE_FILE));
-    writeFileSync(join(dir, SPACING_FILE), JSON.stringify({ at: now, repo }), "utf8");
+    stampGate(dir, repo, now, outcome);
   } catch {
     // A gate that cannot be released expires by itself; it must never become the reason a session breaks.
   }
 }
 
-/** Stamp when a compaction let go, so peers space their starts after it. */
-function stampGate(dir: string, repo: string, now: number): void {
+/**
+ * Stamp when an attempt let go, so peers space their starts after it. `at`/`repo` stay at the top level because
+ * that is what the gate reads; `prior` is the history, newest first, for whoever is reading the shared directory.
+ */
+function stampGate(dir: string, repo: string, now: number, outcome: string): void {
   try {
-    writeFileSync(join(dir, SPACING_FILE), JSON.stringify({ at: now, repo }), "utf8");
+    const previous = readGateFile(join(dir, SPACING_FILE));
+    const history: SpacingStamp[] = [];
+    if (previous && typeof previous.at === "number") {
+      history.push({
+        at: previous.at,
+        repo: typeof previous.repo === "string" ? previous.repo : "unknown",
+        outcome: typeof previous.outcome === "string" ? previous.outcome : "unknown",
+      });
+    }
+    if (Array.isArray(previous?.prior)) {
+      for (const entry of previous.prior as unknown[]) {
+        if (entry && typeof entry === "object" && typeof (entry as SpacingStamp).at === "number") {
+          history.push(entry as SpacingStamp);
+        }
+      }
+    }
+    const stamp: SpacingStamp = { at: now, repo, outcome };
+    writeFileSync(join(dir, SPACING_FILE), JSON.stringify({ ...stamp, prior: history.slice(0, SPACING_HISTORY - 1) }), "utf8");
   } catch {
     /* a stamp that cannot be written costs nothing */
   }
@@ -631,6 +674,8 @@ interface State {
   gateWaitedMs: number;
   /** Set when a forced run went ahead without holding the lease: it still gets to stamp the spacing. */
   gateStamp: boolean;
+  /** Set when this session's own deadline aborted an attempt, so the failure that follows is named as ours. */
+  deadlineFiredAt: number | undefined;
   /** What was read from `.pi/idle-compaction.json` and when. `readConfig` runs at session start on purpose, and a
    *  person editing that file mid-session is entitled to know that their edit is not live yet. */
   configStamp: { path: string; readAt: string | undefined; mtimeMs: number | undefined };
@@ -731,6 +776,7 @@ export default function (pi: ExtensionAPI) {
     gateNote: "not claimed",
     gateWaitedMs: 0,
     gateStamp: false,
+    deadlineFiredAt: undefined,
     compactionHookAt: undefined,
     lastCompactionAt: undefined,
     entriesAtCompaction: undefined,
@@ -819,16 +865,16 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** Only a holder hands the gate back, and it stamps when it let go. */
-  function handBackGate(note: string): void {
+  function handBackGate(note: string, outcome: string): void {
     const ctx = state.lastCtx;
     if (!ctx || !state.gateDir) return;
     if (state.gateHeld) {
-      releaseGate(state.gateDir, sessionIdOf(ctx), basename(ctx.cwd), Date.now());
+      releaseGate(state.gateDir, sessionIdOf(ctx), basename(ctx.cwd), Date.now(), outcome);
       state.gateHeld = false;
     } else if (state.gateStamp) {
       // It never owned the lease, so it cannot release one; but a compaction just happened here, and peers
       // should space their next starts after it all the same.
-      stampGate(state.gateDir, basename(ctx.cwd), Date.now());
+      stampGate(state.gateDir, basename(ctx.cwd), Date.now(), outcome);
       state.gateStamp = false;
     } else {
       return;
@@ -930,6 +976,7 @@ export default function (pi: ExtensionAPI) {
       state.deadline = undefined;
       if (!state.compacting) return;
       state.stats.abortedAtDeadline += 1;
+      state.deadlineFiredAt = Date.now();
       state.stats.lastNote = `aborted at the ${state.cfg.deadlineMs}ms deadline`;
       state.stats.lastAt = new Date().toISOString();
       record(ctx, "deadline", { trigger, quietMs, deadlineMs: state.cfg.deadlineMs, elapsedMs: Date.now() - startedAt });
@@ -962,7 +1009,7 @@ export default function (pi: ExtensionAPI) {
           const freed = typeof after === "number" ? Math.max(0, tokensBefore - after) : 0;
           state.compacting = false;
           clearDeadline();
-          handBackGate(`compacted in ${ms}ms`);
+          handBackGate(`compacted in ${ms}ms`, "compacted");
           state.stats.fired += 1;
           state.stats.freedTokens += freed;
           state.stats.lastNote = `compacted ${tokensBefore} to ${after ?? "?"} tokens (freed ${freed}) in ${Math.round(ms / 1000)}s`;
@@ -984,7 +1031,12 @@ export default function (pi: ExtensionAPI) {
           const ms = Date.now() - startedAt;
           state.compacting = false;
           clearDeadline();
-          handBackGate(`error after ${ms}ms`);
+          // Named by what actually killed it: our deadline, or Pi saying no. That distinction is what the shared
+          // spacing stamp now carries too, and tonight it was the difference between a backend failure and a ceiling
+          // that was simply too short.
+          const diedAtOurCeiling = state.deadlineFiredAt !== undefined;
+          state.deadlineFiredAt = undefined;
+          handBackGate(`error after ${ms}ms`, diedAtOurCeiling ? "aborted at deadline" : "error");
           // "Already compacted" and "Nothing to compact (session too small)" are Pi saying the work was
           // already done or there is none: a skip, not a fault worth a warning.
           const benign = /already compacted|too small|cancelled/i.test(error.message);
@@ -999,7 +1051,7 @@ export default function (pi: ExtensionAPI) {
       // A context invalidated by a reload throws instead of acting on the wrong session.
       state.compacting = false;
       clearDeadline();
-      handBackGate("could not start");
+      handBackGate("could not start", "could not start");
       state.stats.failed += 1;
       state.stats.lastNote = `could not start: ${error instanceof Error ? error.message : String(error)}`;
       debug(ctx, state.stats.lastNote);
@@ -1192,7 +1244,7 @@ export default function (pi: ExtensionAPI) {
     clearDeadline();
     // A pod killed mid-compaction would otherwise leave the fleet waiting on a lease nobody can release.
     // The TTL is the backstop; this is the prompt one.
-    handBackGate("session shutdown");
+    handBackGate("session shutdown", "session shutdown");
     const s = state.stats;
     debug(
       ctx,

@@ -165,9 +165,19 @@ point takes median 71 s and p90 226 s: a deadline under the p90 is a machine tha
 It then queues for a **fleet gate**, because every model here is served by two backends and nine sessions asking at
 once is a different problem from one session asking. The gate is a lease file at
 `/workspace/.pi/idle-compaction/lease.json` — the parent of `/workspace/<repo>` for every checkout on the shared
-volume, which is exactly the scope the contention happens at — plus a spacing stamp recording when the last
-compaction let go. A session may start only when no live lease exists and the last one finished at least `spreadMs`
-ago; otherwise it re-checks on a bounded poll (30 s) and gives up after `gateMaxWaitMs`. A lease carries its holder's
+volume, which is exactly the scope the contention happens at — plus a spacing stamp recording when the last attempt
+let go. A session may start only when no live lease exists and the last one let go at least `spreadMs` ago; otherwise
+it re-checks on a bounded poll (30 s) and gives up after `gateMaxWaitMs`. The gap is measured from the hand-back and
+not from the start on purpose: a 107 s attempt would eat a 90 s start-to-start gap entirely and the fleet would go
+back-to-back. The cost of that is stated rather than hidden — an attempt that dies at its 240 s deadline paces the
+fleet for another 90 s after it fails, so the worst case is about 330 s in which nobody summarises, which is the right
+failure posture when the thing that just failed was a summarisation. The stamp now says `who`, `when` and `why`
+(`compacted`, `aborted at deadline`, `error`, `could not start`, `session shutdown`) and keeps the last 12 of them in
+`prior`, because on 2026-11-26 three agents reconstructed "who claimed when" from four pods' logs and the newest stamp
+alone could not show the pair. The gate is cooperative, and that is its one limit: a pod defers only to peers that
+claim the lease, so a pod running a build without the gate is invisible. Field proof: at 21:08:59Z home-ops, still on
+`ce1e789`, started a 71940-token summarisation 74 s into pi-bot's held lease and died at its own 120 s ceiling. A
+partial rollout protects nobody, which is the argument for moving every pod at once. A lease carries its holder's
 session id, repo, start time and expiry, so a pod killed mid-compaction leaves something the next session takes over
 instead of a fleet permanently blocked by a corpse.
 

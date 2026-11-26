@@ -37,6 +37,8 @@ const MODULE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../ex
 const QUIET_MS = 120000;
 const SPREAD_MS = 90000;
 const POLL_MS = 30000;
+/** `deadlineMs` as shipped. The gate tests do not override it, and one test below runs a ceiling out to its end. */
+const DEADLINE_MS = 240000;
 
 let dirs: string[] = [];
 let gateDir: string = "";
@@ -182,6 +184,75 @@ describe("the fleet gate", () => {
     holder.compacts[0]!.options.onComplete(completed(31000));
     vi.advanceTimersByTime(SPREAD_MS + POLL_MS * 3);
     expect(waiter.compacts).toHaveLength(1);
+  });
+
+  it("paces the fleet after a summarisation died at its ceiling, and says which of the two it was", async () => {
+    // The field shape pi-bot measured at 2026-11-26T21:11:45Z: a 98484-token attempt held the lease, ran to its
+    // 240000ms deadline, was cancelled, and the spacing stamp that appeared was dated at the abort. That is
+    // deliberate, and this is what it buys: a peer does not immediately re-buy the summarisation that just failed.
+    const holder = await pod("home-ops");
+    const peer = await pod("camry");
+
+    vi.advanceTimersByTime(QUIET_MS);
+    expect(holder.compacts).toHaveLength(1);
+    expect(peer.compacts).toHaveLength(0);
+    expect(log(peer.cwd).some((entry) => entry.kind === "gate" && entry.heldBy === "home-ops")).toBe(true);
+
+    // The ceiling expires, this session's own abort wins the race, and Pi reports the cancellation.
+    vi.advanceTimersByTime(DEADLINE_MS + 1);
+    expect(log(holder.cwd).some((entry) => entry.kind === "deadline" && entry.elapsedMs === DEADLINE_MS)).toBe(true);
+
+    const abortedAt = Date.now();
+    holder.compacts[0]!.options.onError(new Error("Compaction cancelled"));
+
+    // The gate is handed back, so the fleet is not blocked behind a dead lease...
+    expect(() => readFileSync(path.join(gateDir, "lease.json"), "utf8")).toThrow();
+    const stamp = JSON.parse(readFileSync(path.join(gateDir, "spacing.json"), "utf8")) as {
+      at: number;
+      repo: string;
+      outcome: string;
+      prior: Array<{ at: number; repo: string; outcome: string }>;
+    };
+    // ...and the stamp now answers who, when and why, which is the difference between "waiting for a summarisation"
+    // and "waiting for one that was cancelled at a ceiling".
+    expect(stamp.repo).toBe("home-ops");
+    expect(stamp.at).toBe(abortedAt);
+    expect(stamp.outcome).toBe("aborted at deadline");
+
+    // A session that arms while the stamp is young is refused by the stamp rather than by a lease: nothing is
+    // summarising any more, and it still has to wait. `quietMs` is what lands its arm inside the spread window.
+    process.env.IDLE_COMPACTION_QUIET_MS = "20000";
+    let late: Session;
+    try {
+      late = await pod("macker");
+      vi.advanceTimersByTime(20000);
+    } finally {
+      delete process.env.IDLE_COMPACTION_QUIET_MS;
+    }
+
+    expect(late.compacts).toHaveLength(0);
+    const refusals = log(late.cwd).filter((entry) => entry.kind === "gate" && String(entry.heldBy ?? "").startsWith("the spacing stamp left by "));
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]!.heldBy).toBe("the spacing stamp left by home-ops");
+    expect(refusals[0]!.heldMs).toBeGreaterThanOrEqual(19000);
+    expect(refusals[0]!.heldMs).toBeLessThan(SPREAD_MS);
+    expect(refusals[0]!.waitMs).toBeGreaterThan(0);
+
+    // A failure paces the fleet; it does not stall it. Past the spread (plus the worst-case jitter the waiter can
+    // be told), the late session gets its turn - and the shared file then holds both halves of the pair, which is
+    // what it could not show tonight: every pod saw its own refusal, and nobody could read the pairing.
+    vi.advanceTimersByTime(SPREAD_MS * 2 + POLL_MS * 2);
+    expect(late.compacts).toHaveLength(1);
+    late.compacts[0]!.options.onComplete(completed(31000));
+
+    const history = JSON.parse(readFileSync(path.join(gateDir, "spacing.json"), "utf8")) as {
+      repo: string;
+      outcome: string;
+      prior: Array<{ at: number; repo: string; outcome: string }>;
+    };
+    expect(history.repo).toBe("macker");
+    expect(history.outcome).toBe("compacted");
+    expect(history.prior[0]).toEqual({ at: abortedAt, repo: "home-ops", outcome: "aborted at deadline" });
   });
 
   it("takes over a lease left behind by a session that died mid-compaction", async () => {
