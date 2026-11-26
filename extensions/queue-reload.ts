@@ -17,6 +17,15 @@
  * context to the command context (`ctx as unknown as ReloadContext`), threw `ctx.waitForIdle is not a function` on
  * the first call, and still returned "Reload queued for idle." - which is how pi-bot and slopyphus spent hours
  * waiting for reloads that had already died (slopyphus' tmux capture, 2026-11-26T20:43:39Z).
+ *
+ * **A queued reload lands at a settle boundary, and the gap can be enormous.** Pi delivers queued input only when a
+ * run settles, so a reload asked for inside a long-running turn does not fire until that turn ends. Measured in the
+ * field: slopyphus typed `/queue-reload` at 2026-11-26T21:39:38Z and Pi reloaded at 21:55:23Z - 15 m 45 s later -
+ * because their turn ran continuously the whole time. The tool path inherits the same property: it asks on the next
+ * settle, and if the agent is mid-turn that settle is however far away the work is. In the common case that calls for
+ * it (`pi update --extensions` from bash inside a long turn), tens of minutes between the update and the reload is
+ * Pi behaving correctly, not a dispatch that failed. Read a field report against this before concluding the dispatch
+ * is broken: the marker that it worked is a `session_shutdown reason=reload` line, not the elapsed time since the ask.
  */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";

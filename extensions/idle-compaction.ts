@@ -59,9 +59,12 @@
  *   compaction on 2026-11-26 freed 14156 tokens in 59 s. With the gate and `spreadMs` serialising the fleet, the
  *   concurrency this bar used to guard against is handled structurally instead. |
  * | `minFreeTokens` / `keptFloorTokens` | 20000 / 24000 | The floor is keepRecentTokens 20000 plus the measured median summary. A compaction that would free less than 20000 tokens is churn. **At this fleet's 131072 window these two are the binding eligibility bar: 44000 tokens.** |
- * | `deadlineMs` | 240000 | A solo attempt measured 27-77 s locally, and this feature's own logs measured 59.2 s for
- *   57181 tokens and 107.2 s for 103142 tokens. Pi's trigger point runs median 71 s and p90 226 s, and every
- *   concurrent attempt died at the old 120 s. A deadline below the p90 cancels work that was going to finish. |
+ * | `deadlineMs` | 240000 | Sized to the tail, and the tail is not the biggest payload: 109797 tokens took 73.6 s on
+ *   2026-11-26 while 55396 took 151.9 s an hour later - duration tracks backend contention, not token count. Pi's own
+ *   trigger point runs median 71 s and p90 226 s, 14 of this fleet's attempts died at the old 120 s ceiling, and the
+ *   one that died at 240 s ran alongside an ungated neighbour's summarisation. So 240 s is the ceiling for a **spaced**
+ *   fleet: after a fleet-wide roll, a `kind:"deadline"` at 240000 is evidence something else is wrong, because nothing
+ *   should be hammering the same two backends at the same time any more. |
  * | `cooldownMs` | 600000 | Stop an idle session from summarising itself over and over. |
  * | `spreadMs` | 90000 | The gap between fleet compactions, measured from the moment the previous attempt **let go** |
  *   rather than from the start. A solo run of this feature costs 59-107 s (the same logs that measured the burst), so
@@ -70,11 +73,13 @@
  *   whereas a gap measured from the start is fully consumed by the attempt itself and the fleet goes back-to-back.
  *   The cost is stated rather than hidden, and `spacing.json` records it: a summarisation that dies at its 240 s
  *   deadline paces the fleet just as hard as one that finished. |
- * | `gateMaxWaitMs` | 3600000 | Queueing has to end. An hour is a skip with a reason, not a session that never |
- *   compacts. The number is the drain, not a mood: a fleet restarted in one breath arms every gated session inside
- *   one second, and a fleet that serialises 13 summarisations at this feature's own measured cost (about 70 s each,
- *   plus `spreadMs` 90 s between them) drains in roughly 13 x 160 s = 2080 s. A 30-minute cap makes the last one or
- *   two sessions give up on a backlog that was about to clear. |
+ * | `gateMaxWaitMs` | 5400000 | Queueing has to end. Ninety minutes is a skip with a reason, not a session that never |
+ *   compacts. The number is the drain, not a mood. A fleet restarted in one breath arms every gated session inside
+ *   one second, and the drain is `spreadMs + duration` per session: at the durations this fleet measured on
+ *   2026-11-26 (52.7 s, 73.6 s, 75.3 s, 107.2 s, 151.9 s) that is 140-240 s each, so 13 sessions drain in 30-50
+ *   minutes and 16 in 37-64. Two independent estimates agree, and both blow past the old 1800000 - a 30-minute cap
+ *   made the last third of a restarted fleet give up on a backlog that was about to clear, which is what slopyphus
+ *   predicted from the shared files before this number moved. |
  * | `prune` | `report` | `report` counts the reclaimable stale tool output and touches nothing. `on` writes the edits. |
  * | `pruneKeepRecentResults` | 12 | The newest tool results are the working set; everything older is a candidate. |
  * | `pruneMinChars` | 2000 | Under this, the edit entry costs about what it saves. |
@@ -186,7 +191,7 @@ const DEFAULT_CONFIG: Config = {
   deadlineMs: 240000,
   cooldownMs: 600000,
   spreadMs: 90000,
-  gateMaxWaitMs: 3600000,
+  gateMaxWaitMs: 5400000,
   prune: "report",
   pruneKeepRecentResults: 12,
   pruneMinChars: 2000,
