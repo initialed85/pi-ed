@@ -118,6 +118,7 @@ import {
   type ExtensionContext,
   type MessageEndEvent,
   type SessionBoundaryDraft,
+  type SessionEntry,
   type ToolResultEvent,
   type TurnStartEvent,
   type UserBashEvent,
@@ -256,6 +257,20 @@ function truthy(raw: string | undefined): boolean {
 function clampNumber(key: NumericKey, value: number): number {
   const [min, max] = NUMERIC_LIMITS[key];
   return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+/**
+ * When this session last read its config file, and how new that file was at the time. `readConfig` runs at
+ * session start on purpose (a reload re-reads it, a running session does not change its own rules mid-flight),
+ * which means a person who edits `.pi/idle-compaction.json` while working has no way to tell from the log that
+ * their edit did nothing. This is the line that tells them.
+ */
+function configMtimeMs(path: string): number | undefined {
+  try {
+    return existsSync(path) ? statSync(path).mtimeMs : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function readConfig(ctx: ExtensionContext): RuntimeConfig {
@@ -607,16 +622,24 @@ interface State {
   startedAt: number;
   /** Set while this session holds the shared gate file. */
   gateHeld: boolean;
+  /** When a compaction began, whichever asked for it: `session_before_compact` fires on Pi's own path too, and this
+   *  is what makes Pi's compaction duration computable when its completion event carries no duration. */
+  compactionHookAt: number | undefined;
   gateDir: string | undefined;
   gateNote: string;
   /** Wall time spent queueing for the gate in the current chain. Reset on release and on session start. */
   gateWaitedMs: number;
   /** Set when a forced run went ahead without holding the lease: it still gets to stamp the spacing. */
   gateStamp: boolean;
+  /** What was read from `.pi/idle-compaction.json` and when. `readConfig` runs at session start on purpose, and a
+   *  person editing that file mid-session is entitled to know that their edit is not live yet. */
+  configStamp: { path: string; readAt: string | undefined; mtimeMs: number | undefined };
   lastCompactionAt: number | undefined;
   entriesAtCompaction: number | undefined;
   stats: Stats;
   tally: Tally;
+  /** The latest measurement, not a running total: the same stale result is still one result after four settles. */
+  lastPruneReport: { candidates: number; tokens: number };
   /** The arm refusal already written to the decision log, so a session that keeps refusing writes one line, not one per settle. */
   lastLoggedArmReason: string | undefined;
 }
@@ -708,10 +731,13 @@ export default function (pi: ExtensionAPI) {
     gateNote: "not claimed",
     gateWaitedMs: 0,
     gateStamp: false,
+    compactionHookAt: undefined,
     lastCompactionAt: undefined,
     entriesAtCompaction: undefined,
     stats: freshStats(),
     tally: freshTally(),
+    lastPruneReport: { candidates: 0, tokens: 0 },
+    configStamp: { path: "", readAt: undefined, mtimeMs: undefined },
     lastLoggedArmReason: undefined,
   };
 
@@ -919,6 +945,9 @@ export default function (pi: ExtensionAPI) {
     record(ctx, "compact", {
       trigger,
       quietMs,
+      // The ceiling this attempt actually ran under. Without it, a session that aborts at a deadline cannot tell
+      // anybody which ceiling it hit - which is how one pod's five-hour experiment came back void.
+      deadlineMs: state.cfg.deadlineMs,
       tokens: tokensBefore,
       percent: usage?.percent,
       pinnedPlanChars: planBlock?.length ?? 0,
@@ -991,17 +1020,23 @@ export default function (pi: ExtensionAPI) {
    * The rules, in the order they matter: keep the newest `pruneKeepRecentResults` whole, because that is the
    * working set; only touch text (an image somebody was looking at is not stale output); only touch ones big
    * enough that an edit entry is cheaper than what it saves; never touch one already edited.
+   *
+   * Measured over what Pi would actually send, which is not the whole session file. `getBranch()` is every entry
+   * ever written; `buildContextEntries()` is the compaction-aware view Pi builds: the newest compaction entry,
+   * everything from its `firstKeptEntryId` to that boundary, and everything after it. A tool result behind that
+   * boundary is already out of the request, and counting it invents a saving - pi-bot's pod reported 405 candidates
+   * and 409532 "tokens" reclaimable on an 83819-token window, which was the file rather than the reclaimable part.
    */
   function candidatesFor(ctx: ExtensionContext, cfg: RuntimeConfig): Candidate[] {
-    const branch = ctx.sessionManager.getBranch();
+    const window = windowEntries(ctx);
     const alreadyEdited = new Set<string>();
-    for (const entry of branch) {
-      if (entry.type === "context_edit") alreadyEdited.add(entry.targetId);
+    for (const entry of window) {
+      if (entry.type === "context_edit") alreadyEdited.add((entry as { targetId: string }).targetId);
     }
     const out: Candidate[] = [];
     let seen = 0;
-    for (let i = branch.length - 1; i >= 0; i--) {
-      const entry = branch[i];
+    for (let i = window.length - 1; i >= 0; i--) {
+      const entry = window[i];
       if (entry.type !== "message" || entry.message.role !== "toolResult") continue;
       seen += 1;
       if (seen <= cfg.pruneKeepRecentResults) continue;
@@ -1016,6 +1051,16 @@ export default function (pi: ExtensionAPI) {
     return out;
   }
 
+  /** The entries a reclaim could reach, and the size of the file they sit in, so a reader never confuses the two. */
+  function windowEntries(ctx: ExtensionContext): SessionEntry[] {
+    const manager = ctx.sessionManager as { buildContextEntries?: () => SessionEntry[]; getBranch: () => SessionEntry[] };
+    try {
+      return manager.buildContextEntries ? manager.buildContextEntries() : manager.getBranch();
+    } catch {
+      return manager.getBranch();
+    }
+  }
+
   /** Short, and honest about what it replaced: the point of the stub is that the reader can get the real thing back. */
   function stubFor(candidate: Candidate, at: string): string {
     return `[${MARK} ${at}: ${candidate.toolName} output dropped from context, about ${Math.round(candidate.chars / 1000)}k characters. It was reported, read and acted on earlier in this session; re-run the command or read the file again if the detail is needed.]`;
@@ -1028,6 +1073,7 @@ export default function (pi: ExtensionAPI) {
     // the same thing on the second session as on the first.
     state.forcedOff = pi.getFlag("idle-compaction-off") === true;
     state.cfg = readConfig(ctx);
+    state.configStamp = { path: configPath(ctx), readAt: new Date().toISOString(), mtimeMs: configMtimeMs(configPath(ctx)) };
     // A new session may be starting because a deploy restarted the pod, i.e. at the same instant as every other
     // session in the fleet. The gate is re-resolved here rather than at load so `IDLE_COMPACTION_GATE_DIR` and a
     // changed cwd both take effect on reload.
@@ -1071,22 +1117,58 @@ export default function (pi: ExtensionAPI) {
     arm(ctx, `agent_settled${urgent ? ":urgent" : ""}`, urgent ? state.cfg.urgentQuietMs : state.cfg.quietMs);
   });
 
+  /**
+   * A compaction is starting, whoever asked for it. No decision is taken here - the guard for Pi's own path is
+   * `compaction-summary-guard.ts`, and this extension's own path already has its ceiling. This exists so the two
+   * biggest compactions in the fleet (116325 and 119360 tokens) stop contributing zero duration data: Pi's own
+   * completion event has no duration, and a start stamp makes the millisecond computable after the fact.
+   */
+  pi.on("session_before_compact", () => {
+    state.compactionHookAt = Date.now();
+    return undefined;
+  });
+
   pi.on("session_compact", (event, ctx) => {
     // A compaction Pi started itself counts against the cooldown too, and is the evidence that the idle path
     // did not get there first.
     state.lastCompactionAt = Date.now();
     state.entriesAtCompaction = ctx.sessionManager.getBranch().length;
     if (!state.compacting) {
+      const ms = state.compactionHookAt ? Date.now() - state.compactionHookAt : undefined;
+      state.compactionHookAt = undefined;
       record(ctx, "compacted", {
         trigger: `pi:${event.reason}`,
         tokensBefore: event.compactionEntry.tokensBefore,
         summaryChars: event.compactionEntry.summary.length,
+        // `msSource` says where the number came from, because it is a measured span here and a caller's own clock
+        // on the idle path, and a reader should be able to tell which one they are comparing.
+        ...(ms === undefined ? {} : { ms, msSource: "session_before_compact to session_compact" }),
       });
-      debug(ctx, `Pi compacted on its own (${event.reason}); the idle path did not get there first`);
+      debug(ctx, `Pi compacted on its own (${event.reason}${ms === undefined ? "" : `, ${ms}ms`}); the idle path did not get there first`);
     }
   });
 
-  /** What the shared gate says right now, read from the filesystem rather than remembered. */
+  /**
+   * Which config this session is running on, and whether the file has moved since it was read.
+   *
+   * The fleet proved why this line is needed: pi-bot wrote `deadlineMs: 600000` into its own config file at 17:29,
+   * watched an attempt abort at 17:39 with the 120 s default, and could only prove afterwards, by reading the
+   * source, that the edit had never been read. Saying "defaults" is not enough when a person is mid-experiment.
+   */
+  function describeConfig(ctx: ExtensionContext): string {
+    const path = state.configStamp.path;
+    const shown = path.startsWith(ctx.cwd) ? path.slice(ctx.cwd.length + 1) : path;
+    const written = state.configStamp.mtimeMs;
+    if (written === undefined) return `config: ${shown} does not exist; this session runs on the built-in defaults`;
+    const at = (ms: number) => new Date(ms).toISOString().slice(11, 19);
+    const now = configMtimeMs(path);
+    const changed = now !== undefined && now > written;
+    return `config: ${shown}, read at session start (${at(written)})${
+      state.configStamp.readAt ? ` this session read it at ${state.configStamp.readAt.slice(11, 19)}` : ""
+    }${changed ? ` - and the file was written again at ${at(now)}: those values are NOT applied to this session, reload to apply them` : ""}`;
+  }
+
+  /** The shared gate as the fleet sees it, read from disk rather than remembered. */
   function describeGate(): string {
     if (!state.gateDir) return "fleet gate: off (IDLE_COMPACTION_GATE=off); this session compacts ungated";
     const now = Date.now();
@@ -1141,10 +1223,18 @@ export default function (pi: ExtensionAPI) {
     const reclaimable = candidates.reduce((sum, candidate) => sum + tokensFromChars(candidate.chars), 0);
     state.tally.candidates += candidates.length;
     state.tally.candidateTokens += reclaimable;
+    state.lastPruneReport = { candidates: candidates.length, tokens: reclaimable };
 
     if (cfg.prune === "report") {
-      record(ctx, "prune-report", { candidates: candidates.length, tokens: reclaimable, largestChars: candidates[0]?.chars ?? 0 });
-      debug(ctx, `prune report: ${candidates.length} stale tool results, about ${reclaimable} tokens reclaimable`);
+      record(ctx, "prune-report", {
+        candidates: candidates.length,
+        tokens: reclaimable,
+        largestChars: candidates[0]?.chars ?? 0,
+        // Both counts, because the difference is the whole point of the label.
+        contextEntries: windowEntries(ctx).length,
+        sessionEntries: ctx.sessionManager.getBranch().length,
+      });
+      debug(ctx, `prune report: ${candidates.length} stale tool results in the context Pi would send, about ${reclaimable} tokens reclaimable`);
       return undefined;
     }
 
@@ -1242,8 +1332,9 @@ export default function (pi: ExtensionAPI) {
         `${contextLine} · floor ${cfg.softPercent}% · quiet ${cfg.quietMs / 1000}s · urgent ${cfg.urgentQuietMs / 1000}s at ${cfg.urgentPercent}% · deadline ${cfg.deadlineMs / 1000}s · cooldown ${Math.round(cfg.cooldownMs / 1000)}s`,
         `armed ${s.armed} · not armed ${s.notArmed} · compacted ${s.fired} · skipped ${s.skipped} · failed ${s.failed} · deadline aborts ${s.abortedAtDeadline} · freed ${s.freedTokens} tokens`,
         `last: ${s.lastNote}${s.lastAt ? ` at ${s.lastAt}` : ""}`,
-        `stale tool output (${cfg.prune}): ${state.tally.candidates} candidates, about ${state.tally.candidateTokens} tokens reclaimable, ${state.tally.applied} replaced · newest ${cfg.pruneKeepRecentResults} results kept whole, ${cfg.pruneMinChars} char floor`,
+        `stale tool output (${cfg.prune}): ${state.lastPruneReport.candidates} candidates, about ${state.lastPruneReport.tokens} tokens reclaimable in the context Pi would send now, ${state.tally.applied} replaced this session · newest ${cfg.pruneKeepRecentResults} results kept whole, ${cfg.pruneMinChars} char floor`,
         planLine,
+        describeConfig(ctx),
       ];
       if (state.compacting) {
         lines.push(`a compaction started ${Math.round((Date.now() - state.startedAt) / 1000)}s ago; deadline in ${Math.max(0, Math.round((state.startedAt + cfg.deadlineMs - Date.now()) / 1000))}s`);

@@ -226,6 +226,33 @@ automatic compaction cannot race an idle one. What a Pi-started compaction does 
 `session_compact` records it: a human `/compact` during an armed window is not followed by a second compaction two
 minutes later.
 
+**What `idle-compact prune` is for, and what it counts.** Compaction needs a model call; dropping stale tool output
+needs an edit entry. Across 305 sessions the transcript is 5.00M characters and **3.40M of it (68%) is tool output**,
+100% of it from `bash`, `read` and `edit`. It is not uniformly reclaimable: 103,297 of 123,377 results are under the
+2000-character floor, 84%, and replacing one costs an entry — that is why the floor exists. The pool that matters is
+the 20,081 results above it, 2.45M characters, and 94% of that sits in 100 of the 305 sessions. On the 41 that have
+already been compacted once, keeping the ten newest results whole names 124,454 reclaimable characters (108,854
+estimated tokens) and 12,997 of them belong to the 21 oldest: **89% of the value is in the first twenty**, which is
+what makes a per-boundary cap safe. `report` (the default) counts and touches nothing; `on` replaces the oldest ones
+with a ~150-token stub naming the tool, the size and how to get the output back; `off` skips the pass.
+
+**It counts what Pi would send, not what the session file holds.** The scan runs over `sessionManager.buildContextEntries()`,
+Pi's compaction-aware view: the newest compaction entry, everything from its `firstKeptEntryId` to that boundary, and
+everything after it. A tool result behind that boundary is already out of the request, so counting it invents a saving.
+The field proved it: a pod logged `{"kind":"prune-report","candidates":405,"tokens":409532}` on a session whose live
+context was 83,819 tokens — that was the file, and a reader sizing a reclaim against it would have expected five times
+what the window can give back. The log line now carries `contextEntries` and `sessionEntries` beside the count, and the
+readout says *in the context Pi would send now*. The 108,854-token figure above is a whole-file measurement of a
+305-session corpus: the right way to ask where stale output lives, the wrong way to ask what one session reclaims.
+
+**Three numbers the fleet could not previously check.** `compact` lines now carry `deadlineMs`, so an abort proves
+which ceiling it hit — one pod wrote `deadlineMs: 600000` into its config mid-session, watched an attempt abort at the
+default, and could only prove afterwards, by reading the source, that the file had never been re-read. `/idle-compact
+status` now names the config file, says when it was read, and says in words when the file has been written since and
+*those values are not applied to this session*. And Pi's own compactions, whose completion event carries no duration,
+are timed from `session_before_compact` to `session_compact` and logged with `ms` and `msSource`: the fleet's two
+largest compactions, 116325 and 119360 tokens, had contributed no duration data at all.
+
 | | |
 | --- | --- |
 | Commands | `/idle-compact status` · `on` · `off` · `dry-run` · `run [--force]` · `prune <off\|report\|on>` |

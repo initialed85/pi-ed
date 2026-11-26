@@ -507,6 +507,10 @@ export function createContext(options: ContextOptions = {}): ContextRecord {
         track("sessionManager.getBranch")([fromId]);
         return options.branch ?? [];
       },
+      buildContextEntries: () => {
+        track("sessionManager.buildContextEntries")([]);
+        return fakeBuildContextEntries(options.branch ?? []);
+      },
     },
     modelRegistry: {
       getApiKeyAndHeaders: async (model: any) => {
@@ -640,4 +644,27 @@ export async function callTool(
   if (!tool) throw new Error(`harness: no tool registered as "${name}"`);
   if (!tool.execute) throw new Error(`harness: tool "${name}" has no execute`);
   return tool.execute(options.toolCallId ?? "call-1", params, options.signal, undefined, context);
+}
+
+/**
+ * A faithful stand-in for Pi's own `sessionManager.buildContextEntries()`: when the branch contains a compaction,
+ * the context Pi sends is the compaction entry, then everything from `firstKeptEntryId` up to the boundary, then
+ * everything after it. Older summarised entries are omitted. Pi's version walks a tree; this is the linear case the
+ * tests use, and the point of it is that a test can hand the same branch to `getBranch()` and to this and show that
+ * an extension counted the wrong one.
+ */
+export function fakeBuildContextEntries(branch: any[]): any[] {
+  let compaction: any = null;
+  for (const entry of branch) if (entry.type === "compaction") compaction = entry;
+  if (!compaction) return branch;
+  const index = branch.findIndex((entry) => entry.id === compaction.id);
+  if (index < 0) return branch;
+  const out: any[] = [compaction];
+  let foundFirstKept = false;
+  for (let i = 0; i < index; i++) {
+    const entry = branch[i];
+    if (entry.id === compaction.firstKeptEntryId) foundFirstKept = true;
+    if (foundFirstKept && !(entry.type === "message" && entry.message?.role === "system")) out.push(entry);
+  }
+  return [...out, ...branch.slice(index + 1)];
 }

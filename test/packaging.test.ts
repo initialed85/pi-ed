@@ -101,6 +101,8 @@ const EXPECTED: Record<string, Surface> = {
     // ui_prompt_start, before_agent_start, agent_start), what means a prompt is already queued, where Pi reports a
     // compaction it started itself (session_compact), and the idle probe that says whether the model is being called
     // for nothing (cache_warming_decision). agent_before_settle is the context-edit boundary, not a signal.
+    // session_before_compact takes no decision: Pi fires it on its own threshold path too, and Pi's completion event
+    // carries no duration, so a start stamp is what makes a fleet compaction measurable after the fact.
     // No turn_end on purpose: agent_settled follows every turn boundary and arms the window there, so a turn_end
     // handler would only cancel an arm and re-arm the same one.
     events: [
@@ -114,6 +116,7 @@ const EXPECTED: Record<string, Surface> = {
       "before_agent_start",
       "agent_settled",
       "agent_before_settle",
+      "session_before_compact",
       "session_compact",
       "session_shutdown",
       "cache_warming_decision",

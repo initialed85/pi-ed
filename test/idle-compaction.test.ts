@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -553,5 +553,135 @@ describe("idle compaction", () => {
     expect(lines[0]).toContain('"stage":"arm"');
     expect(lines[0]).toContain("under the 40% floor");
     expect(h.compacts).toHaveLength(0);
+  });
+});
+
+describe("every number it reports is the number it claims to be", () => {
+  /**
+   * Three field results shaped these assertions.
+   *
+   * pi-bot's pod reported `{"kind":"prune-report","candidates":405,"tokens":409532}` on a session whose live
+   * context was 83819 tokens: the scan had walked the whole session file, including the tool results behind a
+   * compaction boundary that Pi does not send, and a reader would size a reclaim against a number five times the
+   * window. The fix is `sessionManager.buildContextEntries()` - Pi's own compaction-aware view - and the assertion
+   * is the difference between the two counts.
+   *
+   * The same pod wrote `deadlineMs: 600000` into its config at 17:29, watched an attempt abort at the 120 s default
+   * at 17:39, and could only prove afterwards, from the source, that `readConfig` had never re-read the file. And
+   * the fleet's two largest completed compactions (116325 and 119360 tokens, Pi's own threshold path) contributed
+   * no duration at all, because Pi's completion event carries none.
+   */
+  function logLines(h: Harness): any[] {
+    return readFileSync(path.join(h.cwd, ".pi", "idle-compaction", "log.jsonl"), "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  }
+
+  function writeConfig(cwd: string, values: Record<string, unknown>, writtenAt: Date): string {
+    mkdirSync(path.join(cwd, ".pi"), { recursive: true });
+    const file = path.join(cwd, ".pi", "idle-compaction.json");
+    writeFileSync(file, `${JSON.stringify(values, null, 2)}\n`, "utf8");
+    // The mtime is pinned, not now(): the staleness check compares a file's mtime against the stamp taken at
+    // session start, and a test that relied on two writes landing on different milliseconds would be flaky.
+    utimesSync(file, writtenAt, writtenAt);
+    return file;
+  }
+
+  it("counts stale output over what Pi would send, not over the whole session file", async () => {
+    // A session compacted once already: t1..t7 are behind the boundary and Pi drops them, t8..t10 were kept,
+    // t11..t16 are new. The file holds 16 large tool results; the context Pi builds holds 9.
+    const branch = [
+      ...Array.from({ length: 10 }, (_unused, i) => toolResultEntry(`t${i + 1}`, "bash", 5000)),
+      { type: "compaction", id: "c1", parentId: "t10", timestamp: "2026-11-26T00:00:00.000Z", summary: "summary text", firstKeptEntryId: "t8", tokensBefore: 60000 },
+      ...Array.from({ length: 6 }, (_unused, i) => toolResultEntry(`t${11 + i}`, "bash", 5000)),
+    ];
+    const cwd = mkdtempSync(path.join(tmpdir(), "pi-ed-idle-window-"));
+    dirs.push(cwd);
+    // The keep-recent window is narrowed so the arithmetic has an answer worth asserting: 9 tool results in the
+    // context, 3 kept whole, 6 reclaimable. Over the whole file it would have claimed 13.
+    writeConfig(cwd, { pruneKeepRecentResults: 3, pruneMinChars: 1000 }, new Date("2026-11-26T10:00:00.000Z"));
+    const h = await setup({ cwd, branch });
+
+    await h.pi.emit("agent_before_settle", settleBoundary(), h.context);
+    const report = logLines(h).find((line) => line.kind === "prune-report");
+    expect(report.candidates).toBe(6);
+    // 6 x 5000 characters, at the same characters/4 estimate every other number in this file uses.
+    expect(report.tokens).toBe(7500);
+    expect(report.contextEntries).toBe(10);
+    expect(report.sessionEntries).toBe(17);
+
+    const text = await status(h);
+    expect(text).toContain("6 candidates, about 7500 tokens reclaimable in the context Pi would send now");
+  });
+
+  it("never writes a context edit against an entry Pi is not sending", async () => {
+    const branch = [
+      ...Array.from({ length: 10 }, (_unused, i) => toolResultEntry(`t${i + 1}`, "read", 5000)),
+      { type: "compaction", id: "c1", parentId: "t10", timestamp: "2026-11-26T00:00:00.000Z", summary: "summary text", firstKeptEntryId: "t8", tokensBefore: 60000 },
+      ...Array.from({ length: 6 }, (_unused, i) => toolResultEntry(`t${11 + i}`, "read", 5000)),
+    ];
+    const cwd = mkdtempSync(path.join(tmpdir(), "pi-ed-idle-window-apply-"));
+    dirs.push(cwd);
+    writeConfig(cwd, { prune: "on", pruneKeepRecentResults: 3, pruneMinChars: 1000 }, new Date("2026-11-26T10:00:00.000Z"));
+    const h = await setup({ cwd, branch });
+
+    const [result] = await h.pi.emit("agent_before_settle", settleBoundary(), h.context);
+    const ids = (result.entries as any[]).map((draft) => draft.targetId);
+    // Newest candidates first, and t1..t7 absent: they are already out of the request, and editing them would
+    // spend a boundary entry to save nothing.
+    expect(ids).toEqual(["t13", "t12", "t11", "t10", "t9", "t8"]);
+  });
+
+  it("says which config this session is running, and says so when the file has moved since it was read", async () => {
+    const cwd = mkdtempSync(path.join(tmpdir(), "pi-ed-idle-config-"));
+    dirs.push(cwd);
+    writeConfig(cwd, { deadlineMs: 600000 }, new Date("2026-11-26T17:04:31.000Z"));
+    const h = await setup({ cwd });
+
+    const before = await status(h);
+    expect(before).toContain("config: .pi/idle-compaction.json");
+    expect(before).toContain("read at session start (17:04:31)");
+    expect(before).toContain("deadline 600s");
+    expect(before).not.toContain("NOT applied");
+
+    // The exact sequence that voided one pod's experiment: a config edit made after the session started.
+    writeConfig(cwd, { deadlineMs: 30000 }, new Date("2026-11-26T17:29:02.000Z"));
+    const after = await status(h);
+    expect(after).toContain("written again at 17:29:02");
+    expect(after).toContain("NOT applied to this session, reload to apply them");
+    // And the readout still describes the values actually in force, because that is what a deadline line is for.
+    expect(after).toContain("deadline 600s");
+  });
+
+  it("records a session's own config in the log line it was measured under", async () => {
+    const cwd = mkdtempSync(path.join(tmpdir(), "pi-ed-idle-deadline-"));
+    dirs.push(cwd);
+    writeConfig(cwd, { deadlineMs: 600000 }, new Date("2026-11-26T17:04:31.000Z"));
+    const h = await setup({ cwd });
+
+    await settle(h);
+    vi.advanceTimersByTime(QUIET_MS);
+    const attempt = logLines(h).find((line) => line.kind === "compact");
+    expect(attempt?.deadlineMs).toBe(600000);
+    expect(attempt?.quietMs).toBe(QUIET_MS);
+  });
+
+  it("makes a compaction Pi started itself measurable in milliseconds", async () => {
+    const h = await setup();
+    // Pi's own threshold path fires both hooks, so a duration becomes computable even though the completion event
+    // carries none. A turn is what a threshold compaction happens during, so the idle timer is cancelled first -
+    // otherwise the quiet window fires mid-test and the completion looks like the idle path's own. This is the size class nobody had measured: 116325 tokens and 119360 tokens contributed zero
+    // duration data to the fleet's own logs.
+    await h.pi.emit("turn_start", { type: "turn_start", turnIndex: 1 }, h.context);
+    await h.pi.emit("session_before_compact", { type: "session_before_compact", preparation: {}, branchEntries: [], reason: "threshold" }, h.context);
+    vi.advanceTimersByTime(184000);
+    await h.pi.emit("session_compact", { type: "session_compact", reason: "threshold", compactionEntry: { id: "c1", tokensBefore: 116325, summary: "x".repeat(19253) } }, h.context);
+
+    const line = logLines(h).find((entry) => entry.kind === "compacted" && entry.trigger === "pi:threshold");
+    expect(line.tokensBefore).toBe(116325);
+    expect(line.summaryChars).toBe(19253);
+    expect(line.ms).toBe(184000);
+    expect(line.msSource).toBe("session_before_compact to session_compact");
   });
 });
