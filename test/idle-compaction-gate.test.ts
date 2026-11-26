@@ -150,7 +150,10 @@ describe("the fleet gate", () => {
     expect(times).toHaveLength(sessions.length);
     const gaps = times.slice(1).map((at, i) => at - times[i]!);
     // The acceptance claim, stated as a number: no two summarisations in this fleet started inside the same minute.
+    // The run measures 93.2 s to 125.6 s, which is what `spreadMs` plus the poll interval adds up to.
     expect(Math.min(...gaps)).toBeGreaterThanOrEqual(60000);
+    // And the queue moves: a fleet that starves a session for ten minutes has not been protected, it has been stalled.
+    expect(Math.max(...gaps)).toBeLessThan(180000);
 
     // And the mechanism is visible in the logs rather than inferred: every one of these sessions either held the
     // gate or recorded waiting on it.
