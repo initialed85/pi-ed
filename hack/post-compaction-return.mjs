@@ -159,6 +159,10 @@ for (const dir of fs.readdirSync(root, { withFileTypes: true })) {
       name,
       at: c.at,
       trigger: String(c.trigger ?? "?"),
+      // `freed` is absent on the build that was live in this window: Pi's `CompactionEntry` carries `tokensBefore`
+      // only, and the landing size was not recorded until 26fe878. Printing 0 for those rows reads as "Pi's
+      // compactions freed nothing", which is a missing field rather than a measurement.
+      freedKnown: c.freed !== undefined && c.freed !== null,
       freed: Number(c.freed ?? 0),
       immediate: paying ? 1 : 0,
       chargedUncached: charged ? charged.i + charged.cw : 0,
@@ -227,7 +231,7 @@ for (const r of perPod.sort((a, b) => (a.chargedGap ?? 1e9) - (b.chargedGap ?? 1
   const share = r.chargedCached + r.chargedUncached > 0 ? pctv(r.chargedCached / (r.chargedCached + r.chargedUncached)) : "n/a";
   const warm = r.nextCached + r.nextUncached > 0 ? `${pctv(r.nextCached / (r.nextCached + r.nextUncached))} cached` : "none";
   console.log(
-    `${r.at} ${r.name.padEnd(26)} ${r.trigger.padEnd(21)} freed ${String(r.freed).padStart(6)}  ` +
+    `${r.at} ${r.name.padEnd(26)} ${r.trigger.padEnd(21)} freed ${r.freedKnown ? String(r.freed).padStart(6) : "   n/a "}  ` +
       `payer ${r.immediate ? "same call (prepareNextTurn)" : `next call ${String(r.chargedGap ?? -1).padStart(5)}s` + " (deferred)"}  ` +
       `charged ${String(r.chargedUncached).padStart(6)} uncached / ${String(r.chargedCached).padStart(6)} cached (${share})  call after that ${warm.padStart(6)}  next user turn ${String(r.userGap ?? -1).padStart(6)}s`,
   );
