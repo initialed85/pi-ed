@@ -440,6 +440,55 @@ this fleet is `-ne -e`). A scratch `--mode rpc` session with empty stdin spends 
 | Evidence | `.pi/idle-compaction/log.jsonl`, one JSON line per compaction decision, plus an arm refusal written once per reason (a session that never compacts still leaves evidence, and the same line is not repeated on every settle), a `gate` line for every wait, takeover and forced run, one `start` line per session naming the build and the config it resolved, `boxes` on every attempt that asked the
 boxes first, and `build` on every line |
 
+### `cache-warm-policy.ts` — should a prompt cache be kept alive on purpose? It says no, and shows the work
+
+Pi ships a prompt-cache warmer (`dist/core/cache-warmer.js`, in 1.5.0 and 1.6.1 alike): it re-sends the last real
+request with a one-token output cap at 90% of the declared cache lifetime, refuses to replay a request it cannot
+replay identically, prices the decision, and asks extensions before acting. On this fleet it has never warmed
+anything, for a reason that is in the catalogue rather than in the arithmetic: it prices a refresh from
+`model.cost`, and all 9 entries in `/root/.pi/agent/models.json` carry no `cost` block, so Pi returns
+`{action: "stop", reason: "no catalogue pricing"}` before it reaches its own economics. The question "should we
+warm?" had therefore never been answered here in either direction. This answers it, in GPU units, and it ships
+dark.
+
+The gate lives in `lib/cache-warm.ts` as pure functions over two things the session already has: rooter's per-call
+rows for this session (`GET /rooter/events?key=h:<first 10 chars of the Pi session id>`, whose
+`prompt_tokens_computed` is the work a refresh would have avoided, and whose `prefill_ms` prices it) and the
+session's own arrival rhythm off the branch. It arms only when nothing has been idle past `maxIdleMs`, median
+recompute clears `minRecomputeTokens`, arrivals clear `minArrivalsPerHour`, and the last call was not already a
+cache read. Two corrections are carried in the code, both from review:
+
+- a *high* cache hit rate is not a precondition, it is a **veto**. A session reading 99% of its prompt from cache is
+  a session a refresh cannot help, and it is the fleet's normal state: this session's 148 calls in 139 minutes
+  recomputed a median of **285 tokens**.
+- gating on the gap between turns against the measured prefix lifetime discriminates nothing (pi-bot's objection,
+  and it was right): with a ~99-minute lifetime almost every session clears it. The idle bar is kept, but against
+  the interval a refresh would run on, as a veto — not as the reason to warm.
+
+What the fleet measured against that gate (`hack/warm-counter.mjs`, rooter boot `d7f15035b14e`, 347 generations,
+144 minutes, 24 session keys): **0 of the 5 Pi sessions warmable**, and 0 warmable among the 19 `p:`-keyed callers
+that ever recomputed 10,000-51,000 tokens — every one of those was a single call followed by 100+ minutes of
+silence, which is precisely the shape a warm must not pay for. The fleet's whole cold-prefill spend in that window
+was 30 calls, 934,953 tokens and 1,568 seconds of box time; arming everything at a 2,000-second cadence would have
+added 15 refreshes costing ~1 second if the prefixes were resident and ~1,425 seconds if they were not. The
+prefixes were resident: rooter measures `restoreTokS` at 1.81M tok/s on strata against `coldPrefillTokS` 2,178,
+a 830x gap that is the whole argument for why Pi sessions do not need help staying hot.
+
+The same run corrected the rates this code used. Sushi was assumed at 460-470 tok/s cold from pi-ed's own probes and
+measures **236.7 tok/s** at the router, which prices a 42,000-token cold refresh at 178 seconds rather than 91.
+Pi's own bar, for reference: an idle refresh arms only when `0.15 × missCost − warmCost ≥ $0.05`, which at this
+fleet's median prompt needs input tokens priced around **$24.67/M** — so the `cost` block is not a nicety, it is
+the door Pi stops at.
+
+| | |
+| --- | --- |
+| Commands | `/cache-warm` (mode, last decision, the rhythm it was judged from) |
+| Config | `.pi/cache-warm.json`, with `CACHE_WARM_MODE` / `CACHE_WARM_MIN_RECOMPUTE_TOKENS` / `CACHE_WARM_MIN_ARRIVALS_PER_HOUR` / `CACHE_WARM_VETO_CACHE_HIT_RATE` / `CACHE_WARM_MAX_IDLE_MS` / `CACHE_WARM_EVIDENCE_CALLS` overrides |
+| Knobs | `mode` (**observe** — the gate runs, its verdict is logged as `gateVerdict`, and the action is `stop`, which sends no request at all: measuring what the gate would have armed is free, so arming is a decision made after reading the log, not before) · `minRecomputeTokens` (10000) · `minArrivalsPerHour` (2) · `vetoCacheHitRate` (0.99) · `maxIdleMs` (2000000, just over Pi's 30-minute idle horizon) · `evidenceCalls` (8) · `evidenceWindowMs` (3600000) · `evidenceTimeoutMs` (1500, and a 60-second backoff after a rooter read fails) |
+| Ceilings | Pi's own, which decide what a catalogue may ever say: a refresh is scheduled at `min(ttl × 0.9, ttl − 10s)` and Pi stops a run whose next refresh falls past 30 minutes after the agent settles (60 while it streams). Declaring `promptCache.short` above 2,000 seconds schedules a refresh Pi refuses to send, so a declared value is a **re-arm interval**, never a claim about how long a prefix lives |
+| Ownership | Also answers `cache_warming_decision` from the summarisation side (`idle-compaction.ts`), and Pi merges that event by taking the last handler that answered in load order. This extension watches `session_before_compact` / `session_compact` / `session_compact_failed` and holds the veto itself, so a warm never depends on which of the two Pi loaded first |
+| Evidence | `.pi/cache-warm/log.jsonl`, one JSON line per decision: Pi's own `warmCost` / `missCost` / `continuationProbability`, what this extension answered, `gateVerdict` when observing, the median recompute it priced from, whether that price was observed or table-derived, the rhythm, and `evidenceSource` when rooter could not be read |
+
 ### `plan.ts` — `/goal`, `/direction` and `/todo`: the aim, the route to it, and the steps
 
 An intent is the first thing a long session loses. It is stated at the top, it survives the first twenty turns by

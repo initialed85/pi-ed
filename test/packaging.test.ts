@@ -95,6 +95,18 @@ const EXPECTED: Record<string, Surface> = {
     messageRenderers: [],
     entryRenderers: [],
   },
+  "cache-warm-policy.ts": {
+    // Pi merges `cache_warming_decision` by taking the last handler that answered, in extension load order
+    // (runner.js `emitCacheWarmingDecision`), and idle-compaction also answers it - with `stop` only while a
+    // summarisation is in flight. So this file watches the same compaction events and holds the veto itself:
+    // a warm must not depend on which of the two Pi loaded first.
+    events: ["session_before_compact", "session_compact", "session_compact_failed", "cache_warming_decision"],
+    tools: [],
+    commands: ["cache-warm"],
+    flags: [],
+    messageRenderers: [],
+    entryRenderers: [],
+  },
   "idle-compaction.ts": {
     // Compaction has no event of its own to hook, so this is the whole idle question: what a run looked like on the
     // way out (turn_start / agent_settled), what means somebody is busy again (tool_result, message_end, user_bash,
