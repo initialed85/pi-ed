@@ -87,9 +87,15 @@ function audit(file) {
       const calls = (m.content ?? []).filter((c) => c.type === "toolCall").map((c) => (c.name === "todos" ? `todos:${c.arguments?.action ?? "?"}` : c.name));
       seq.push({ kind: "call", at, input: u.input ?? 0, read: u.cacheRead ?? 0, write: u.cacheWrite ?? 0, out: u.output ?? 0, share: gross > 0 ? (u.cacheRead ?? 0) / gross : 0, model: `${m.provider}/${m.model}`, calls });
     } else if (r.type === "message" && m?.role === "system") {
-      // Pi writes this record when the system prompt changes, and it carries the sections, so the rewrite is named.
+      // Pi writes this record when the prompt context changes, and it names both halves of what the model actually
+      // sees: `sections` for the prompt body, and `toolsAdded` / `toolsRemoved` for the tool list. The tool list is
+      // part of the request Pi sends (chunk-NL4X6LBY.js rebuilds it per call with getCurrentTools(messages): base
+      // tools plus every recorded addition minus every removal), so a tool appearing or disappearing is a prefix
+      // rewrite exactly like a section changing - and counting only `sections` misses it.
       const sections = Object.entries(m.sections ?? {}).map(([k, v]) => `${k}:${hash(String(v ?? ""))}`);
-      seq.push({ kind: "prompt", at, sections });
+      const added = (m.toolsAdded ?? []).map((t) => t?.name ?? "?");
+      const removed = (m.toolsRemoved ?? []).map((t) => t?.name ?? "?");
+      seq.push({ kind: "prompt", at, sections, added, removed });
     } else if (r.type === "compaction" || r.type === "context_edit" || r.type === "model_change" || r.type === "custom_message") {
       seq.push({ kind: r.type === "custom_message" ? `inject:${r.customType ?? r.message?.customType ?? "?"}` : r.type, at });
     }
@@ -97,6 +103,13 @@ function audit(file) {
 
   const calls = seq.filter((s) => s.kind === "call");
   const prompts = seq.filter((s) => s.kind === "prompt");
+  // Tool churn replayed the way Pi replays it. The transcript never carries the full tool definitions (0 records do),
+  // so absolute identity is not recoverable from a session file; churn is, and churn is what a cache key would have
+  // to survive. A tool whose SCHEMA changes under an unchanged name is invisible here by construction - only a live
+  // session can hash getCurrentTools() at before_provider_request and see that.
+  const churn = new Map();
+  for (const p of prompts) for (const n of [...p.added, ...p.removed]) churn.set(n, (churn.get(n) ?? 0) + 1);
+  const toolRewrites = prompts.filter((p) => p.added.length + p.removed.length > 0);
   const win = calls.slice(-n);
   const shares = win.map((c) => c.share);
   const misses = [];
@@ -140,7 +153,12 @@ function audit(file) {
     if (prev) for (const [k, v] of cur) if (prev.get(k) !== v) sectionChange.set(k, (sectionChange.get(k) ?? 0) + 1);
     prev = cur;
   }
-  console.log(`  system-prompt rewrite records ${prompts.length} for ${calls.length} calls (${((prompts.length / Math.max(1, calls.length)) * 100).toFixed(2)}% of calls)`);
+  console.log(`  prompt-rewrite records ${prompts.length} for ${calls.length} calls (${((prompts.length / Math.max(1, calls.length)) * 100).toFixed(2)}% of calls) · ${toolRewrites.length} of them change the TOOL LIST`);
+  if (churn.size > 0) {
+    console.log(`  tool-list churn by name: ${[...churn].sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ×${v}`).join(", ")}`);
+    const toggles = [...churn].filter(([, v]) => v > 1).length;
+    console.log(`  names that move more than once ${toggles} · a name added once and never removed is a load-time registration, a name that appears repeatedly is a per-turn or per-reload toggle`);
+  }
   if (sectionChange.size > 0) {
     console.log(`  sections that changed between rewrites: ${[...sectionChange].sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ×${v}`).join(", ")}`);
   }

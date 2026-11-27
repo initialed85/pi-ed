@@ -14,7 +14,10 @@ test/         vitest suite, no Pi runtime and no network needed
 hack/         check-package-shape.mjs (the CI gate on the package manifest), ci-status.sh (ask Woodpecker
               what it did with a commit), pty-panel.py (press keys in a real `pi` under a pty and read the
               screen), plan-influence-check.sh (ask a real model what a plan line changes about its next
-              action), plan-wording-probe.sh (compare candidate block sentences against each other)
+              action), plan-wording-probe.sh (compare candidate block sentences against each other),
+              idle-drain-read.mjs (what the idle gate actually did across the fleet, priced),
+              post-compaction-return.mjs (who pays a compaction's re-read, and the cached share by idle-gap
+              band), cache-prefix-audit.mjs (one session's cache behaviour, section by section)
 .woodpecker/  CI: workflow lint + typecheck + tests
 ```
 
@@ -343,6 +346,41 @@ the pod's own arm lines, which are turn endings. slopyphus pays back in 7.8 h of
 pi-team-room in 36.8 h, longhorn-storage-gateway in 37.7 h. Three of the four pods with completions do not see the
 saving inside a working day, which is the case for moving the arm bar nearer the threshold a session is actually
 heading for rather than leaving it where the token bars happen to land.
+
+**Who pays a compaction's re-read - and why the tempting fix for it is not built.** The re-send price invites an
+obvious trick: after a compaction, run one deliberately trivial completion against the new prefix so the expensive
+uncached read happens in the idle path instead of on the human's next turn. `hack/post-compaction-return.mjs` measures
+the two things that decide it, by joining the gate log's completions to each pod's session timeline. Pi already records
+both halves: every assistant call carries `usage`, and every prefix rewrite is a system-role record carrying `sections`
+and `toolsAdded` / `toolsRemoved` - and since Pi rebuilds the live tool list per call from those records
+(`getCurrentTools(messages)`), a tool appearing or disappearing is a rewrite of the cached prefix like any section
+change. Measured, 2026-11-27, 1678 calls across 14 pods:
+
+| idle gap since the previous call | calls | median cached share | 25th percentile | calls still above 50% |
+|---|---|---|---|---|
+| 1-30 s | 974 | 99% | 99% | 974 |
+| 30-60 s | 431 | 99% | 98% | 430 |
+| 60-120 s | 158 | 99% | 97% | 153 |
+| 120-300 s | 62 | 97% | 93% | 47 |
+| 300-900 s | 41 | 96% | 0% | 22 |
+| 900-3600 s | 9 | 0% | 0% | 1 |
+| over 3600 s | 3 | 0% | 0% | 1 |
+
+So the cache survives a five-minute gap untouched and is usually gone past fifteen minutes - **a gap is not what makes a
+call cold**. Of the 57 calls in the window that re-read more than half their prefix, 50 had no rewrite recorded between
+them and the previous call, and **none of them happened at a gap under 30 s**: the cold population is a compaction and
+reload artifact, not a per-turn leak. Where the payment actually lands is the compaction boundary - my own session's
+file carries 79 compactions whose first following call re-sent a median **29671 uncached tokens each, 2,310,889 tokens
+in all**, at a median cached share of 12.6%. In the interactive path that paying call arrives 17-50 s after the
+completion; in the idle path it arrives whenever anyone next calls (median 49 s), and 7 of 26 completions had no later
+call in the window at all.
+
+Given that, warming is a latency transfer and never a saving: the read is paid once whichever call reaches the new
+prefix first. Against the measured returns it wins in **4 of 26** cases (next call 206-340 s - the human lands warm,
+same tokens), makes the human wait behind a read already running in **12 of 26** (next call within 90 s), and buys a
+cold read nobody would ever have paid in **7 of 26** (nobody came back). It is not built, and this is the measurement
+that says why; shipping it would need a predictor for the 200-400 s return band, which the idle path by definition
+cannot see - it fires because the session is quiet.
 
 **How to check a build without rolling one.** Pods load extensions from Pi's extension clone
 (`/root/.pi/agent/git/github.com/initialed85/pi-ed`), not from a workspace checkout, so "which build is this pod
