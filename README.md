@@ -333,6 +333,17 @@ f3df978 or later, `tokensAfter` meant d5edf91 or later — and that inference is
 the commit its own `git` reported was not the code it was executing. `hack/idle-drain-read.mjs` reads the marker
 first and falls back to the field-shape table only for records written before it.
 
+**Two sections the price question added.** `== what each completion cost to re-send ==` prices every idle-path
+completion at 0.84 x max(tokensBefore, tokensAfter) uncached prompt tokens and prints the fleet return (freed ÷
+re-sent); for 2026-11-27T00:00-05:10Z that is 385371 freed against 621130 re-sent, a return of 0.62, with no
+completion paying for itself inside a call. `== how long a completion takes to pay back, per pod ==` then turns that
+into the only question that decides whether to do one at all: a completion gives back 0.1 x freed on each *later*
+call, so it needs price ÷ (0.1 x freed) calls - 15 to 20 here - and that many calls is a wall-clock figure taken from
+the pod's own arm lines, which are turn endings. slopyphus pays back in 7.8 h of its own use, pi-bot in 15.7 h,
+pi-team-room in 36.8 h, longhorn-storage-gateway in 37.7 h. Three of the four pods with completions do not see the
+saving inside a working day, which is the case for moving the arm bar nearer the threshold a session is actually
+heading for rather than leaving it where the token bars happen to land.
+
 **How to check a build without rolling one.** Pods load extensions from Pi's extension clone
 (`/root/.pi/agent/git/github.com/initialed85/pi-ed`), not from a workspace checkout, so "which build is this pod
 running" is answered by `git -C /root/.pi/agent/git/github.com/initialed85/pi-ed rev-parse HEAD` — and, on `9561806`
