@@ -117,6 +117,21 @@ function audit(file) {
     console.log(`    miss ${new Date(m.at).toISOString().slice(5, 19)} re-sent ${m.input} uncached · gap ${m.gap === null ? "?" : `${m.gap.toFixed(0)}s`}${m.gap !== null && m.gap <= backToBackSec ? "  ← while back to back: a rewrite, not a TTL expiry" : "  ← after an idle gap"}`);
   }
 
+  // What a compaction costs in cache terms: it rewrites the prefix by design, so the first call after one re-sends
+  // whatever the summarisation kept. That is the price side of a completion, and it belongs beside the tokens freed
+  // rather than being assumed free.
+  const afterCompaction = [];
+  for (let i = 0; i < seq.length; i++) {
+    if (seq[i].kind !== "compaction") continue;
+    const next = seq.slice(i + 1).find((x) => x.kind === "call");
+    if (next) afterCompaction.push(next);
+  }
+  if (afterCompaction.length > 0) {
+    console.log(
+      `  first call after each of ${afterCompaction.length} compactions: median ${med(afterCompaction.map((c) => c.input))} uncached tokens, max ${Math.max(...afterCompaction.map((c) => c.input))}, ${afterCompaction.reduce((s, c) => s + c.input, 0)} in total · median share ${pct(med(afterCompaction.map((c) => c.share)))}`,
+    );
+  }
+
   // Which sections actually change, and how often the prompt is rewritten at all.
   const sectionChange = new Map();
   let prev = null;
