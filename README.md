@@ -369,18 +369,27 @@ change. Measured, 2026-11-27, 1678 calls across 14 pods:
 So the cache survives a five-minute gap untouched and is usually gone past fifteen minutes - **a gap is not what makes a
 call cold**. Of the 57 calls in the window that re-read more than half their prefix, 50 had no rewrite recorded between
 them and the previous call, and **none of them happened at a gap under 30 s**: the cold population is a compaction and
-reload artifact, not a per-turn leak. Where the payment actually lands is the compaction boundary - my own session's
-file carries 79 compactions whose first following call re-sent a median **29671 uncached tokens each, 2,310,889 tokens
-in all**, at a median cached share of 12.6%. In the interactive path that paying call arrives 17-50 s after the
-completion; in the idle path it arrives whenever anyone next calls (median 49 s), and 7 of 26 completions had no later
-call in the window at all.
+reload artifact, not a per-turn leak. The size of the bill is visible per session too: `hack/cache-prefix-audit.mjs`
+reports that my own session's file carries 79 compactions whose first following call re-sent a median **29671 uncached
+tokens each, 2,310,889 tokens in all**, at a median cached share of 12.6%.
 
-Given that, warming is a latency transfer and never a saving: the read is paid once whichever call reaches the new
-prefix first. Against the measured returns it wins in **4 of 26** cases (next call 206-340 s - the human lands warm,
-same tokens), makes the human wait behind a read already running in **12 of 26** (next call within 90 s), and buys a
-cold read nobody would ever have paid in **7 of 26** (nobody came back). It is not built, and this is the measurement
-that says why; shipping it would need a predictor for the 200-400 s return band, which the idle path by definition
-cannot see - it fires because the session is quiet.
+**Who is charged, split by path (27 completions).** Every compaction pays one full uncached re-send, and the path
+decides who pays it. **16 paid at the completion itself**: every `pi:threshold` completion, because Pi compacts in
+`prepareNextTurn` and re-issues the request that triggered it against the compacted prefix - charged 27803-40612
+uncached at 0-19% share, and the following call is warm again at 93-100%. **5 deferred**: every idle-path
+`agent_settled` completion, because nothing is mid-turn, so the charge lands on whoever next calls - 31416-39716
+uncached, 21 s to 3466 s later. **6 paid nothing**: five `session_start:startup` completions and one settled completion
+on a pod nobody returned to, 216010 tokens freed with the re-send never charged. That last group is the only case where
+a compaction is free, and it is the argument for treating a compaction on a session that is genuinely finished as
+different from one on a session that is about to be used again.
+
+Given that, warming is a latency transfer and never a saving: the new prefix is evaluated once by whichever call
+reaches it first, and on the Pi path it is already evaluated by the turn that asked for the compaction. So the only
+completions a warm could apply to are the deferred idle-path ones - **6 in this window, of which 1 was in the band
+where a warm would have arrived first** (the 299 s return), 1 was beaten by a call 21 s later, 3 returned long after
+the cache had decayed, and 1 never came back. It is not built, and this is the measurement that says why; shipping it
+would need a predictor for the 200-400 s return band, which the idle path by definition cannot see - it fires because
+the session is quiet.
 
 **How to check a build without rolling one.** Pods load extensions from Pi's extension clone
 (`/root/.pi/agent/git/github.com/initialed85/pi-ed`), not from a workspace checkout, so "which build is this pod

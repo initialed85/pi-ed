@@ -147,17 +147,27 @@ for (const dir of fs.readdirSync(root, { withFileTypes: true })) {
 
   for (const c of records) {
     const at = Date.parse(c.at);
-    const nextCall = calls.find((a) => a.t > at + 2000);
+    // Pi compacts in prepareNextTurn, so the call that pays for the new prefix can carry the completion's own
+    // timestamp - it is the request that triggered the compaction, re-issued against the compacted prefix. Skipping
+    // every call within two seconds of the completion, as an earlier version of this script did, hid that payer on
+    // the Pi path and made the following (already warm) call look like the one being charged.
+    const paying = calls.find((a) => a.t >= at - 3000 && a.t <= at + 3000) ?? null;
+    const nextCall = calls.find((a) => a.t > (paying ? paying.t : at) + 2000);
     const nextUser = users.find((u) => u.t > at + 2000);
+    const charged = paying ?? nextCall ?? null;
     const row = {
       name,
       at: c.at,
       trigger: String(c.trigger ?? "?"),
       freed: Number(c.freed ?? 0),
+      immediate: paying ? 1 : 0,
+      chargedUncached: charged ? charged.i + charged.cw : 0,
+      chargedCached: charged ? charged.cr : 0,
+      chargedGap: charged ? Math.round((charged.t - at) / 1000) : null,
       callGap: nextCall ? Math.round((nextCall.t - at) / 1000) : null,
+      nextCached: nextCall ? nextCall.cr : 0,
+      nextUncached: nextCall ? nextCall.i + nextCall.cw : 0,
       userGap: nextUser ? Math.round((nextUser.t - at) / 1000) : null,
-      uncached: nextCall ? nextCall.i + nextCall.cw : 0,
-      cached: nextCall ? nextCall.cr : 0,
       head: nextUser ? nextUser.head : "",
     };
     perPod.push(row);
@@ -209,15 +219,17 @@ for (const dir of fs.readdirSync(root, { withFileTypes: true })) {
 }
 
 const withCall = perPod.filter((r) => r.callGap !== null);
-console.log(`window since ${since}  completions ${perPod.length}  with a later model call ${withCall.length}  with a later user turn ${perPod.filter((r) => r.userGap !== null).length}`);
+console.log(`window since ${since}  completions ${perPod.length}  paid at the completion itself ${perPod.filter((r) => r.immediate).length}  deferred to a later call ${perPod.filter((r) => !r.immediate && r.chargedUncached > 0).length}  never paid (no later call) ${perPod.filter((r) => !r.immediate && !r.chargedUncached).length}`);
 for (const f of failures) console.log(`  timeline read failed: ${f}`);
 
 console.log(`\n== who pays the re-read after a compaction ==`);
-for (const r of perPod.sort((a, b) => (a.callGap ?? 1e9) - (b.callGap ?? 1e9))) {
-  const share = r.cached + r.uncached > 0 ? pctv(r.cached / (r.cached + r.uncached)) : "n/a";
+for (const r of perPod.sort((a, b) => (a.chargedGap ?? 1e9) - (b.chargedGap ?? 1e9))) {
+  const share = r.chargedCached + r.chargedUncached > 0 ? pctv(r.chargedCached / (r.chargedCached + r.chargedUncached)) : "n/a";
+  const warm = r.nextCached + r.nextUncached > 0 ? `${pctv(r.nextCached / (r.nextCached + r.nextUncached))} cached` : "none";
   console.log(
-    `${r.at} ${r.name.padEnd(26)} ${r.trigger.padEnd(21)} freed ${String(r.freed).padStart(6)}  next call ${String(r.callGap ?? -1).padStart(6)}s  next user turn ${String(r.userGap ?? -1).padStart(6)}s  ` +
-      `that call ${String(r.uncached).padStart(6)} uncached / ${String(r.cached).padStart(6)} cached (${share})`,
+    `${r.at} ${r.name.padEnd(26)} ${r.trigger.padEnd(21)} freed ${String(r.freed).padStart(6)}  ` +
+      `payer ${r.immediate ? "same call (prepareNextTurn)" : `next call ${String(r.chargedGap ?? -1).padStart(5)}s` + " (deferred)"}  ` +
+      `charged ${String(r.chargedUncached).padStart(6)} uncached / ${String(r.chargedCached).padStart(6)} cached (${share})  call after that ${warm.padStart(6)}  next user turn ${String(r.userGap ?? -1).padStart(6)}s`,
   );
 }
 
