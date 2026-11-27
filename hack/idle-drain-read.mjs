@@ -52,7 +52,9 @@ const FINGERPRINTS = [
   { build: "f3df978+ (arm records carry percent)", test: (r) => r.kind === "compact" && typeof r.percent === "number" },
   { build: "gate era (lease + spread deferrals)", test: (r) => r.kind === "gate" && typeof r.heldMs === "number" },
   { build: "d5edf91+ (compacted records tokensAfter)", test: (r) => r.kind === "compacted" && typeof r.tokensAfter === "number" },
-  { build: "36492fb+ (softPercent 25)", test: (r) => String(r.reason ?? "").includes("under the 25% floor") },
+  // The floor quoted in an arm refusal is whatever that pod's config says, not the shipped 25, so matching the
+  // literal "25%" mislabelled a pod running a custom softPercent as merely "arm-stage skips" (pi-bot, 04:05Z).
+  { build: "36492fb+ (arm refusal names the floor in force)", test: (r) => /under the \d+% floor/.test(String(r.reason ?? "")) },
   { build: "297def5+ (arm-stage skips)", test: (r) => r.kind === "skip" && String(r.stage ?? "") === "arm" },
   { build: "fleet default deadlineMs 240000", test: (r) => r.kind === "deadline" && r.deadlineMs === 240000 },
   { build: "older 120000ms deadline", test: (r) => r.kind === "deadline" && r.deadlineMs === 120000 },

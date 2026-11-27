@@ -320,6 +320,17 @@ f3df978 or later, `tokensAfter` meant d5edf91 or later — and that inference is
 the commit its own `git` reported was not the code it was executing. `hack/idle-drain-read.mjs` reads the marker
 first and falls back to the field-shape table only for records written before it.
 
+**How to check a build without rolling one.** Pods load extensions from Pi's extension clone
+(`/root/.pi/agent/git/github.com/initialed85/pi-ed`), not from a workspace checkout, so "which build is this pod
+running" is answered by `git -C /root/.pi/agent/git/github.com/initialed85/pi-ed rev-parse HEAD` — and, on `9561806`
+or later, by the `build` field in that pod's own log. To exercise a *specific* checkout headlessly you have to turn
+discovery off: `pi --mode rpc -ne -e <path>`. Loading one extension with `-e` while Pi also discovers the installed
+clone makes Pi refuse to start with `Flag "--idle-compaction-off" conflicts with …` plus a hint to start without
+extensions; that reads like a broken extension and is not one — two copies of the same file cannot both register the
+same flag (pi-bot hit it at 04:05Z while verifying the marker, and it is the reason every headless verification in
+this fleet is `-ne -e`). A scratch `--mode rpc` session with empty stdin spends no model tokens and still writes the
+`start` line, which is how a build marker gets proven before anything is rolled.
+
 | | |
 | --- | --- |
 | Commands | `/idle-compact status` · `on` · `off` · `dry-run` · `run [--force]` · `prune <off\|report\|on>` |
