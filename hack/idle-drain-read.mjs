@@ -25,7 +25,10 @@ const since = flag("since", "2026-11-27T00:00:00");
 
 /** Defaults at the roll target f3df978, repeated here so the reader is not editing the extension to judge it. */
 const DEFAULTS = {
-  softPercent: 25,
+  // The shipped default at the 2026-11-27 roll target (65; it was 25 before that roll). Used only as a label for
+  // pods whose records predate the config stamp - a pod running a custom bar is judged by its own `cfg`, never by
+  // either literal.
+  softPercent: 65,
   minFreeTokens: 30000,
   keptFloorTokens: 24000,
   deadlineMs: 240000,

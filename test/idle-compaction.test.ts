@@ -173,7 +173,7 @@ describe("idle compaction", () => {
     await settle(h);
     vi.advanceTimersByTime(QUIET_MS * 10);
     expect(h.compacts).toHaveLength(0);
-    expect(await status(h)).toContain("is under the 25% floor");
+    expect(await status(h)).toContain("is under the 65% floor");
   });
 
   it("states the eligibility bar that actually bites at this fleet's window", async () => {
@@ -199,7 +199,29 @@ describe("idle compaction", () => {
     await settle(small);
     vi.advanceTimersByTime(QUIET_MS * 10);
     expect(small.compacts).toHaveLength(0);
-    expect(await status(small)).toContain("is under the 25% floor");
+    // The refusal names both bars, because both failed: this session is under the percent bar *and* under the margin,
+    // and a message that said only "under the floor" is what made a pod read its own arm-stage skips as bar behaviour.
+    expect(await status(small)).toContain(
+      "is under the 65% floor (and would free about 5000 tokens, under the 30000 minimum)",
+    );
+  });
+
+  it("proves the raised 65% bar is not the gate, so nobody mistakes the number for a behaviour change", async () => {
+    // `softPercent` went 25 -> 65 on 2026-11-27 with Ed's approval, and this test is the reason the knob is documented
+    // as inert: `clearsMargin` arms any session at or above keptFloorTokens + minFreeTokens = 54000 tokens whatever
+    // its percent says, and refuses any session below it whatever its percent says. Anyone who wants the bar to bite
+    // has to change that bypass, not the number - so the bypass is asserted in code rather than left to prose.
+    const midBand = await setup({ contextUsage: { percent: 42, tokens: 55000, contextWindow: 131072 } });
+    await settle(midBand);
+    vi.advanceTimersByTime(QUIET_MS);
+    expect(midBand.compacts).toHaveLength(1);
+
+    // The other direction: a session the percent bar would happily arm is still refused by the margin bar.
+    const highPercentSmall = await setup({ contextUsage: { percent: 90, tokens: 30000, contextWindow: 131072 } });
+    await settle(highPercentSmall);
+    vi.advanceTimersByTime(QUIET_MS * 10);
+    expect(highPercentSmall.compacts).toHaveLength(0);
+    expect(await status(highPercentSmall)).toContain("would free about 6000 tokens, under the 30000 minimum");
   });
 
   it("scales an attempt's ceiling from the context it is summarising, because a flat one is a guess", async () => {
@@ -715,7 +737,7 @@ describe("idle compaction", () => {
     const text = await status(h);
     expect(text).toContain("context usage not measured yet");
     expect(text).not.toContain("?");
-    expect(text).toContain("floor 25%");
+    expect(text).toContain("floor 65%");
   });
 
   it("runs on command when a person asks, and refuses when the arithmetic says no", async () => {
@@ -754,7 +776,7 @@ describe("idle compaction", () => {
     const refusals = lines.filter((line) => line.includes('"stage":"arm"'));
     expect(refusals).toHaveLength(1);
     expect(refusals[0]).toContain('"stage":"arm"');
-    expect(refusals[0]).toContain("under the 25% floor");
+    expect(refusals[0]).toContain("under the 65% floor");
     expect(h.compacts).toHaveLength(0);
   });
 });

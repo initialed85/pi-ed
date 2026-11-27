@@ -50,20 +50,27 @@
  * | --- | --- | --- |
  * | `quietMs` | 120000 | 96% of the gaps inside a working exchange here are under 60 s (11217 gaps under 10 s and 2945 between 10 and 60 s, out of 14802). Two silent minutes means the burst ended. |
  * | `urgentPercent` / `urgentQuietMs` | 80 / 20000 | Above 80% the next prompt pays this cost anyway (the threshold is 87.5%). Starting 20 s after the run settled is never worse than starting when the user types. |
- * | `softPercent` | 25 | Below this there is nothing worth a summarisation call. The bar is deliberately *below* where |
- *   the margin bars bind, because a percent bar is a token bar in disguise at a fixed window: 25% of 131072 is 32768
- *   tokens, while `keptFloorTokens` + `minFreeTokens` refuse anything under 44000. So 44000 is the bar that actually
- *   bites for this fleet, and it is built from measured constants: Pi's 20000 keep-recent, the 2565-token median
- *   summary, and the smallest freeing worth a call. The old 40% was 52429 tokens here, above where the fleet's
- *   sessions live (10 of 11 were 26k-44k at startup) and above the band proven to pay for itself - a 44285-token
- *   compaction on 2026-11-26 freed 14156 tokens in 59 s. With the gate and `spreadMs` serialising the fleet, the
- *   concurrency this bar used to guard against is handled structurally instead. **And it is advisory**: percent is
+ * | `softPercent` | 65 | Raised from 25 on 2026-11-27 with Ed's approval, to sit *below Pi's own 87.5% auto-compaction* |
+ *   and claim the band before it: 65% of 131072 is 85197 tokens, against Pi's threshold at 114688, so the idle path |
+ *   now arms a session with 29491 tokens (22.5 points) of headroom before Pi summarises inside a live turn. The bar |
+ *   is a placement decision, not a worth-it decision, and **it is currently inert as a gate**: what decides whether |
+ *   a session may compact is `keptFloorTokens` + `minFreeTokens`, and the margin bar rescues the percent bar (see |
+ *   `clearsMargin` below), so at this window any session at or above 24000 + 30000 = **54000 tokens** arms whatever |
+ *   its percent says, and any session below 54000 tokens is refused whatever the bar says (54000 is 41.2% of 131072, |
+ *   below any bar above 41.2%). Changing 25 to 65 therefore changes the *wording* of refusals and nothing else. That |
+ *   is stated here rather than buried because the raised number was approved as a fix for cliffs, and it is not one: |
+ *   eligibility already began at 54000 tokens, so the idle path was reaching the 65-87.5% band; what stopped it was |
+ *   attempts aborting (see `deadlineMs` and the box pre-flight) and busy sessions never leaving a `quietMs` gap. |
+ *   `hack/cliff-counter.mjs` is the test that proves either reading: it counts Pi-threshold completions inside the |
+ *   65-87.5% band (a cliff: the session ran out of room on Pi's schedule) against idle completions in the same band, |
+ *   before and after the roll, and predicts a zero delta from this knob alone. **And it is advisory**: percent is
  *   computed from whatever `contextWindow` Pi carries for the alias, which is not necessarily the window the model
  *   ran - pi-team-room answered a genuine 186420-token prompt (185898 of it `cacheRead`) under a 131072 constant,
  *   which is 142.23% of too small a number. So percent may arm a session too eagerly, which is only waste, but it
  *   may not refuse one the token bars already cleared. Refusing on a denominator that is wrong is how a legitimate
  *   candidate is skipped and never learns it was skipped. |
- * | `minFreeTokens` / `keptFloorTokens` | 20000 / 24000 | The floor is keepRecentTokens 20000 plus the measured median summary. A compaction that would free less than 20000 tokens is churn. **At this fleet's 131072 window these two are the binding eligibility bar: 44000 tokens.** What a finished compaction *lands* on is 24734-40770 tokens across the six idle-path completions measured on 2026-11-26 and 2026-11-27 (inputs 44285-103142): the landing band is an outcome of `keepRecentTokens`, not of input size. The band was 25667-31480 until the fleet drain produced a landing at 40770 that freed only 9474 and one at 24734 that freed 49305, which is the point: a completion can land high and free little, or land low and free a lot, so yield and landing are two measurements. |
+ * | `minFreeTokens` / `keptFloorTokens` | 30000 / 24000 | `minFreeTokens` is what a completed summarisation has to free |
+ *   before it is worth issuing, and it is a measured number, not a preference: a completion re-sends the prefix | uncached and re-reads the kept tail, so one completion costs about 28000-35000 cache-write tokens (pi-bot's | 2026-11-27 measurement: 20513 freed against 34286 re-sent) and an aborted one costs 15-33k for nothing. Measured | across 15 sessions that cleared the old 20000 minimum, only 8 would have paid for themselves; camry freed 3388 | against a 31843 re-send. `keptFloorTokens` is Pi's 20000 keep-recent plus the measured 2565-token median summary. | **At this fleet's window the two together are the binding eligibility bar: 24000 + 30000 = 54000 tokens, reached | through `clearsMargin`, which arms a session whatever `softPercent` says.** What a finished compaction *lands* on is | 24734-40770 tokens across the six idle-path completions measured on 2026-11-26 and 2026-11-27 (inputs | 44285-103142): the landing band is an outcome of `keepRecentTokens`, not of input size. It was written as | 25667-31480 until a fleet drain produced a landing at 40770 that freed only 9474 and one at 24734 that freed | 49305, which is the point: a completion can land high and free little, or land low and free a lot, so yield and | landing are two separate measurements. |
  * | `deadlineMs` | 240000 | Sized to the tail, and the tail is not the biggest payload: 109797 tokens took 73.6 s on
  *   2026-11-26 while 55396 took 151.9 s an hour later - duration tracks backend contention, not token count. Pi's own
  *   trigger point runs median 71 s and p90 226 s, 14 of this fleet's attempts died at the old 120 s ceiling, and the
@@ -275,7 +282,7 @@ const DEFAULT_CONFIG: Config = {
   quietMs: 120000,
   urgentQuietMs: 20000,
   urgentPercent: 80,
-  softPercent: 25,
+  softPercent: 65,
   minFreeTokens: 30000,
   keptFloorTokens: 24000,
   deadlineMs: 240000,
@@ -1207,7 +1214,13 @@ function blockReason(ctx: ExtensionContext, state: State, cfg: RuntimeConfig, op
   // candidate is skipped and never learns it was skipped.
   const free = usage.tokens - cfg.keptFloorTokens;
   const clearsMargin = free >= cfg.minFreeTokens;
-  if (usage.percent < cfg.softPercent && !clearsMargin) return `context at ${usage.percent.toFixed(1)}% is under the ${cfg.softPercent}% floor`;
+  if (usage.percent < cfg.softPercent && !clearsMargin) {
+    // Both bars failed here, and the message names both: saying only "under the 65% floor" is what let a pod running
+    // a custom bar read its own arm-stage skips as bar behaviour (pi-bot, 2026-11-27 04:05Z), when what refused those
+    // sessions was the token margin.
+    const freeShown = free > 0 ? `about ${free} tokens` : `nothing`;
+    return `context at ${usage.percent.toFixed(1)}% is under the ${cfg.softPercent}% floor (and would free ${freeShown}, under the ${cfg.minFreeTokens} minimum)`;
+  }
   if (!clearsMargin) return `would free about ${free} tokens, under the ${cfg.minFreeTokens} minimum`;
   const branch = ctx.sessionManager.getBranch();
   if (branch.length > 0 && branch[branch.length - 1].type === "compaction") return "the last entry is already a compaction";
