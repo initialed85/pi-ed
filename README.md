@@ -378,10 +378,14 @@ decides who pays it. **16 paid at the completion itself**: every `pi:threshold` 
 `prepareNextTurn` and re-issues the request that triggered it against the compacted prefix - charged 27803-40612
 uncached at 0-19% share, and the following call is warm again at 93-100%. **5 deferred**: every idle-path
 `agent_settled` completion, because nothing is mid-turn, so the charge lands on whoever next calls - 31416-39716
-uncached, 21 s to 3466 s later. **6 paid nothing**: five `session_start:startup` completions and one settled completion
-on a pod nobody returned to, 216010 tokens freed with the re-send never charged. That last group is the only case where
-a compaction is free, and it is the argument for treating a compaction on a session that is genuinely finished as
-different from one on a session that is about to be used again.
+uncached, 21 s to 3466 s later. **6 charged nothing inside the window**: five `session_start:startup` completions and one
+settled completion on a pod nobody returned to, 216010 tokens freed with no re-send recorded.
+
+That last group is not free and should not be read as a win. The summarisation call was paid either way, and the
+benefit of a compaction only ever arrives on *later* calls - so a completion with no later call inside the window has a
+cost on the record and a benefit outside it, in both directions. It is the group this measurement cannot judge, it is
+the group where a warming completion would be a certain waste, and it is why the startup path is the hardest of the
+three to price: a resumed session that stays quiet has not yet told us whether it was worth compacting.
 
 Given that, warming is a latency transfer and never a saving: the new prefix is evaluated once by whichever call
 reaches it first, and on the Pi path it is already evaluated by the turn that asked for the compaction. So the only

@@ -219,7 +219,7 @@ for (const dir of fs.readdirSync(root, { withFileTypes: true })) {
 }
 
 const withCall = perPod.filter((r) => r.callGap !== null);
-console.log(`window since ${since}  completions ${perPod.length}  paid at the completion itself ${perPod.filter((r) => r.immediate).length}  deferred to a later call ${perPod.filter((r) => !r.immediate && r.chargedUncached > 0).length}  never paid (no later call) ${perPod.filter((r) => !r.immediate && !r.chargedUncached).length}`);
+console.log(`window since ${since}  completions ${perPod.length}  paid at the completion itself ${perPod.filter((r) => r.immediate).length}  deferred to a later call ${perPod.filter((r) => !r.immediate && r.chargedUncached > 0).length}  no later call inside the window ${perPod.filter((r) => !r.immediate && !r.chargedUncached).length}  (that last group has its cost on the record and its benefit outside the window, in both directions - not a win)`);
 for (const f of failures) console.log(`  timeline read failed: ${f}`);
 
 console.log(`\n== who pays the re-read after a compaction ==`);
