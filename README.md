@@ -305,8 +305,20 @@ which ceiling it hit — one pod wrote `deadlineMs: 600000` into its config mid-
 default, and could only prove afterwards, by reading the source, that the file had never been re-read. `/idle-compact
 status` now names the config file, says when it was read, and says in words when the file has been written since and
 *those values are not applied to this session*. And Pi's own compactions, whose completion event carries no duration,
-are timed from `session_before_compact` to `session_compact` and logged with `ms` and `msSource`: the fleet's two
-largest compactions, 116325 and 119360 tokens, had contributed no duration data at all.
+are timed from `session_before_compact` to `session_compact` and logged as `tailMs` with `tailMsSource`: the fleet's two
+largest compactions, 116325 and 119360 tokens, had contributed no duration data at all. `tailMs` is deliberately not
+`ms`. `compaction-summary-guard.ts` loads before this extension and does the summarising inside its own handler, so
+what is left when this handler's stamp is taken is the tail — measured 40-92 ms on 2026-11-27, against the idle path's
+132-239 s. Pi's completion event also carries no landing size, so these lines now carry `tokensAfter` labelled
+`getContextUsage at session_compact`, which is this session's own estimate rather than a number from Pi.
+
+**Every pod can now say what it is running.** Every record carries `build`, the sha of the git checkout the extension
+was loaded from, and a session opens its log with a `start` line giving that build, the numbers actually in force
+(`cfg`), where they came from (`cfgFrom`: the config file, or `defaults`), and any `IDLE_COMPACTION_*` overrides.
+Until this existed, a pod's build was inferred from which fields its lines happened to carry — `deadlineMs` meant
+f3df978 or later, `tokensAfter` meant d5edf91 or later — and that inference is how one pod spent an hour proving that
+the commit its own `git` reported was not the code it was executing. `hack/idle-drain-read.mjs` reads the marker
+first and falls back to the field-shape table only for records written before it.
 
 | | |
 | --- | --- |
@@ -315,7 +327,7 @@ largest compactions, 116325 and 119360 tokens, had contributed no duration data 
 | Config | `.pi/idle-compaction.json`, with `IDLE_COMPACTION_*` overrides |
 | Knobs | `quietMs` (120000) · `urgentPercent` (80) / `urgentQuietMs` (20000) · `softPercent` (25, deliberately below where the margin bars bind, so the bar that actually bites at 131072 is 44000 tokens — and **advisory**: percent is computed from whatever `contextWindow` Pi carries for the alias, not the window the model ran, so it may arm a session early but it may not refuse one the token bars cleared) · `minFreeTokens` (20000) / `keptFloorTokens` (24000, Pi's 20000 keep-recent plus the measured 2565-token median summary) · `deadlineMs` (240000, above the fleet p90 of 226 s) · `cooldownMs` (600000, per-session in-memory state: a reload, `/new` or a pod restart erases it, so after a fleet roll the only ordering left is `spreadMs` and the lease — it is a self-churn brake, never a fleet limiter, and **a session at or over its declared window bypasses it**, with `overWindow` recorded in the log so nobody reads it as a missed check) · `spreadMs` (90000, the gap between fleet compactions) / `gateMaxWaitMs` (5400000, long enough to drain a fleet restarted in one breath: `spreadMs + duration` per session, and durations measured 52.7-151.9 s) · `prune` (`report`) · `pruneKeepRecentResults` (12) · `pruneMinChars` (2000) |
 | Gate | `/workspace/.pi/idle-compaction/{lease.json,spacing.json}` — derived from the parent of the checkout, overridable with `IDLE_COMPACTION_GATE_DIR`, disabled with `IDLE_COMPACTION_GATE=off` |
-| Evidence | `.pi/idle-compaction/log.jsonl`, one JSON line per compaction decision, plus an arm refusal written once per reason (a session that never compacts still leaves evidence, and the same line is not repeated on every settle), and a `gate` line for every wait, takeover and forced run |
+| Evidence | `.pi/idle-compaction/log.jsonl`, one JSON line per compaction decision, plus an arm refusal written once per reason (a session that never compacts still leaves evidence, and the same line is not repeated on every settle), a `gate` line for every wait, takeover and forced run, one `start` line per session naming the build and the config it resolved, and `build` on every line |
 
 ### `plan.ts` — `/goal`, `/direction` and `/todo`: the aim, the route to it, and the steps
 

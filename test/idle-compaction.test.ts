@@ -686,9 +686,11 @@ describe("idle compaction", () => {
     }
     const log = readFileSync(path.join(h.cwd, ".pi", "idle-compaction", "log.jsonl"), "utf8");
     const lines = log.split("\n").filter(Boolean);
-    expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain('"stage":"arm"');
-    expect(lines[0]).toContain("under the 25% floor");
+    // The session's own start line is not part of what this test counts; what must not multiply is the refusal.
+    const refusals = lines.filter((line) => line.includes('"stage":"arm"'));
+    expect(refusals).toHaveLength(1);
+    expect(refusals[0]).toContain('"stage":"arm"');
+    expect(refusals[0]).toContain("under the 25% floor");
     expect(h.compacts).toHaveLength(0);
   });
 });
@@ -818,7 +820,39 @@ describe("every number it reports is the number it claims to be", () => {
     const line = logLines(h).find((entry) => entry.kind === "compacted" && entry.trigger === "pi:threshold");
     expect(line.tokensBefore).toBe(116325);
     expect(line.summaryChars).toBe(19253);
-    expect(line.ms).toBe(184000);
-    expect(line.msSource).toBe("session_before_compact to session_compact");
+    // `tailMs`, not `ms`: the span left over after an earlier handler did the summarising. A reader comparing it to
+    // the idle path's genuine `ms` has to be able to see that they are two different measurements.
+    expect(line.tailMs).toBe(184000);
+    expect(line.tailMsSource).toContain("the summarisation ran in an earlier handler");
+    expect(line.ms).toBeUndefined();
+    // Pi's completion event carries no landing size, so the log carries this session's own estimate, labelled.
+    expect(line.tokensAfter).toBe(78000);
+    expect(line.tokensAfterSource).toBe("getContextUsage at session_compact");
+    expect(line.freed).toBe(116325 - 78000);
+  });
+
+  it("says which build and which config a session is running, on the line it opens its log with", async () => {
+    // Every build identity question this fleet has had was answered by guessing from which fields a line happened
+    // to carry. A pod that never compacts now still reports what it is running.
+    const cwd = mkdtempSync(path.join(tmpdir(), "pi-ed-idle-build-"));
+    dirs.push(cwd);
+    writeConfig(cwd, { softPercent: 30, gateMaxWaitMs: 3600000 }, new Date("2026-11-27T03:00:00.000Z"));
+    const h = await setup({ cwd });
+
+    const start = logLines(h).find((entry) => entry.kind === "start");
+    expect(start?.trigger).toBe("session_start:startup");
+    expect(String(start?.build)).toMatch(/^[0-9a-f]{7,12}$/);
+    expect(start?.cfgFrom).toBe(path.join(cwd, ".pi", "idle-compaction.json"));
+    expect(start?.cfg.softPercent).toBe(30);
+    expect(start?.cfg.gateMaxWaitMs).toBe(3600000);
+    expect(start?.cfg.deadlineMs).toBe(240000); // the shipped default, untouched by this test's config file
+
+    // And the arm line repeats the two things that identify it, so a single line is enough to judge a decision.
+    await settle(h);
+    vi.advanceTimersByTime(QUIET_MS);
+    const attempt = logLines(h).find((entry) => entry.kind === "compact");
+    expect(attempt?.build).toBe(start?.build);
+    expect(attempt?.cfgFrom).toBe(start?.cfgFrom);
+    expect(attempt?.cfg.softPercent).toBe(30);
   });
 });

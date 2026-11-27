@@ -155,7 +155,8 @@
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { dirname, basename, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   CONFIG_DIR_NAME,
@@ -382,10 +383,97 @@ function record(ctx: ExtensionContext | undefined, kind: string, data: Record<st
       const kept = readFileSync(path, "utf8").split("\n").filter(Boolean).slice(-LOG_KEEP_LINES);
       writeFileSync(path, `${kept.join("\n")}\n`, "utf8");
     }
-    appendFileSync(path, `${JSON.stringify({ at: new Date().toISOString(), kind, ...data })}\n`, "utf8");
+    // `build` first so a reader filtering on it does not have to know the shape of any particular build's records.
+    // A record that names its own build ends the era of identifying a build by which fields its lines happened to carry.
+    appendFileSync(path, `${JSON.stringify({ at: new Date().toISOString(), kind, build: buildStamp().sha, ...data })}\n`, "utf8");
   } catch {
     // Recording is allowed to fail silently. It must never be the reason a session breaks.
   }
+}
+
+/* ------------------------------------------------------------------ build identity
+ *
+ * Which checkout a decision came from used to be inferable only from the *shape* of a record: a line carrying
+ * `deadlineMs` came from f3df978 or later, a line carrying `tokensAfter` from d5edf91 or later. That inference held
+ * right up to the night it did not, when one pod spent an hour proving that the commit its own `git` reported was
+ * not the code it was executing. Every pod can now say what it is running, in its own log, without a reader having
+ * to know what any build writes.
+ *
+ * The stamp is the git checkout the extension was loaded from - Pi's extension clone, not the workspace the session
+ * is sitting in - resolved once per process by walking up from this module's own file until a `.git` appears. A
+ * detached checkout reports the sha in `HEAD` itself; a checkout with no `.git` above it (an installed release)
+ * reports `unknown`, which is a useful answer too.
+ */
+
+interface BuildStamp {
+  sha: string;
+  dir: string;
+}
+
+let buildStampCache: BuildStamp | undefined;
+
+function buildStamp(): BuildStamp {
+  if (buildStampCache) return buildStampCache;
+  let dir = "";
+  try {
+    dir = dirname(fileURLToPath(import.meta.url));
+  } catch {
+    dir = "";
+  }
+  let sha = "unknown";
+  let root = dir || process.cwd();
+  while (root.length > 1) {
+    const gitDir = join(root, ".git");
+    if (existsSync(gitDir)) {
+      try {
+        const head = readFileSync(join(gitDir, "HEAD"), "utf8").trim();
+        if (head.startsWith("ref: ")) {
+          const ref = head.slice(5);
+          const refFile = join(gitDir, ref);
+          if (existsSync(refFile)) {
+            sha = readFileSync(refFile, "utf8").trim();
+          } else {
+            const packed = readFileSync(join(gitDir, "packed-refs"), "utf8")
+              .split("\n")
+              .find((line) => !line.startsWith("^") && line.endsWith(` ${ref}`));
+            if (packed) sha = packed.split(" ")[0] ?? sha;
+          }
+        } else {
+          sha = head;
+        }
+      } catch {
+        sha = "unknown";
+      }
+      break;
+    }
+    root = dirname(root);
+  }
+  if (!/^[0-9a-f]{7,40}$/.test(sha)) sha = "unknown";
+  buildStampCache = { sha: sha.slice(0, 12), dir: dir || "unknown" };
+  return buildStampCache;
+}
+
+/** The numbers actually in force, under the names a reader of the log needs to judge a decision by. */
+function cfgStamp(cfg: RuntimeConfig): Record<string, number> {
+  return {
+    softPercent: cfg.softPercent,
+    minFreeTokens: cfg.minFreeTokens,
+    keptFloorTokens: cfg.keptFloorTokens,
+    deadlineMs: cfg.deadlineMs,
+    spreadMs: cfg.spreadMs,
+    gateMaxWaitMs: cfg.gateMaxWaitMs,
+    cooldownMs: cfg.cooldownMs,
+    quietMs: cfg.quietMs,
+    urgentQuietMs: cfg.urgentQuietMs,
+    urgentPercent: cfg.urgentPercent,
+  };
+}
+
+/** Environment overrides in effect. A number that came from the pod's environment is not a drift in its config file,
+ *  and the two have looked identical in this fleet more than once. */
+function envOverrides(): string[] {
+  return ENV_NUMBERS.map(([name]) => (process.env[name]?.trim() ? `${name}=${process.env[name]?.trim()}` : ""))
+    .filter((line) => line !== "");
 }
 
 function debug(ctx: ExtensionContext | undefined, line: string): void {
@@ -947,6 +1035,11 @@ export default function (pi: ExtensionAPI) {
     lastLoggedArmReason: undefined,
   };
 
+  /** `defaults` when this session read no config file, otherwise the file it read. Pod-local drift is the recurring
+   *  failure in this fleet, so every arm line says where its numbers came from. */
+  const cfgFrom = (): string =>
+    state.configStamp.path && existsSync(state.configStamp.path) ? state.configStamp.path : "defaults";
+
   function clearTimer(): void {
     if (state.timer) clearTimeout(state.timer);
     state.timer = undefined;
@@ -1157,6 +1250,9 @@ export default function (pi: ExtensionAPI) {
       deadlineMs: state.cfg.deadlineMs,
       tokens: tokensBefore,
       percent: usage?.percent,
+      cfgFrom: cfgFrom(),
+      // The four numbers a drain read is judged against, on the line that was produced under them.
+      cfg: cfgStamp(state.cfg),
       // Recorded when it is true, because it is the fact that explains a compaction that ran inside the cooldown:
       // the cooldown was bypassed on purpose, not missed.
       ...(usage?.tokens !== undefined && usage.tokens !== null && usage.contextWindow !== undefined && usage.tokens >= usage.contextWindow ? { overWindow: true } : {}),
@@ -1304,6 +1400,18 @@ export default function (pi: ExtensionAPI) {
     // A resumed session is the moment being described: sitting down with the context already near the ceiling.
     // Arm the ordinary quiet window rather than compacting on the spot, so the work happens when he is not
     // about to type, and does not happen at all when he is.
+    // One line per session start saying who this pod is: which build it loaded, which config it read, where the gate
+    // is. It goes *before* the arm, because arming decides and can log a refusal on the spot, and a reader should
+    // meet the pod before they meet its first decision. Before this, a restart was only detectable as a side effect
+    // of something else happening, and a pod that never compacts reported nothing at all.
+    record(ctx, "start", {
+      trigger: `session_start:${event.reason}`,
+      cfgFrom: cfgFrom(),
+      gateDir: state.gateDir ?? "none",
+      cfg: cfgStamp(state.cfg),
+      ...(envOverrides().length ? { cfgEnv: envOverrides() } : {}),
+      ...(state.cfg.problems.length ? { problems: state.cfg.problems } : {}),
+    });
     arm(ctx, `session_start:${event.reason}`, state.cfg.quietMs);
     debug(
       ctx,
@@ -1442,6 +1550,8 @@ export default function (pi: ExtensionAPI) {
     // A compaction Pi started itself counts against the cooldown too, and is the evidence that the idle path
     // did not get there first.
     state.lastCompactionAt = Date.now();
+    const usage = usageOf(ctx);
+    const after = usage && typeof usage.tokens === "number" ? usage.tokens : undefined;
     state.entriesAtCompaction = ctx.sessionManager.getBranch().length;
     if (!state.compacting) {
       const ms = state.compactionHookAt ? Date.now() - state.compactionHookAt : undefined;
@@ -1451,11 +1561,16 @@ export default function (pi: ExtensionAPI) {
         trigger: `pi:${event.reason}`,
         tokensBefore: event.compactionEntry.tokensBefore,
         summaryChars: event.compactionEntry.summary.length,
-        // `msSource` says where the number came from, because it is a measured span here and a caller's own clock
-        // on the idle path, and a reader should be able to tell which one they are comparing.
-        ...(ms === undefined ? {} : { ms, msSource: "session_before_compact to session_compact" }),
+        // Named `tailMs`, not `ms`, because it is not the summarisation's duration. `compaction-summary-guard.ts`
+        // loads before this extension and does the summarising inside its own `session_before_compact` handler,
+        // returning the result to Pi, so by the time *this* handler's stamp is taken the work is done and what is
+        // measured is the tail: 40-92 ms on 2026-11-27, against 132-239 s for the idle path's genuine `ms`.
+        ...(ms === undefined ? {} : { tailMs: ms, tailMsSource: "this handler's stamp to session_compact; the summarisation ran in an earlier handler" }),
+        // Pi's completion event carries no landing size (`CompactionEntry` has `tokensBefore` only), so this is this
+        // session's own estimate taken at completion, labelled as such rather than passed off as Pi's number.
+        ...(after === undefined ? {} : { tokensAfter: after, tokensAfterSource: "getContextUsage at session_compact", freed: Math.max(0, event.compactionEntry.tokensBefore - after) }),
       });
-      debug(ctx, `Pi compacted on its own (${event.reason}${ms === undefined ? "" : `, ${ms}ms`}); the idle path did not get there first`);
+      debug(ctx, `Pi compacted on its own (${event.reason}${ms === undefined ? "" : `, ${ms}ms tail`}); the idle path did not get there first`);
       // The hold taken at `session_before_compact` is released here, and the spacing stamp says *which* path ran,
       // so a reader of the shared directory can tell a gated idle completion from a Pi threshold completion.
       stopPiPathHold();

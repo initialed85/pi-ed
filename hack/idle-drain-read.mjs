@@ -6,8 +6,9 @@
  *      still held the gate for its whole duration, so yield per held second is the number that matters);
  *   2. how many attempts hit the ceiling, and what they paid for nothing;
  *   3. how long peers queued behind a holder, which is the cost side of the gate;
- *   4. which build each pod is really running, since the records carry no build marker and the answer has to be
- *      inferred from which fields exist.
+ *   4. which build each pod is really running. Pods report `build` on every record and their resolved config on
+ *      `start` and `compact` lines as of the commit that added the marker; for anything older the answer still has
+ *      to be inferred from which fields exist, so the fingerprint table is kept as the fallback.
  *
  * Usage: node hack/idle-drain-read.mjs [--since 2026-11-27T02:16:00] [--root /workspace]
  */
@@ -121,25 +122,30 @@ let totalHeldMs = 0;
 const lineRate = []; // summarisation rate per landed idle-path completion: the number that sizes the deadline
 for (const r of completions.sort((a, b) => a.at.localeCompare(b.at))) {
   const freed = r.freed ?? 0;
-  const ms = r.ms ?? 0;
+  // Pi's path records `tailMs` (the span left over after an earlier handler did the summarising), never `ms`.
+  // The idle path records `ms`, which is a real duration. They are not the same measurement and must not be summed.
+  const piPath = String(r.trigger ?? "").startsWith("pi:");
+  const ms = piPath ? r.tailMs ?? 0 : r.ms ?? 0;
   const landing = r.tokensAfter ?? 0;
   const total = r.tokensBefore ?? 0;
   const estimated = total - DEFAULTS.keptFloorTokens;
   const tags = [];
-  // Pi's own path reports no tokensAfter/freed, so judging its yield from zeros is a reading error, not a finding.
-  const piPath = String(r.trigger ?? "").startsWith("pi:");
   if (piPath) {
-    tags.push("Pi path: no tokensAfter recorded, ms is a tail span not a duration");
+    tags.push(
+      r.tokensAfter !== undefined
+        ? `Pi path landing is ${r.tokensAfterSource ?? "an unlabelled estimate"}, tail span ${ms}ms`
+        : "Pi path: no landing recorded (build predates the estimate)",
+    );
   } else {
     if (landing && (landing < BAND[0] || landing > BAND[1])) tags.push(`landing outside band ${BAND[0]}-${BAND[1]}`);
     if (freed < DEFAULTS.minFreeTokens) tags.push(`LOW YIELD: freed ${freed} < ${DEFAULTS.minFreeTokens}`);
     if (estimated - freed > 5000) tags.push(`arm estimate over-predicted by ${estimated - freed}`);
   }
-  // A rate on a Pi-path line is meaningless: its ms is a tail span, so the division produces numbers like 1.3M tok/s.
+  // A rate on a Pi-path line is meaningless: its tail span is not a duration, so the division produces 1.3M tok/s.
   const rate = !piPath && ms > 0 && total > 0 ? Math.round(total / (ms / 1000)) : 0;
   if (rate) lineRate.push(rate);
   totalFreed += freed;
-  totalHeldMs += ms;
+  if (!piPath) totalHeldMs += ms;
   console.log(
     `${r.at} ${r.pod.padEnd(26)} ${String(r.trigger).padEnd(22)} ${total} -> ${landing} freed ${freed} in ${Math.round(ms / 1000)}s` +
       `${rate ? ` at ${rate} tok/s` : ""}` +
@@ -233,6 +239,11 @@ for (const [pod, w] of [...waits.entries()].sort((a, b) => b[1].n - a[1].n)) {
       (w.piHold ? `  Pi-path holds recorded ${w.piHold}` : ""),
   );
 }
+// A `gate` record carrying `error` is the fail-open branch in fire(): the pod compacted with no lease held.
+// slopyphus found zero of these across the whole fleet, which is worth keeping as a count rather than a grep.
+const ungated = records.filter((r) => r.kind === "gate" && r.error);
+for (const r of ungated) console.log(`${r.at} ${r.pod.padEnd(26)} UNGATED ESCAPE error ${r.error} trigger ${r.trigger}`);
+console.log(`ungated escapes (compacted with no lease held after a gate I/O error) ${ungated.length}`);
 const gives = records.filter((r) => r.kind === "gate" && r.gaveUp);
 console.log(`gate give-ups ${gives.length} (a give-up means a session stopped waiting, which is the failure mode gateMaxWaitMs exists to bound)`);
 
@@ -241,6 +252,43 @@ const skips = records.filter((r) => r.kind === "skip" && r.reason);
 const byReason = new Map();
 for (const r of skips) byReason.set(r.reason, (byReason.get(r.reason) ?? 0) + 1);
 for (const [reason, n] of [...byReason.entries()].sort((a, b) => b[1] - a[1])) console.log(`${String(n).padStart(3)}  ${reason}`);
+
+header("what each pod says it is running (self-reported)");
+// The records themselves now answer the build question: every line carries `build`, and `start` / `compact` lines
+// carry the config in force and where it came from. Until a pod writes a marker there is nothing to report here,
+// which is why the fingerprint table below is kept as the fallback.
+const reported = new Map();
+for (const r of records) {
+  if (r.build === undefined) continue;
+  const e = reported.get(r.pod) ?? { builds: new Map(), cfgFrom: undefined, cfg: undefined, cfgEnv: undefined, unmarked: 0 };
+  e.builds.set(r.build, (e.builds.get(r.build) ?? 0) + 1);
+  if (r.cfgFrom !== undefined) e.cfgFrom = r.cfgFrom;
+  if (r.cfg !== undefined) e.cfg = r.cfg;
+  if (r.cfgEnv !== undefined) e.cfgEnv = r.cfgEnv;
+  reported.set(r.pod, e);
+}
+for (const r of records) if (r.build === undefined) {
+  const e = reported.get(r.pod) ?? { builds: new Map(), unmarked: 0 };
+  e.unmarked += 1;
+  reported.set(r.pod, e);
+}
+const buildsSeen = new Map();
+for (const [pod, e] of [...reported.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+  const builds = [...e.builds.entries()].sort((a, b) => b[1] - a[1]);
+  const sha = builds.map(([s, n]) => `${s} (${n} lines)`).join(", ") || "no marker in window";
+  const cfg = e.cfg
+    ? `soft ${e.cfg.softPercent}% deadline ${Math.round(e.cfg.deadlineMs / 1000)}s spread ${Math.round(e.cfg.spreadMs / 1000)}s gateMaxWait ${Math.round(e.cfg.gateMaxWaitMs / 1000)}s minFree ${e.cfg.minFreeTokens} cooldown ${Math.round(e.cfg.cooldownMs / 1000)}s`
+    : "no config reported in window";
+  console.log(`${pod.padEnd(26)} build ${sha}  from ${e.cfgFrom ?? "not reported"}  ${cfg}`);
+  if (e.cfgEnv?.length) console.log(`  env overrides ${e.cfgEnv.join(", ")}`);
+  if (e.unmarked) console.log(`  ${e.unmarked} records in window carry no build marker (written by a build that predates the marker)`);
+  for (const [s] of builds) buildsSeen.set(s, (buildsSeen.get(s) ?? 0) + 1);
+}
+console.log(
+  buildsSeen.size
+    ? `builds seen ${[...buildsSeen.entries()].map(([s, n]) => `${s} in ${n} pod(s)`).join(", ")}`
+    : "no pod in this window self-reported a build; the fingerprint table below is the only answer available",
+);
 
 header("build fingerprints");
 const seen = new Map();
