@@ -6,14 +6,19 @@
  * 87.5%. A Pi-path completion inside that band is a cliff: the session ran out of room on Pi's schedule rather than
  * ours, and the summarisation landed inside a live turn. So this counts, per pod and fleet-wide:
  *
- *   - `cliff`        Pi-path (`pi:threshold`) completions whose `tokensBefore` sits in the bar -> threshold band.
- *                    Zero is the goal.
- *   - `claimed`      idle-path completions in the same band: the idle path got there first.
+ *   - `CLIFF`        Pi-path (`pi:threshold`) completions, which are the cliff by definition: Pi reached 87.5% of its
+ *                    own denominator before the idle path got there. Zero is the goal.
+ *   - `claimable`    of those, the ones at or above the bar, i.e. sessions the idle path was eligible to claim.
+ *   - `claimed`      idle-path completions inside the bar -> threshold band: the idle path got there first.
  *   - `missed`       idle attempts in the band that never landed (deadline aborts, Pi-side refusals, gate give-ups).
  *   - `underBar`     idle completions below the bar, which survive the raise because the token bars are the real gate.
  *   - `arm refusals` how many sessions the raised bar is now turning away at arm time.
  *
  * Read-only: it never writes to a pod. It reads `<root>/<pod>/.pi/idle-compaction/log.jsonl` and nothing else.
+ *
+ * Why the cliff is not banded: the measured Pi-path inputs on 2026-11-26 and 2026-11-27 ran 114803-119360 tokens,
+ * which is just *above* 87.5% of the declared 131072 (114688), so filtering cliffs by the 65-87.5% band discarded
+ * every one of them and printed a clean fleet. The band is applied to the idle side, where it is meaningful.
  *
  * Usage:
  *   node hack/cliff-counter.mjs --since 2026-11-27T09:00:00
@@ -99,6 +104,9 @@ for (const pod of pods()) {
   // of 131072 = 114688, so banding the cliff itself would have hidden every single one of them.
   const cliff = piThreshold;
   const claimable = piThreshold.filter((r) => typeof r.tokensBefore === "number" && r.tokensBefore >= barTokens);
+  // Pi-path `compacted` records carry a landing size only on builds that estimated one, so a freed total of zero here
+  // means "this build recorded none", not "nothing was freed".
+  const cliffFreedRows = cliff.filter((r) => typeof r.freed === "number");
   // An idle attempt in the band is a miss unless a completion for the same session landed at that size.
   const missed = bandAttempts.filter((r) => !claimed.some((c) => c.tokensBefore === r.tokens));
 
@@ -114,6 +122,7 @@ for (const pod of pods()) {
     cliffDetail: cliff.map((r) => `${String(r.at ?? "").slice(11, 19)} ${r.tokensBefore ?? "?"}tok -> ${r.tokensAfter ?? "?"}`),
     cliffClaimable: claimable.length,
     freedPiPath: sum(cliff, "freed"),
+    cliffFreedRows: cliffFreedRows.length,
     missed: missed.length,
     deadlineAborts: deadline.length,
     preflightDefers: preflight.length,
@@ -124,6 +133,10 @@ for (const pod of pods()) {
 }
 
 const total = (key) => report.reduce((n, r) => n + (r[key] ?? 0), 0);
+const freedText = () =>
+  total("cliffFreedRows")
+    ? `${total("freedPiPath")} tokens across ${total("cliffFreedRows")}/${total("cliff")} rows`
+    : `n/a: ${total("cliff")} cliff rows and not one of them carried a landing size`;
 
 console.log(`cliff counter · window ${since} .. ${until} · root ${root}`);
 console.log(
@@ -145,12 +158,14 @@ for (const r of report) {
 console.log("");
 console.log(
   `fleet: pods reporting ${report.length} | idle completions ${total("idleCompleted")} (freed ${total("freedIdle")}) | ` +
-    `idle completions in band ${total("claimed")} | CLIFF events ${total("cliff")} (freed ${total("freedPiPath")}) | ` +
+    `idle completions in band ${total("claimed")} | CLIFF events ${total("cliff")}, ${total("cliffClaimable")} of them ` +
+    `at or above the bar so the idle path could have claimed them (freed ${freedText()}) | ` +
     `band attempts that did not land ${total("missed")} | deadline aborts ${total("deadlineAborts")} | pre-flight ` +
     `defers ${total("preflightDefers")} | arm refusals ${total("armRefusals")}`,
 );
 console.log(
-  `verdict: the cliff is what this bar was raised to remove - ${total("cliff")} Pi-threshold compactions inside the ` +
-    `${bar}-${threshold}% band in this window. Compare the rate per hour against a window of the same length before ` +
+  `verdict: a cliff is a Pi-threshold compaction - Pi reached 87.5% of its own denominator before the idle path got ` +
+    `there. ${total("cliff")} in this window across ${report.length} pods, ${total("cliffClaimable")} of them on ` +
+    `sessions the raised bar could have claimed. Compare the rate per hour against a window of the same length before ` +
     `the roll; a cliff count that fell only because nobody was active is not a win.`,
 );
