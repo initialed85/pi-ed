@@ -33,8 +33,11 @@ const DEFAULTS = {
   gateMaxWaitMs: 5400000,
   cooldownMs: 600000,
 };
-/** Landing band measured across the idle-path completions of 2026-11-26 (25667-31480) plus the widest one seen. */
-const BAND = [25667, 32374];
+/** Landing band measured across the idle-path completions of 2026-11-26 and 2026-11-27 (24734-40770 across 6
+ * completions). It was 25667-32374 until a fleet drain produced a landing at 40770 (freed only 9474) and one at
+ * 24734 (freed 49305), i.e. the narrow end of the band was an artefact of a small sample, not a property of the
+ * mechanism: a completion can land low and still free almost nothing, or land high and free a lot. */
+const BAND = [24734, 40770];
 
 /** Field-shape fingerprints, newest first. The build a pod runs has to be inferred until a marker is recorded. */
 /**
@@ -239,11 +242,26 @@ for (const [pod, w] of [...waits.entries()].sort((a, b) => b[1].n - a[1].n)) {
       (w.piHold ? `  Pi-path holds recorded ${w.piHold}` : ""),
   );
 }
-// A `gate` record carrying `error` is the fail-open branch in fire(): the pod compacted with no lease held.
-// slopyphus found zero of these across the whole fleet, which is worth keeping as a count rather than a grep.
+// Two different things a single line would blur, and slopyphus caught that I was about to blur them.
+// An *escape* is a pod that compacted with no lease because the gate itself failed: the record carries `error`.
+// A *concurrent run* is a summarisation that went ahead beside a peer's live lease by design - Pi's own path
+// (`holdGateForPiPath` will not stomp a live lease and does not honour the spacing stamp) and a forced `/run --force`
+// (`asked now`). Neither carries `error`, so counting only `error` reads as an all-clear on the exact failure mode
+// the spacing/lease hazard fix targets. Three of these fired on 2026-11-27.
 const ungated = records.filter((r) => r.kind === "gate" && r.error);
+const CONCURRENT_ACTIONS = new Set(["Pi compacting while the gate is held elsewhere", "asked now"]);
+const concurrent = records.filter((r) => r.kind === "gate" && CONCURRENT_ACTIONS.has(String(r.action ?? "")));
 for (const r of ungated) console.log(`${r.at} ${r.pod.padEnd(26)} UNGATED ESCAPE error ${r.error} trigger ${r.trigger}`);
 console.log(`ungated escapes (compacted with no lease held after a gate I/O error) ${ungated.length}`);
+for (const r of concurrent)
+  console.log(
+    `${r.at} ${r.pod.padEnd(26)} CONCURRENT RUN action "${r.action}" ${r.heldBy ? `heldBy ${r.heldBy}` : ""}${r.forced ? " forced" : ""}`,
+  );
+console.log(
+  `concurrent runs (a summarisation that went ahead beside a peer's live lease) ${concurrent.length} - ` +
+    `${concurrent.filter((r) => String(r.action).startsWith("Pi compacting")).length} of them Pi's own path, ` +
+    `${concurrent.filter((r) => r.action === "asked now").length} forced`,
+);
 const gives = records.filter((r) => r.kind === "gate" && r.gaveUp);
 console.log(`gate give-ups ${gives.length} (a give-up means a session stopped waiting, which is the failure mode gateMaxWaitMs exists to bound)`);
 
