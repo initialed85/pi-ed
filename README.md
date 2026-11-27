@@ -484,6 +484,11 @@ a 830x gap that is the whole argument for why Pi sessions do not need help stayi
 
 The same run corrected the rates this code used. Sushi was assumed at 460-470 tok/s cold from pi-ed's own probes and
 measures **236.7 tok/s** at the router, which prices a 42,000-token cold refresh at 178 seconds rather than 91.
+Those seconds are **box work, not wall time**, and the gap is the queue: rooter measured a warm restore of a
+33,761-token prefix at 0.585 s of work that took **97 s** on the wire, arriving to a box at `running=2 waiting=1`
+and finishing at `running=7`. A gate that trades in capacity should price the work; a promise about response time
+may not be made from this number, and deadline arithmetic (idle-compaction) sizes against rooter's queue bound
+instead.
 Pi's own bar, for reference: an idle refresh arms only when `0.15 × missCost − warmCost ≥ $0.05`, which at this
 fleet's median prompt needs input tokens priced around **$24.67/M** — so the `cost` block is not a nicety, it is
 the door Pi stops at.

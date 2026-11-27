@@ -83,7 +83,17 @@ export const COLD_PREFILL_TOK_S: Record<string, number> = {
   sushi: 236,
 };
 
-/** What `tokens` of cold recompute would have cost on `backend`, when no observation is available. */
+/**
+ * What `tokens` of cold recompute would have cost on `backend`, when no observation is available.
+ *
+ * Every figure this returns is **box work**, not wall time, and the two differ by the queue: rooter measured a
+ * warm restore of a 33,761-token prefix at 0.585 s of work that took 97 s on the wire, because the box reported
+ * `running=2 waiting=1` when it arrived and `running=7` when it finished. So "a refresh avoids 178s" is a claim
+ * about GPU seconds this fleet would not spend, and no claim about latency anyone would notice - which is the
+ * right basis for a policy that trades in capacity, and the wrong basis for a promise about response time.
+ * Where deadline arithmetic is involved (idle-compaction), the number to size against is rooter's queue bound,
+ * not this.
+ */
 export function coldSeconds(tokens: number, backend: string | undefined, rates: Record<string, number> = COLD_PREFILL_TOK_S): number | undefined {
   const rate = backend ? rates[backend] : undefined;
   if (!rate || tokens <= 0) return undefined;
