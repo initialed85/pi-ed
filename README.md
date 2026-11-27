@@ -204,6 +204,26 @@ partial rollout protects nobody, which is the argument for moving every pod at o
 session id, repo, start time and expiry, so a pod killed mid-compaction leaves something the next session takes over
 instead of a fleet permanently blocked by a corpse.
 
+**Then it asks whether either box can take the job.** The gate serialises this fleet; it says nothing about the two
+machines behind rooter, and rooter's 2026-11-27 measurements put the aborts there. Cold summarisation-shaped prompts
+prefill at 2,512 / 2,481 / 2,486 tok/s on strata (46,857 / 83,335 / 114,772 tokens, flat with size) and
+470 / 466 / 463 tok/s on sushi, decoding at 47–63 tok/s against sushi's 8.5 — so an 82.7k summarisation costs ~214 s
+on one box and ~45 s on the other, and `auto` chooses. Worse, the queue in front of a box is invisible from this
+side: three concurrent cold prompts held per-call prefill at ~2,475 tok/s while ttft went 18.9 → 52.7 → 161.5 s and
+rooter's own `wait_ms` stayed 0.000, because the queue forms after the proxy hands off. That is the only explanation
+for three 45k–77k summarisations that ran their full 240 s on provably idle sessions: 45k costs ~132 s, so the rest
+was waiting.
+
+So before claiming the lease, an attempt reads `GET /rooter/backends` (803 bytes, 1–3 ms, using the key this session
+already holds for its provider) and defers when **every** healthy box reports `busy == concurrency` — the pessimistic
+rule, because a request is only certain to queue at that point. It retries every `boxRetryMs` on the same cancellable
+timer the gate wait uses, gives up after `boxMaxDefers` looks with a reason, runs no read at all when a person asked
+now or the provider is not rooter, and fails open on any error: a proxy that will not answer is not a box that is
+full. It is a look and not a reservation — a peer can take the slot in the hundred milliseconds between — and the
+real queue depths (`live.queued`, `sushi:num_requests_waiting`) sit behind rooter's backend key, which no pi pod
+holds. Each attempt records the snapshot it saw as `boxes: ["strata=1/4", "sushi=4/4"]`, which is the field that
+was missing when the fleet's aborts had to be argued about instead of counted.
+
 It also counts stale tool output at `agent_before_settle` — tool results are 3.40M of the 5.00M characters of
 transcript in that session, 68% — and dropping them is the one context reduction that needs no model call and keeps
 the reasoning verbatim. **By default it only counts them.** Set `prune: "on"` to replace stale, text-only, non-recent
@@ -224,7 +244,11 @@ released when the summarisation never reports back, a Pi-path compaction that di
 recorded collision when Pi forces a summarisation while a peer holds, and the ungated mode — plus three for the
 eligibility bars themselves: a session over its declared window compacting inside its own cooldown (logged
 `overWindow`), the percent bar being unable to refuse what the token bars cleared, and an idle attempt standing aside
-while Pi compacts that same session.
+while Pi compacts that same session — plus nine for the box pre-flight: a saturated fleet deferring without taking
+the lease, headroom starting the attempt and stamping `boxes` on it, a deferral retrying and taking the box that
+frees, boxes that stay full ending in one skip with a reason, the read failing open and announcing itself once, the
+key resolved through the model registry (which is the shape a real pi model has), `slotsFree` beating the arithmetic
+both ways, a non-rooter provider and a person asking now issuing no call at all, and the switch-off.
 
 **The field result that changed the defaults.** A deploy stamp restarted every pod in the fleet inside the same
 second, so every session's quiet window opened at the same instant, and nine of them issued a summarisation request
@@ -411,9 +435,10 @@ this fleet is `-ne -e`). A scratch `--mode rpc` session with empty stdin spends 
 | Commands | `/idle-compact status` · `on` · `off` · `dry-run` · `run [--force]` · `prune <off\|report\|on>` |
 | Flags | `--idle-compaction-off` |
 | Config | `.pi/idle-compaction.json`, with `IDLE_COMPACTION_*` overrides |
-| Knobs | `quietMs` (120000) · `urgentPercent` (80) / `urgentQuietMs` (20000) · `softPercent` (25, deliberately below where the margin bars bind, so the bar that actually bites at 131072 is 44000 tokens — and **advisory**: percent is computed from whatever `contextWindow` Pi carries for the alias, not the window the model ran, so it may arm a session early but it may not refuse one the token bars cleared) · `minFreeTokens` (**30000** — what a completion has to free before it is worth its own re-send: 12 idle-path completions measured 9474-49305 tokens freed against 37328-63746 tokens re-sent, a fleet return of 0.62, so a 20000 minimum was asking for the 3 sessions that freed 15000, 9474 and 19099 to pay ~2.5x their gain) / `keptFloorTokens` (24000, Pi's 20000 keep-recent plus the measured 2565-token median summary) · `deadlineMs` (240000, the **floor**: above the fleet p90 of 226 s) scaled up per attempt by `rateTokensPerSecond` (300, the poor end of the measured 255-816 tok/s band) to at most `maxDeadlineMs` (900000) — a flat ceiling is what killed two 2026-11-27 attempts at 480 s on 90599 and 82704 token contexts for 3151 tokens between them, and scaling is bounded by a ceiling rather than by a guess · `cooldownMs` (600000) / `retryCooldownMs` (1800000, how long a session waits before re-attempting one that did not finish; not bypassed by `overWindow`, because the attempt that just burned its ceiling is the one not to re-buy, and Pi's own 87.5% auto-compaction serves an out-of-room session meanwhile, per-session in-memory state: a reload, `/new` or a pod restart erases it, so after a fleet roll the only ordering left is `spreadMs` and the lease — it is a self-churn brake, never a fleet limiter, and **a session at or over its declared window bypasses it**, with `overWindow` recorded in the log so nobody reads it as a missed check) · `spreadMs` (90000, the gap between fleet compactions) / `gateMaxWaitMs` (5400000, long enough to drain a fleet restarted in one breath: `spreadMs + duration` per session, and durations measured 52.7-151.9 s) · `prune` (`report`) · `pruneKeepRecentResults` (12) · `pruneMinChars` (2000) |
+| Knobs | `quietMs` (120000) · `urgentPercent` (80) / `urgentQuietMs` (20000) · `softPercent` (25, deliberately below where the margin bars bind, so the bar that actually bites at 131072 is 44000 tokens — and **advisory**: percent is computed from whatever `contextWindow` Pi carries for the alias, not the window the model ran, so it may arm a session early but it may not refuse one the token bars cleared) · `minFreeTokens` (**30000** — what a completion has to free before it is worth its own re-send: 12 idle-path completions measured 9474-49305 tokens freed against 37328-63746 tokens re-sent, a fleet return of 0.62, so a 20000 minimum was asking for the 3 sessions that freed 15000, 9474 and 19099 to pay ~2.5x their gain) / `keptFloorTokens` (24000, Pi's 20000 keep-recent plus the measured 2565-token median summary) · `deadlineMs` (240000, the **floor**: above the fleet p90 of 226 s) scaled up per attempt by `rateTokensPerSecond` (300, the poor end of the measured 255-816 tok/s band) to at most `maxDeadlineMs` (900000) — a flat ceiling is what killed two 2026-11-27 attempts at 480 s on 90599 and 82704 token contexts for 3151 tokens between them, and scaling is bounded by a ceiling rather than by a guess · `cooldownMs` (600000) / `retryCooldownMs` (1800000, how long a session waits before re-attempting one that did not finish; not bypassed by `overWindow`, because the attempt that just burned its ceiling is the one not to re-buy, and Pi's own 87.5% auto-compaction serves an out-of-room session meanwhile, per-session in-memory state: a reload, `/new` or a pod restart erases it, so after a fleet roll the only ordering left is `spreadMs` and the lease — it is a self-churn brake, never a fleet limiter, and **a session at or over its declared window bypasses it**, with `overWindow` recorded in the log so nobody reads it as a missed check) · `spreadMs` (90000, the gap between fleet compactions) / `gateMaxWaitMs` (5400000, long enough to drain a fleet restarted in one breath: `spreadMs + duration` per session, and durations measured 52.7-151.9 s) · `prune` (`report`) · `pruneKeepRecentResults` (12) · `pruneMinChars` (2000) · `boxCheckMs` (1500, the budget for `GET /rooter/backends` before an attempt is issued; `0` ships every attempt blind) / `boxRetryMs` (15000) / `boxMaxDefers` (20) |
 | Gate | `/workspace/.pi/idle-compaction/{lease.json,spacing.json}` — derived from the parent of the checkout, overridable with `IDLE_COMPACTION_GATE_DIR`, disabled with `IDLE_COMPACTION_GATE=off` |
-| Evidence | `.pi/idle-compaction/log.jsonl`, one JSON line per compaction decision, plus an arm refusal written once per reason (a session that never compacts still leaves evidence, and the same line is not repeated on every settle), a `gate` line for every wait, takeover and forced run, one `start` line per session naming the build and the config it resolved, and `build` on every line |
+| Evidence | `.pi/idle-compaction/log.jsonl`, one JSON line per compaction decision, plus an arm refusal written once per reason (a session that never compacts still leaves evidence, and the same line is not repeated on every settle), a `gate` line for every wait, takeover and forced run, one `start` line per session naming the build and the config it resolved, `boxes` on every attempt that asked the
+boxes first, and `build` on every line |
 
 ### `plan.ts` — `/goal`, `/direction` and `/todo`: the aim, the route to it, and the steps
 

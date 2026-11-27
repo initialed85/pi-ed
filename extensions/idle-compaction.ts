@@ -95,6 +95,15 @@
  *   minutes and 16 in 37-64. Two independent estimates agree, and both blow past the old 1800000 - a 30-minute cap
  *   made the last third of a restarted fleet give up on a backlog that was about to clear, which is what slopyphus
  *   predicted from the shared files before this number moved. |
+ * | `boxCheckMs` | 1500 | Ask `GET /rooter/backends` before issuing, and stop asking after this long. The read | is 803 bytes and 1-3 ms on the LAN (rooter, 2026-11-27), so the timeout is not the cost of the question; it is the
+ *   bound on a proxy that has stopped answering. `0` switches the pre-flight off and every attempt ships blind, which
+ *   is worth having because of what rooter measured: three cold prompts on one box held per-call prefill at ~2,475
+ *   tok/s while ttft went 18.9 -> 52.7 -> 161.5 s and `wait_ms` stayed 0.000 throughout, so a queued summarisation
+ *   burns its whole ceiling waiting for a slot nobody publishes. |
+ * | `boxRetryMs` | 15000 | How long to sit before looking again when every healthy box is at its slots. Fifteen | seconds is a quarter of a solo attempt, and a box that is full now is usually one that just started something: strata
+ *   prefills at ~2,480 tok/s, so 15 s moves a 37k-token job along. The timer is the same cancellable one the gate
+ *   wait uses, so a returning person always beats a queued compaction. |
+ * | `boxMaxDefers` | 20 | Give up after this many looks at a saturated fleet - five minutes of boxes that stayed | full - which is a skip with a reason rather than a session parked indefinitely. Reset by any attempt that ran. |
  * | `prune` | `report` | `report` counts the reclaimable stale tool output and touches nothing. `on` writes the edits. |
  * | `pruneKeepRecentResults` | 12 | The newest tool results are the working set; everything older is a candidate. |
  * | `pruneMinChars` | 2000 | Under this, the edit entry costs about what it saves. |
@@ -107,6 +116,11 @@
  *   at `deadlineMs` this extension calls `ctx.abort()`, which reaches `abortCompaction()` and aborts the controller
  *   the summarisation call is running on, and Pi writes no entry for an aborted compaction - the session keeps
  *   everything it had. A queued prompt, by contrast, is simply processed after the compaction finishes.
+ * - **The pre-flight is a look, not a reservation.** `busy < concurrency` one hundred milliseconds before a request
+ *   does not mean a slot is free when the request arrives, and a peer can fill it in between. The rule is therefore
+ *   the pessimistic one - defer only when *every* healthy box is at its declared slots - and it fails open on any
+ *   error, because rooter being unreachable is not a reason to stop summarising. What the boxes themselves report
+ *   (`live.queued`, `live.phase`, `sushi:num_requests_waiting`) is behind rooter's backend key, which no pi pod holds.
  * - **The contention is the fleet, not the transcript.** Every model in this fleet is served by two backends, and a
  *   deploy stamp restarts every pod inside the same second, so every session's quiet window opens at the same
  *   instant. Nine of them did that on 2026-11-26 (58877 to 186420 tokens each) and every one was aborted at the
@@ -147,6 +161,43 @@
  *   throw that prefix away. While one is in flight this extension answers `cache_warming_decision` with
  *   `stop`. Every model in this fleet declares no cache lifetime, so warming is inert here today; the rule is
  *   insurance for the day a session runs on a cache-aware provider.
+ *
+ * ## The box pre-flight: do not issue into a fleet that is already working
+ *
+ * The gate says *this fleet is not running two summarisations at once*. It does not say *a box can take this job*.
+ * rooter's measurements on 2026-11-27 put the aborts there rather than on the deadline:
+ *
+ * - **Placement.** A cold summarisation-shaped prompt prefills at 2,512 / 2,481 / 2,486 tok/s on strata for 46,857 /
+ *   83,335 / 114,772 tokens - flat with size - and at 470 / 466 / 463 tok/s on sushi, decoding at 47-63 tok/s against
+ *   sushi's 8.5. An 82.7k summarisation is therefore ~214 s on one box (179 s prefill + ~35 s decode) and ~45 s on the
+ *   other. `auto` chooses, and a 240 s ceiling is passable on one route and not the other.
+ * - **Queueing, which is invisible from this side.** Three cold prompts on one box held per-call prefill at ~2,475
+ *   tok/s while ttft went 18.9 -> 52.7 -> 161.5 s, and rooter's own `wait_ms` stayed 0.000 throughout, because the
+ *   queue forms after the proxy hands the request off. That is what pi-bot's three aborts at 45,455 / 55,077 / 76,954
+ *   tokens were: its sessions were provably idle (no user turn, no own call inside `[at - elapsedMs, at]`) and 45k
+ *   costs ~132 s, so the remaining ~108 s was spent waiting for a slot nothing publishes.
+ *
+ * **The read.** `GET /rooter/backends` - 803 bytes, 1-3 ms on the LAN - returns `busy`, `concurrency`, `healthy`
+ * (`ready` is an alias) per box, authenticated with the same key this session already holds for its provider (the
+ * model object's `baseUrl`, which pi rewrites to the proxy url when a provider declares one, plus
+ * `modelRegistry.getApiKeyAndHeaders()` or `model.apiKey`). It is asked *before* the lease is claimed, because a
+ * deferral must not make this session look busy to the rest of the fleet, and the result is carried into the
+ * collision arm so an attempt that ends up beside a live generation was not issued blind.
+ *
+ * **The rule is pessimistic on purpose:** defer only when *every* healthy box reports `busy == concurrency`. With one
+ * box free the request can be placed, and `auto`'s placement is rooter's decision, not ours. A deferral re-reads on
+ * `boxRetryMs` through the same cancellable timer the gate wait uses - a returning person always beats a queued
+ * compaction - and stops after `boxMaxDefers` looks with one skip saying `gave up after N looks`.
+ *
+ * **It fails open.** A box list that cannot be read is not a saturated box list: a timeout, a non-200, a body that is
+ * not a list, a provider that is not rooter, and a person who asked now (a command, `/compact`, a `pi:threshold`
+ * collision) all run ungated, and the first such event logs one line saying so instead of repeating it per attempt.
+ *
+ * **What it cannot be.** A look, not a reservation: a peer can take the slot in the milliseconds between the read and
+ * the request. The signals that would make it a reservation - `live.queued`, `live.phase`, `live.prefill_tok_s_mean`,
+ * `sushi:num_requests_waiting` - sit behind rooter's backend key, which no pi pod holds and should not. Each attempt
+ * records the snapshot it saw (`boxes: ["strata=1/4", "sushi=4/4"]`) so the next abort is measured against what was
+ * known at issue time, which is the field this volume has never had.
  *
  * Side effects: compactions can happen unasked, at idle. Every compaction decision is logged to
  * `.pi/idle-compaction/log.jsonl`, and an arm refusal is logged once per reason rather than once per settle, so a
@@ -209,6 +260,9 @@ interface Config {
   retryCooldownMs: number;
   spreadMs: number;
   gateMaxWaitMs: number;
+  boxCheckMs: number;
+  boxRetryMs: number;
+  boxMaxDefers: number;
   prune: PruneMode;
   pruneKeepRecentResults: number;
   pruneMinChars: number;
@@ -231,6 +285,9 @@ const DEFAULT_CONFIG: Config = {
   retryCooldownMs: 1800000,
   spreadMs: 90000,
   gateMaxWaitMs: 5400000,
+  boxCheckMs: 1500,
+  boxRetryMs: 15000,
+  boxMaxDefers: 20,
   prune: "report",
   pruneKeepRecentResults: 12,
   pruneMinChars: 2000,
@@ -253,6 +310,9 @@ type NumericKey =
   | "retryCooldownMs"
   | "spreadMs"
   | "gateMaxWaitMs"
+  | "boxCheckMs"
+  | "boxRetryMs"
+  | "boxMaxDefers"
   | "pruneKeepRecentResults"
   | "pruneMinChars"
   | "pruneMaxPerBoundary";
@@ -271,6 +331,9 @@ const NUMERIC_LIMITS: Record<NumericKey, [number, number]> = {
   retryCooldownMs: [0, 86400000],
   spreadMs: [1000, 3600000],
   gateMaxWaitMs: [1000, 21600000],
+  boxCheckMs: [0, 60000],
+  boxRetryMs: [1000, 3600000],
+  boxMaxDefers: [1, 200],
   pruneKeepRecentResults: [0, 200],
   pruneMinChars: [200, 200000],
   pruneMaxPerBoundary: [1, 100],
@@ -290,6 +353,9 @@ const ENV_NUMBERS: Array<[string, NumericKey]> = [
   ["IDLE_COMPACTION_RETRY_COOLDOWN_MS", "retryCooldownMs"],
   ["IDLE_COMPACTION_SPREAD_MS", "spreadMs"],
   ["IDLE_COMPACTION_GATE_MAX_WAIT_MS", "gateMaxWaitMs"],
+  ["IDLE_COMPACTION_BOX_CHECK_MS", "boxCheckMs"],
+  ["IDLE_COMPACTION_BOX_RETRY_MS", "boxRetryMs"],
+  ["IDLE_COMPACTION_BOX_MAX_DEFERS", "boxMaxDefers"],
   ["IDLE_COMPACTION_PRUNE_KEEP_RECENT", "pruneKeepRecentResults"],
   ["IDLE_COMPACTION_PRUNE_MIN_CHARS", "pruneMinChars"],
   ["IDLE_COMPACTION_PRUNE_MAX", "pruneMaxPerBoundary"],
@@ -375,6 +441,119 @@ function readConfig(ctx: ExtensionContext): RuntimeConfig {
   if (truthy(process.env.IDLE_COMPACTION_PIN_PLAN)) cfg.pinPlan = true;
 
   return cfg;
+}
+
+/* ------------------------------------------------------------------ the box pre-flight
+ *
+ * The gate decides which session in this fleet may summarise; it says nothing about whether either box can take the
+ * job the moment the lease is handed over. rooter measured both halves of that on 2026-11-27, and both belong here:
+ *
+ *   - placement: cold summarisation-shaped prompts run strata at 2,512 / 2,481 / 2,486 tok/s prefill (46,857 /
+ *     83,335 / 114,772 tokens - flat with size, no collapse) and sushi at 470 / 466 / 463 tok/s, with decode at
+ *     47-63 tok/s against sushi's 8.5. An 82.7k summarisation therefore costs ~214 s on sushi and ~45 s on strata
+ *     before anybody else is counted.
+ *   - queueing: three cold prompts (45k, 80k, 110k) on one box kept per-call prefill at ~2,475 tok/s while ttft
+ *     went 18.9 -> 52.7 -> 161.5 s, and rooter's own `wait_ms` stayed 0.000 throughout, because the queue forms
+ *     after the proxy hands the request off. So the time a summarisation can spend waiting is invisible to every
+ *     number rooter has ever published, and pi-bot's three aborts at 45,455 / 55,077 / 76,954 tokens on provably
+ *     idle sessions are that: 45k needs ~132 s on the slow box, yet it consumed the whole 240 s.
+ *
+ * `GET /rooter/backends` answers the question at arm time: per box `busy`, `concurrency`, `healthy`, `slotsFree`
+ * (`concurrency`, `busy`, `healthy`, `slotsFree`, `inflight`, `coldPrefillTokS`, `restoreTokS`, `totalWait` are all
+ * there), 803-1187 bytes, 49-199 ms measured from a pod over the public front door and the in-cluster service both,
+ * using the key this session already holds for its provider. It is a go/no-go, not a reservation: a peer can take the
+ * slot between the read and the request, and the boxes themselves (`live.queued`, `sushi:num_requests_waiting`) are
+ * behind rooter's backend key, which no pi pod holds. The rule is therefore the pessimistic one - defer only when
+ * *every* healthy box is out of slots, which is when a request is certain to queue rather than merely likely to.
+ *
+ * It runs before the lease is claimed, because a session that is going to defer must not make the fleet wait on
+ * it, and it fails open: no rooter provider, an unreadable response, a timeout. rooter being down is not a reason
+ * to stop summarising - the deadline already handles what a saturated box does to a request.
+ */
+const BOX_ENDPOINT = "/rooter/backends";
+
+interface BackendState {
+  name: string;
+  busy: number;
+  concurrency: number;
+  healthy: boolean;
+  /** rooter publishes `slotsFree` directly; where it is present it is the box's own answer, so it beats arithmetic. */
+  slotsFree?: number;
+}
+
+type BoxRead = { ok: true; backends: BackendState[] } | { ok: false; error: string };
+
+/** Where to ask. Only a session routed through rooter can answer this, and only rooter knows the boxes. */
+function boxRootUrl(model: unknown): string | undefined {
+  const record = model as { provider?: unknown; baseUrl?: unknown } | undefined;
+  if (!record || record.provider !== "rooter") return undefined;
+  const base = typeof record.baseUrl === "string" ? record.baseUrl.trim() : "";
+  if (!base) return undefined;
+  return base.replace(/\/+$/, "").replace(/\/v1$/, "");
+}
+
+/** The snapshot as one short word per box, so a log line can be scanned rather than parsed. */
+function boxesStamp(backends: BackendState[]): string[] {
+  return backends.map(
+    (box) => `${box.name}=${box.busy}/${box.concurrency}${box.healthy ? "" : " unhealthy"}`,
+  );
+}
+
+function boxDecision(backends: BackendState[]): { proceed: boolean; reason?: string } {
+  if (backends.length === 0) return { proceed: true };
+  const healthy = backends.filter((box) => box.healthy);
+  if (healthy.length === 0) {
+    return { proceed: false, reason: `no healthy box (${boxesStamp(backends).join(" ")})` };
+  }
+  // A box has headroom when it says it has. `slotsFree` is rooter's published answer; `busy < concurrency` is the
+  // same statement rebuilt from the pair, for a build that does not publish the field.
+  const free = (box: BackendState) => (box.slotsFree !== undefined ? box.slotsFree > 0 : box.busy < box.concurrency);
+  if (healthy.some(free)) return { proceed: true };
+  return {
+    proceed: false,
+    reason: `every healthy box is at its slots (${boxesStamp(healthy).join(" ")}); a summarisation issued now would queue`,
+  };
+}
+
+async function readBackends(ctx: ExtensionContext, timeoutMs: number): Promise<BoxRead> {
+  const root = boxRootUrl(ctx.model);
+  if (!root) return { ok: false, error: "provider is not rooter" };
+  try {
+    let key: string | undefined = (ctx.model as { apiKey?: string } | undefined)?.apiKey;
+    if (!key) {
+      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model as never);
+      key = auth.ok ? auth.apiKey : undefined;
+      if (!auth.ok) return { ok: false, error: `no key: ${auth.error}` };
+    }
+    if (!key) return { ok: false, error: "no key resolved" };
+    const response = await fetch(`${root}${BOX_ENDPOINT}`, {
+      method: "GET",
+      headers: { "x-api-key": key, accept: "application/json" },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) return { ok: false, error: `HTTP ${response.status}` };
+    const rows: unknown = await response.json();
+    if (!Array.isArray(rows)) return { ok: false, error: "body was not a list" };
+    const backends = rows
+      .map((row) => row as Partial<BackendState>)
+      .filter((row) => typeof row.name === "string" && typeof row.busy === "number" && typeof row.concurrency === "number")
+      .map((row) => ({
+        name: String(row.name),
+        busy: Math.max(0, Math.round(row.busy as number)),
+        concurrency: Math.max(1, Math.round(row.concurrency as number)),
+        healthy: row.healthy !== false,
+        ...(typeof row.slotsFree === "number" ? { slotsFree: Math.round(row.slotsFree) } : {}),
+      }));
+    return { ok: true, backends };
+  } catch (error) {
+    // A fetch failure in node arrives as a TypeError whose story is in `cause`, and an AbortSignal timeout arrives
+    // as a TimeoutError with a message nobody would recognise. Name what a reader can act on.
+    const name = error instanceof Error ? error.name : String(error);
+    if (name === "AbortError" || name === "TimeoutError") return { ok: false, error: `timeout after ${timeoutMs}ms` };
+    const cause = (error as { cause?: { code?: string } } | undefined)?.cause;
+    const detail = error instanceof Error && error.message ? error.message : name;
+    return { ok: false, error: cause?.code ? `${detail} (${cause.code})` : detail };
+  }
 }
 
 /* ------------------------------------------------------------------ record */
@@ -481,6 +660,9 @@ function cfgStamp(cfg: RuntimeConfig): Record<string, number> {
     retryCooldownMs: cfg.retryCooldownMs,
     spreadMs: cfg.spreadMs,
     gateMaxWaitMs: cfg.gateMaxWaitMs,
+    boxCheckMs: cfg.boxCheckMs,
+    boxRetryMs: cfg.boxRetryMs,
+    boxMaxDefers: cfg.boxMaxDefers,
     quietMs: cfg.quietMs,
     urgentQuietMs: cfg.urgentQuietMs,
     urgentPercent: cfg.urgentPercent,
@@ -933,6 +1115,12 @@ interface State {
    *  re-armed in the same window and burned 480 s between them for 3151 tokens freed. */
   lastAttemptAt: number | undefined;
   lastAttemptOutcome: string | undefined;
+  /** The last box snapshot this session read, so a status line can say what the fleet looked like. */
+  lastBoxes: BackendState[] | undefined;
+  /** Why the pre-flight last declined to speak, so one failure is logged once and not every attempt. */
+  lastBoxError: string | undefined;
+  /** Consecutive headroom deferrals. Bounded so a permanently saturated box cannot park a session forever. */
+  headroomDefers: number;
   entriesAtCompaction: number | undefined;
   stats: Stats;
   tally: Tally;
@@ -1082,6 +1270,9 @@ export default function (pi: ExtensionAPI) {
     lastCompactionAt: undefined,
     lastAttemptAt: undefined,
     lastAttemptOutcome: undefined,
+    lastBoxes: undefined,
+    lastBoxError: undefined,
+    headroomDefers: 0,
     entriesAtCompaction: undefined,
     stats: freshStats(),
     tally: freshTally(),
@@ -1192,9 +1383,77 @@ export default function (pi: ExtensionAPI) {
     debug(ctx, `gate released (${note})`);
   }
 
+  /**
+   * Decide, then start. The decision includes whether either box can take the job right now, which is why that
+   * check is not inside `startAttempt`: a session that defers on headroom must not have claimed the fleet lease
+   * first, and a session whose provider is not rooter never waits on a network call at all.
+   */
   function fire(trigger: string, quietMs: number, force: boolean): void {
     const ctx = state.lastCtx;
     if (!ctx) return;
+    const cfg = state.cfg;
+    // A person who asked now is not queued behind a read, and neither is a session that cannot ask.
+    if (force || cfg.boxCheckMs <= 0 || !boxRootUrl(ctx.model)) {
+      void startAttempt(ctx, trigger, quietMs, force, undefined);
+      return;
+    }
+    void (async () => {
+      const read = await readBackends(ctx, cfg.boxCheckMs);
+      if (!read.ok) {
+        if (state.lastBoxError !== read.error) {
+          state.lastBoxError = read.error;
+          record(ctx, "skip", { stage: "preflight", trigger, reason: `box read unavailable (${read.error}); running ungated` });
+        }
+        void startAttempt(ctx, trigger, quietMs, force, undefined);
+        return;
+      }
+      state.lastBoxes = read.backends;
+      const decision = boxDecision(read.backends);
+      if (decision.proceed || force) {
+        state.headroomDefers = 0;
+        void startAttempt(ctx, trigger, quietMs, force, read.backends);
+        return;
+      }
+      state.headroomDefers += 1;
+      if (state.headroomDefers > cfg.boxMaxDefers) {
+        state.headroomDefers = 0;
+        state.stats.skipped += 1;
+        state.stats.lastNote = `skipped: ${decision.reason}, and the boxes stayed full`;
+        record(ctx, "skip", {
+          stage: "preflight",
+          trigger,
+          reason: `${decision.reason}; gave up after ${cfg.boxMaxDefers} looks`,
+          boxes: boxesStamp(read.backends),
+          defers: cfg.boxMaxDefers,
+        });
+        return;
+      }
+      state.stats.skipped += 1;
+      state.stats.lastNote = `deferred for box headroom: ${decision.reason}`;
+      record(ctx, "skip", {
+        stage: "preflight",
+        trigger,
+        reason: decision.reason,
+        boxes: boxesStamp(read.backends),
+        defer: state.headroomDefers,
+      });
+      debug(ctx, `pre-flight deferred (${decision.reason})`);
+      // The same cancellable timer the gate wait uses, so a returning person always beats a queued compaction.
+      state.timer = setTimeout(() => {
+        state.timer = undefined;
+        fire(trigger, quietMs, false);
+      }, cfg.boxRetryMs);
+      state.timer.unref?.();
+    })();
+  }
+
+  function startAttempt(
+    ctx: ExtensionContext,
+    trigger: string,
+    quietMs: number,
+    force: boolean,
+    boxes: BackendState[] | undefined,
+  ): void {
     const blocked = blockReason(ctx, state, state.cfg, { force });
     if (blocked) {
       state.stats.skipped += 1;
@@ -1316,6 +1575,10 @@ export default function (pi: ExtensionAPI) {
       cfgFrom: cfgFrom(),
       // The four numbers a drain read is judged against, on the line that was produced under them.
       cfg: cfgStamp(state.cfg),
+      // Which boxes had headroom when this attempt was issued. Recorded because what the fleet has since been
+      // blamed on is placement and queueing, and neither is judgeable afterwards without a snapshot taken at the
+      // moment of the decision.
+      ...(boxes && boxes.length ? { boxes: boxesStamp(boxes) } : {}),
       // Recorded when it is true, because it is the fact that explains a compaction that ran inside the cooldown:
       // the cooldown was bypassed on purpose, not missed.
       ...(usage?.tokens !== undefined && usage.tokens !== null && usage.contextWindow !== undefined && usage.tokens >= usage.contextWindow ? { overWindow: true } : {}),
@@ -1475,13 +1738,19 @@ export default function (pi: ExtensionAPI) {
       cfgFrom: cfgFrom(),
       gateDir: state.gateDir ?? "none",
       cfg: cfgStamp(state.cfg),
+      // Whether this pod can even ask, said once at the moment it starts rather than discovered when an attempt
+      // silently skips the read. A pod whose model carries no rooter base url runs blind, and that is worth knowing
+      // before somebody reads its aborts.
+      ...(boxRootUrl(ctx.model)
+        ? { boxRoot: boxRootUrl(ctx.model) }
+        : { boxRoot: `inactive (${state.cfg.boxCheckMs <= 0 ? "switched off" : "model carries no rooter base url"})` }),
       ...(envOverrides().length ? { cfgEnv: envOverrides() } : {}),
       ...(state.cfg.problems.length ? { problems: state.cfg.problems } : {}),
     });
     arm(ctx, `session_start:${event.reason}`, state.cfg.quietMs);
     debug(
       ctx,
-      `start: enabled=${state.cfg.enabled && !state.forcedOff} quiet=${state.cfg.quietMs}ms urgent=${state.cfg.urgentQuietMs}ms@${state.cfg.urgentPercent}% soft=${state.cfg.softPercent}% deadline=${state.cfg.deadlineMs}ms rate=${state.cfg.rateTokensPerSecond}tok/s maxDeadline=${state.cfg.maxDeadlineMs}ms cooldown=${state.cfg.cooldownMs}ms retry=${state.cfg.retryCooldownMs}ms prune=${state.cfg.prune}` +
+      `start: enabled=${state.cfg.enabled && !state.forcedOff} quiet=${state.cfg.quietMs}ms urgent=${state.cfg.urgentQuietMs}ms@${state.cfg.urgentPercent}% soft=${state.cfg.softPercent}% deadline=${state.cfg.deadlineMs}ms rate=${state.cfg.rateTokensPerSecond}tok/s maxDeadline=${state.cfg.maxDeadlineMs}ms cooldown=${state.cfg.cooldownMs}ms retry=${state.cfg.retryCooldownMs}ms box=${state.cfg.boxCheckMs}ms/${state.cfg.boxRetryMs}ms x${state.cfg.boxMaxDefers} prune=${state.cfg.prune}` +
         (state.cfg.problems.length ? ` problems: ${state.cfg.problems.join(", ")}` : ""),
     );
   });
@@ -1839,6 +2108,9 @@ export default function (pi: ExtensionAPI) {
       const lines = [
         `${MARK}: ${cfg.enabled && !state.forcedOff ? "on" : "off"}${state.forcedOff ? " (--idle-compaction-off)" : ""}`,
         `${contextLine} · floor ${cfg.softPercent}% · quiet ${cfg.quietMs / 1000}s · urgent ${cfg.urgentQuietMs / 1000}s at ${cfg.urgentPercent}% · deadline ${cfg.deadlineMs / 1000}s · cooldown ${Math.round(cfg.cooldownMs / 1000)}s · this session's ceiling ${attemptDeadlineMs(cfg, usage?.tokens ?? 0) / 1000}s at ${cfg.rateTokensPerSecond} tok/s` +
+        (state.lastBoxes && state.lastBoxes.length
+          ? ` · boxes ${boxesStamp(state.lastBoxes).join(" ")}${state.headroomDefers ? ` (deferred ${state.headroomDefers}x for headroom)` : ""}`
+          : "") +
           (state.lastAttemptOutcome && state.lastAttemptOutcome !== "completed" ? ` · last attempt ${state.lastAttemptOutcome}` : ""),
         `armed ${s.armed} · not armed ${s.notArmed} · compacted ${s.fired} · skipped ${s.skipped} · failed ${s.failed} · deadline aborts ${s.abortedAtDeadline} · freed ${s.freedTokens} tokens`,
         `last: ${s.lastNote}${s.lastAt ? ` at ${s.lastAt}` : ""}`,
