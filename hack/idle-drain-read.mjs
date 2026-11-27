@@ -26,7 +26,7 @@ const since = flag("since", "2026-11-27T00:00:00");
 /** Defaults at the roll target f3df978, repeated here so the reader is not editing the extension to judge it. */
 const DEFAULTS = {
   softPercent: 25,
-  minFreeTokens: 20000,
+  minFreeTokens: 30000,
   keptFloorTokens: 24000,
   deadlineMs: 240000,
   spreadMs: 90000,
@@ -169,6 +169,35 @@ console.log(
   `completed ${completions.length} (${idleCompletions.length} idle path, ${completions.length - idleCompletions.length} Pi path)  ` +
     `freed ${totalFreed} tokens  gate held ${Math.round(totalHeldMs / 1000)}s for the idle-path ones`,
 );
+
+header("what each completion cost to re-send");
+// The price of a summarisation is not the summarisation. After one, the whole kept tail re-reads at 0.1x and the
+// prefix is re-created at 1.25x, so a completion costs 0.84 x max(tokensBefore, tokensAfter) in uncached prompt
+// tokens (measured by pi-bot on this fleet: 90666 prompt tokens with 55810 cached = 34856 written against a 20513
+// token gain). Worth doing when the tokens it frees are worth more than the prefix it re-sends; worth doing twice a
+// day when they are not. The break-even is in re-sends of this session's own prompt, which is what the bar compares.
+const priceOf = (r) => 0.84 * Math.max(r.tokensBefore ?? 0, r.tokensAfter ?? 0);
+let pricedFreed = 0;
+let pricedCost = 0;
+for (const r of completions.filter((r) => !String(r.trigger ?? "").startsWith("pi:")).sort((a, b) => a.at.localeCompare(b.at))) {
+  const price = Math.round(priceOf(r));
+  const freed = r.freed ?? 0;
+  pricedFreed += freed;
+  pricedCost += price;
+  const verdict = freed >= DEFAULTS.minFreeTokens ? (freed >= price ? "pays for itself" : `net negative: needs ${Math.ceil(price / Math.max(freed, 1))} calls to break even`) : "below the bar: should not have been attempted";
+  console.log(
+    `${r.at} ${r.pod.padEnd(26)} freed ${String(freed).padStart(6)} against a ${String(price).padStart(6)} token re-send` +
+      ` (return ${(freed / Math.max(price, 1)).toFixed(2)})  ${verdict}`,
+  );
+}
+console.log(
+  `idle-path completions in window: freed ${pricedFreed} tokens against ${pricedCost} tokens re-sent` +
+    ` (fleet return ${(pricedFreed / Math.max(pricedCost, 1)).toFixed(2)})`,
+);
+// A prompt rewrite - which is what a plan mutation costs - is the other thing that re-sends a prefix, and it is the
+// cheaper of the two: 1794 uncached tokens measured. A compaction has to beat that to be worth preferring.
+const rewritePrice = 1794;
+console.log(`for scale: a system prompt rewrite costs ${rewritePrice} uncached tokens, so a completion that frees less than that is worth less than leaving the plan section alone`);
 
 header("attempts that paid for nothing");
 // One aborted attempt is two records: the `deadline` line and a `skip error:"Compaction cancelled"` a second or two

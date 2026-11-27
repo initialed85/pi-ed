@@ -46,6 +46,8 @@ beforeEach(() => {
 });
 afterEach(() => {
   vi.useRealTimers();
+  // The keys a test may set to drive a ceiling: they belong to that test, not to the ones that follow it.
+  for (const key of ["IDLE_COMPACTION_RATE_TOKENS_PER_SECOND", "IDLE_COMPACTION_MAX_DEADLINE_MS", "IDLE_COMPACTION_RETRY_COOLDOWN_MS"]) delete process.env[key];
   for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
   dirs = [];
 });
@@ -73,6 +75,9 @@ async function setup(
     start?: boolean;
   } = {},
 ): Promise<Harness> {
+  // The ceiling scales from the token count, so a test that asserts *when* an abort lands pins a rate where the
+  // configured `deadlineMs` floor governs. The scaling itself has its own test below.
+  if (process.env.IDLE_COMPACTION_RATE_TOKENS_PER_SECOND === undefined) process.env.IDLE_COMPACTION_RATE_TOKENS_PER_SECOND = "100000";
   const cwd = options.cwd ?? mkdtempSync(path.join(tmpdir(), "pi-ed-idle-compact-"));
   if (options.cwd === undefined) dirs.push(cwd);
   const pi = createFakePi();
@@ -172,16 +177,19 @@ describe("idle compaction", () => {
   });
 
   it("states the eligibility bar that actually bites at this fleet's window", async () => {
-    // `softPercent` 25 of 131072 is 32768 tokens, but the margin bars refuse anything under 44000 (keptFloorTokens
-    // 24000 plus minFreeTokens 20000), so 44000 is the bar in practice - and it is built from measured constants.
-    // The band just above it is worth compacting: a 44285-token session freed 14156 tokens in 59 s on 2026-11-26.
-    const justUnder = await setup({ contextUsage: { percent: 32.8, tokens: 43000, contextWindow: 131072 } });
+    // The bar is `keptFloorTokens` 24000 + `minFreeTokens` 30000 = 54000 tokens, and 30000 is a measured number, not
+    // a preference: a completed idle summarisation re-sends the prefix uncached and re-reads the kept tail, so one
+    // completion costs about 28000-35000 cache-write tokens (pi-bot's 2026-11-27 measurement: 20513 freed against
+    // 34286 re-sent) and an aborted one costs 15-33k for nothing. Measured across 15 sessions that cleared the old
+    // 20000 minimum, only 8 would have paid for themselves; camry freed 3388 against a 31843 re-send - ten hours of
+    // re-sending a prompt to save a third of one prompt.
+    const justUnder = await setup({ contextUsage: { percent: 40.4, tokens: 53000, contextWindow: 131072 } });
     await settle(justUnder);
     vi.advanceTimersByTime(QUIET_MS * 10);
     expect(justUnder.compacts).toHaveLength(0);
-    expect(await status(justUnder)).toContain("would free about 19000 tokens, under the 20000 minimum");
+    expect(await status(justUnder)).toContain("would free about 29000 tokens, under the 30000 minimum");
 
-    const justOver = await setup({ contextUsage: { percent: 34.4, tokens: 45000, contextWindow: 131072 } });
+    const justOver = await setup({ contextUsage: { percent: 42, tokens: 55000, contextWindow: 131072 } });
     await settle(justOver);
     vi.advanceTimersByTime(QUIET_MS);
     expect(justOver.compacts).toHaveLength(1);
@@ -192,6 +200,61 @@ describe("idle compaction", () => {
     vi.advanceTimersByTime(QUIET_MS * 10);
     expect(small.compacts).toHaveLength(0);
     expect(await status(small)).toContain("is under the 25% floor");
+  });
+
+  it("scales an attempt's ceiling from the context it is summarising, because a flat one is a guess", async () => {
+    // The measured band: 400-816 tok/s on an idle path, 255-540 tok/s once Pi's own path runs beside it. The scaling
+    // uses the poor end (300 tok/s) so a big session gets room to finish - macgrubernetes at 90599 tokens and
+    // home-ops at 82704 each ran the full 480 s on 2026-11-27 and freed 1231 and 1920 tokens between them - while a
+    // small session keeps the floor it has always had, and nothing runs past `maxDeadlineMs`.
+    process.env.IDLE_COMPACTION_RATE_TOKENS_PER_SECOND = "300";
+    const big = await setup({ contextUsage: { percent: 87, tokens: 90000, contextWindow: 103418 } });
+    await settle(big);
+    vi.advanceTimersByTime(URGENT_QUIET_MS);
+    expect(big.compacts).toHaveLength(1);
+    // ceil(90000 / 300 * 1000) = 300000, above the 240000 floor this session would previously have been killed at.
+    vi.advanceTimersByTime(240000);
+    expect(big.calls.some((call) => call.name === "abort")).toBe(false);
+    vi.advanceTimersByTime(60000);
+    expect(big.calls.some((call) => call.name === "abort")).toBe(true);
+    const aborted = logOf(big).find((entry) => entry.kind === "deadline");
+    expect(aborted?.deadlineMs).toBe(300000);
+
+    // The floor still governs a small context: scaling never shortens a ceiling, and never exceeds the cap.
+    process.env.IDLE_COMPACTION_MAX_DEADLINE_MS = "900000";
+    const huge = await setup({ contextUsage: { percent: 95, tokens: 131072, contextWindow: 131072 } });
+    await settle(huge);
+    vi.advanceTimersByTime(URGENT_QUIET_MS);
+    expect(logOf(huge).find((entry) => entry.kind === "compact")?.deadlineMs).toBe(436907);
+  });
+
+  it("holds off a session whose last attempt burned its ceiling without finishing", async () => {
+    // The expensive failure mode of this feature is an attempt that holds the fleet gate, re-sends the prefix and
+    // frees nothing - which is what two of the 2026-11-27 aborts did, on 90599 and 82704 token contexts. A session
+    // that just did that does not get to try again inside its success cooldown; it waits longer.
+    process.env.IDLE_COMPACTION_RATE_TOKENS_PER_SECOND = "300";
+    process.env.IDLE_COMPACTION_RETRY_COOLDOWN_MS = "1800000";
+    const h = await setup({ contextUsage: { percent: 87, tokens: 90000, contextWindow: 103418 } });
+    await settle(h);
+    vi.advanceTimersByTime(URGENT_QUIET_MS);
+    expect(h.compacts).toHaveLength(1);
+    vi.advanceTimersByTime(300000); // the scaled ceiling for 90000 tokens at 300 tok/s, no completion reported
+    expect(h.calls.some((call) => call.name === "abort")).toBe(true);
+    h.compacts[0]!.options.onError(new Error("Compaction cancelled"));
+
+    // A fresh settle inside the retry window is refused, and says which of the two it is facing. The usage has not
+    // moved, so this is the same candidate the session was already eligible for.
+    await settle(h);
+    vi.advanceTimersByTime(URGENT_QUIET_MS);
+    expect(h.compacts).toHaveLength(1);
+    expect(await status(h)).toContain("last attempt did not finish at its deadline");
+    expect(await status(h)).toContain("cooldown after an attempt that did not finish at its deadline");
+
+    // And past the retry window it may try again, because the point is to stop a loop, not to stop compacting.
+    vi.advanceTimersByTime(1800000);
+    await settle(h);
+    vi.advanceTimersByTime(URGENT_QUIET_MS);
+    expect(h.compacts).toHaveLength(2);
   });
 
   it("shortens the window to twenty seconds when the next prompt is going to pay for it anyway", async () => {
@@ -446,8 +509,9 @@ describe("idle compaction", () => {
     // the direction where a legitimate candidate is skipped and never learns it was skipped.
     process.env.IDLE_COMPACTION_SOFT_PERCENT = "40";
     try {
-      // 34.33% of the declared window, and 45000 - 24000 = 21000 free: the margin bars clear, so the floor does not.
-      const h = await setup({ contextUsage: { percent: 34.33, tokens: 45000, contextWindow: 131072 } });
+      // 34.33% of a declared 175000 window, and 60000 - 24000 = 36000 free: the margin bars clear, so the floor
+      // does not refuse it. The declared window is the wrong one on purpose - that is the pi-team-room shape.
+      const h = await setup({ contextUsage: { percent: 34.33, tokens: 60000, contextWindow: 175000 } });
       await settle(h);
       vi.advanceTimersByTime(QUIET_MS);
       expect(h.compacts).toHaveLength(1);

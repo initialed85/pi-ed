@@ -203,7 +203,10 @@ interface Config {
   minFreeTokens: number;
   keptFloorTokens: number;
   deadlineMs: number;
+  rateTokensPerSecond: number;
+  maxDeadlineMs: number;
   cooldownMs: number;
+  retryCooldownMs: number;
   spreadMs: number;
   gateMaxWaitMs: number;
   prune: PruneMode;
@@ -219,10 +222,13 @@ const DEFAULT_CONFIG: Config = {
   urgentQuietMs: 20000,
   urgentPercent: 80,
   softPercent: 25,
-  minFreeTokens: 20000,
+  minFreeTokens: 30000,
   keptFloorTokens: 24000,
   deadlineMs: 240000,
+  rateTokensPerSecond: 300,
+  maxDeadlineMs: 900000,
   cooldownMs: 600000,
+  retryCooldownMs: 1800000,
   spreadMs: 90000,
   gateMaxWaitMs: 5400000,
   prune: "report",
@@ -241,7 +247,10 @@ type NumericKey =
   | "minFreeTokens"
   | "keptFloorTokens"
   | "deadlineMs"
+  | "rateTokensPerSecond"
+  | "maxDeadlineMs"
   | "cooldownMs"
+  | "retryCooldownMs"
   | "spreadMs"
   | "gateMaxWaitMs"
   | "pruneKeepRecentResults"
@@ -256,7 +265,10 @@ const NUMERIC_LIMITS: Record<NumericKey, [number, number]> = {
   minFreeTokens: [0, 500000],
   keptFloorTokens: [0, 200000],
   deadlineMs: [5000, 900000],
+  rateTokensPerSecond: [50, 5000],
+  maxDeadlineMs: [5000, 3600000],
   cooldownMs: [0, 86400000],
+  retryCooldownMs: [0, 86400000],
   spreadMs: [1000, 3600000],
   gateMaxWaitMs: [1000, 21600000],
   pruneKeepRecentResults: [0, 200],
@@ -272,7 +284,10 @@ const ENV_NUMBERS: Array<[string, NumericKey]> = [
   ["IDLE_COMPACTION_MIN_FREE_TOKENS", "minFreeTokens"],
   ["IDLE_COMPACTION_KEPT_FLOOR_TOKENS", "keptFloorTokens"],
   ["IDLE_COMPACTION_DEADLINE_MS", "deadlineMs"],
+  ["IDLE_COMPACTION_RATE_TOKENS_PER_SECOND", "rateTokensPerSecond"],
+  ["IDLE_COMPACTION_MAX_DEADLINE_MS", "maxDeadlineMs"],
   ["IDLE_COMPACTION_COOLDOWN_MS", "cooldownMs"],
+  ["IDLE_COMPACTION_RETRY_COOLDOWN_MS", "retryCooldownMs"],
   ["IDLE_COMPACTION_SPREAD_MS", "spreadMs"],
   ["IDLE_COMPACTION_GATE_MAX_WAIT_MS", "gateMaxWaitMs"],
   ["IDLE_COMPACTION_PRUNE_KEEP_RECENT", "pruneKeepRecentResults"],
@@ -460,9 +475,12 @@ function cfgStamp(cfg: RuntimeConfig): Record<string, number> {
     minFreeTokens: cfg.minFreeTokens,
     keptFloorTokens: cfg.keptFloorTokens,
     deadlineMs: cfg.deadlineMs,
+    rateTokensPerSecond: cfg.rateTokensPerSecond,
+    maxDeadlineMs: cfg.maxDeadlineMs,
+    cooldownMs: cfg.cooldownMs,
+    retryCooldownMs: cfg.retryCooldownMs,
     spreadMs: cfg.spreadMs,
     gateMaxWaitMs: cfg.gateMaxWaitMs,
-    cooldownMs: cfg.cooldownMs,
     quietMs: cfg.quietMs,
     urgentQuietMs: cfg.urgentQuietMs,
     urgentPercent: cfg.urgentPercent,
@@ -908,6 +926,13 @@ interface State {
    *  person editing that file mid-session is entitled to know that their edit is not live yet. */
   configStamp: { path: string; readAt: string | undefined; mtimeMs: number | undefined };
   lastCompactionAt: number | undefined;
+  /** When an attempt started and how it ended: `completed`, `did not finish at its deadline`, `stopped part way`,
+   *  `failed`, `could not start`. An attempt that burned its ceiling without finishing is the most expensive thing
+   *  this extension does to the fleet - it held the gate, queued every neighbour behind it and freed nothing - so it
+   *  is held off longer than one that finished. On 2026-11-27 macgrubernetes (90599 tokens) and home-ops (82704) each
+   *  re-armed in the same window and burned 480 s between them for 3151 tokens freed. */
+  lastAttemptAt: number | undefined;
+  lastAttemptOutcome: string | undefined;
   entriesAtCompaction: number | undefined;
   stats: Stats;
   tally: Tally;
@@ -937,6 +962,23 @@ function freshTally(): Tally {
 }
 
 /* ------------------------------------------------------------------ eligibility */
+
+/**
+ * How long one attempt may run, scaled from its own size.
+ *
+ * A flat ceiling is a guess about a job whose duration is proportional to its input. Measured on this fleet: idle-
+ * path completions ran 400-816 tok/s through the 02:17-02:24Z startup regime and 255-540 tok/s once Pi's own path
+ * was summarising beside them, so the 240000 ms default serves a 50000-token session comfortably and falls far short
+ * of a 90000-token one - which is how two 480 s windows went past for 3151 tokens freed. Scaling from the token
+ * count at a rate taken from the poor end of the measured band is what lets a big session finish; `maxDeadlineMs`
+ * is what stops a big session from holding the gate indefinitely.
+ */
+function attemptDeadlineMs(cfg: RuntimeConfig, tokens: number): number {
+  if (!Number.isFinite(tokens) || tokens <= 0) return cfg.deadlineMs;
+  const scaled = Math.ceil((tokens / cfg.rateTokensPerSecond) * 1000);
+  return Math.min(Math.max(cfg.deadlineMs, scaled), cfg.maxDeadlineMs);
+}
+
 
 function usageOf(ctx: ExtensionContext): ContextUsage | undefined {
   try {
@@ -987,6 +1029,17 @@ function blockReason(ctx: ExtensionContext, state: State, cfg: RuntimeConfig, op
   // refills a window faster than a 10 minute cooldown protects it - and the answer Ed got was a provider 400:
   // "This endpoint's maximum context length is 131072 tokens. However, you requested about 135838 tokens."
   const overWindow = usage.tokens >= usage.contextWindow;
+  // An attempt that burned its ceiling without finishing is the most expensive thing this extension can do to the
+  // fleet: it held the gate, queued everyone else behind it, and freed nothing. The success cooldown alone did not
+  // cover it - on 2026-11-27 macgrubernetes (90599 tokens) and home-ops (82704) each re-armed in the same window and
+  // burned 480 s for 3151 tokens between them - so a failed attempt is held off longer than a finished one.
+  // Unlike the success cooldown, this one is not bypassed when the session is already over its window: an attempt
+  // that just burned its ceiling is exactly the attempt that must not be re-bought immediately, and Pi's own auto-
+  // compaction at 87.5% is what serves an out-of-room session in the meantime.
+  if (state.lastAttemptAt !== undefined && state.lastAttemptOutcome && state.lastAttemptOutcome !== "completed") {
+    const since = Date.now() - state.lastAttemptAt;
+    if (since < cfg.retryCooldownMs) return `cooldown after an attempt that ${state.lastAttemptOutcome}: ${Math.ceil((cfg.retryCooldownMs - since) / 1000)}s left`;
+  }
   if (state.lastCompactionAt !== undefined && !overWindow) {
     const since = Date.now() - state.lastCompactionAt;
     if (since < cfg.cooldownMs) return `cooldown: ${Math.ceil((cfg.cooldownMs - since) / 1000)}s left`;
@@ -1027,6 +1080,8 @@ export default function (pi: ExtensionAPI) {
     deadlineFiredAt: undefined,
     compactionHookAt: undefined,
     lastCompactionAt: undefined,
+    lastAttemptAt: undefined,
+    lastAttemptOutcome: undefined,
     entriesAtCompaction: undefined,
     stats: freshStats(),
     tally: freshTally(),
@@ -1150,6 +1205,10 @@ export default function (pi: ExtensionAPI) {
 
     const usage = usageOf(ctx);
     const tokensBefore = usage?.tokens ?? 0;
+    // This attempt's own ceiling, scaled from its token count. Decided once, here, so the lease expiry, the watchdog
+    // and the log line all name the same number: a lease that outlives its attempt is how a queue makes a neighbour
+    // wait for something that already stopped.
+    const attemptMs = attemptDeadlineMs(state.cfg, tokensBefore);
 
     // The gate is claimed here, at the moment of the decision, not when the quiet window opened: ten sessions
     // that armed in the same second must still end up summarising one at a time.
@@ -1158,7 +1217,7 @@ export default function (pi: ExtensionAPI) {
         state.gateDir,
         sessionIdOf(ctx),
         basename(ctx.cwd),
-        state.cfg.deadlineMs,
+        attemptMs,
         state.cfg.spreadMs,
         Date.now(),
       );
@@ -1223,6 +1282,8 @@ export default function (pi: ExtensionAPI) {
     const startedAt = Date.now();
     state.compacting = true;
     state.startedAt = startedAt;
+    state.lastAttemptAt = startedAt;
+    state.lastAttemptOutcome = "in flight";
 
     clearDeadline();
     state.deadline = setTimeout(() => {
@@ -1230,16 +1291,17 @@ export default function (pi: ExtensionAPI) {
       if (!state.compacting) return;
       state.stats.abortedAtDeadline += 1;
       state.deadlineFiredAt = Date.now();
-      state.stats.lastNote = `aborted at the ${state.cfg.deadlineMs}ms deadline`;
+      state.lastAttemptOutcome = "did not finish at its deadline";
+      state.stats.lastNote = `aborted at the ${attemptMs}ms deadline`;
       state.stats.lastAt = new Date().toISOString();
-      record(ctx, "deadline", { trigger, quietMs, deadlineMs: state.cfg.deadlineMs, elapsedMs: Date.now() - startedAt });
+      record(ctx, "deadline", { trigger, quietMs, deadlineMs: attemptMs, tokens: tokensBefore, elapsedMs: Date.now() - startedAt });
       try {
         // Pi's abort() cancels an in-flight compaction. The session keeps everything it had.
         ctx.abort();
       } catch (error) {
         debug(ctx, `abort failed: ${error instanceof Error ? error.message : String(error)}`);
       }
-    }, state.cfg.deadlineMs);
+    }, attemptMs);
     state.deadline.unref?.();
 
     record(ctx, "compact", {
@@ -1247,7 +1309,8 @@ export default function (pi: ExtensionAPI) {
       quietMs,
       // The ceiling this attempt actually ran under. Without it, a session that aborts at a deadline cannot tell
       // anybody which ceiling it hit - which is how one pod's five-hour experiment came back void.
-      deadlineMs: state.cfg.deadlineMs,
+      deadlineMs: attemptMs,
+      deadlineCeilingMs: state.cfg.maxDeadlineMs,
       tokens: tokensBefore,
       percent: usage?.percent,
       cfgFrom: cfgFrom(),
@@ -1274,6 +1337,7 @@ export default function (pi: ExtensionAPI) {
           state.stats.lastNote = `compacted ${tokensBefore} to ${after ?? "?"} tokens (freed ${freed}) in ${Math.round(ms / 1000)}s`;
           state.stats.lastAt = new Date().toISOString();
           state.lastCompactionAt = Date.now();
+          state.lastAttemptOutcome = "completed";
           state.entriesAtCompaction = ctx.sessionManager.getBranch().length;
           ctx.ui.notify(`${MARK}: freed about ${freed} tokens in ${Math.round(ms / 1000)}s while idle; context now about ${after ?? "?"} tokens`, "info");
           record(ctx, "compacted", {
@@ -1295,6 +1359,7 @@ export default function (pi: ExtensionAPI) {
           // that was simply too short.
           const diedAtOurCeiling = state.deadlineFiredAt !== undefined;
           state.deadlineFiredAt = undefined;
+          state.lastAttemptOutcome = diedAtOurCeiling ? "did not finish at its deadline" : "stopped part way";
           handBackGate(`error after ${ms}ms`, diedAtOurCeiling ? "aborted at deadline" : "error");
           // "Already compacted" and "Nothing to compact (session too small)" are Pi saying the work was
           // already done or there is none: a skip, not a fault worth a warning.
@@ -1311,6 +1376,7 @@ export default function (pi: ExtensionAPI) {
       state.compacting = false;
       clearDeadline();
       handBackGate("could not start", "could not start");
+      state.lastAttemptOutcome = "could not start";
       state.stats.failed += 1;
       state.stats.lastNote = `could not start: ${error instanceof Error ? error.message : String(error)}`;
       debug(ctx, state.stats.lastNote);
@@ -1415,7 +1481,7 @@ export default function (pi: ExtensionAPI) {
     arm(ctx, `session_start:${event.reason}`, state.cfg.quietMs);
     debug(
       ctx,
-      `start: enabled=${state.cfg.enabled && !state.forcedOff} quiet=${state.cfg.quietMs}ms urgent=${state.cfg.urgentQuietMs}ms@${state.cfg.urgentPercent}% soft=${state.cfg.softPercent}% deadline=${state.cfg.deadlineMs}ms cooldown=${state.cfg.cooldownMs}ms prune=${state.cfg.prune}` +
+      `start: enabled=${state.cfg.enabled && !state.forcedOff} quiet=${state.cfg.quietMs}ms urgent=${state.cfg.urgentQuietMs}ms@${state.cfg.urgentPercent}% soft=${state.cfg.softPercent}% deadline=${state.cfg.deadlineMs}ms rate=${state.cfg.rateTokensPerSecond}tok/s maxDeadline=${state.cfg.maxDeadlineMs}ms cooldown=${state.cfg.cooldownMs}ms retry=${state.cfg.retryCooldownMs}ms prune=${state.cfg.prune}` +
         (state.cfg.problems.length ? ` problems: ${state.cfg.problems.join(", ")}` : ""),
     );
   });
@@ -1772,7 +1838,8 @@ export default function (pi: ExtensionAPI) {
           : "plan pinned in the summary: on, but nothing to pin - this session has no plan file";
       const lines = [
         `${MARK}: ${cfg.enabled && !state.forcedOff ? "on" : "off"}${state.forcedOff ? " (--idle-compaction-off)" : ""}`,
-        `${contextLine} · floor ${cfg.softPercent}% · quiet ${cfg.quietMs / 1000}s · urgent ${cfg.urgentQuietMs / 1000}s at ${cfg.urgentPercent}% · deadline ${cfg.deadlineMs / 1000}s · cooldown ${Math.round(cfg.cooldownMs / 1000)}s`,
+        `${contextLine} · floor ${cfg.softPercent}% · quiet ${cfg.quietMs / 1000}s · urgent ${cfg.urgentQuietMs / 1000}s at ${cfg.urgentPercent}% · deadline ${cfg.deadlineMs / 1000}s · cooldown ${Math.round(cfg.cooldownMs / 1000)}s · this session's ceiling ${attemptDeadlineMs(cfg, usage?.tokens ?? 0) / 1000}s at ${cfg.rateTokensPerSecond} tok/s` +
+          (state.lastAttemptOutcome && state.lastAttemptOutcome !== "completed" ? ` · last attempt ${state.lastAttemptOutcome}` : ""),
         `armed ${s.armed} · not armed ${s.notArmed} · compacted ${s.fired} · skipped ${s.skipped} · failed ${s.failed} · deadline aborts ${s.abortedAtDeadline} · freed ${s.freedTokens} tokens`,
         `last: ${s.lastNote}${s.lastAt ? ` at ${s.lastAt}` : ""}`,
         `stale tool output (${cfg.prune}): ${state.lastPruneReport.candidates} candidates, about ${state.lastPruneReport.tokens} tokens reclaimable in the context Pi would send now, ${state.tally.applied} replaced this session · newest ${cfg.pruneKeepRecentResults} results kept whole, ${cfg.pruneMinChars} char floor`,

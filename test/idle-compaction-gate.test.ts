@@ -48,11 +48,13 @@ beforeEach(() => {
   gateDir = mkdtempSync(path.join(tmpdir(), "pi-ed-gate-"));
   dirs.push(gateDir);
   process.env.IDLE_COMPACTION_GATE_DIR = gateDir;
+  process.env.IDLE_COMPACTION_RATE_TOKENS_PER_SECOND = "100000";
 });
 
 afterEach(() => {
   vi.useRealTimers();
   delete process.env.IDLE_COMPACTION_GATE_DIR;
+  delete process.env.IDLE_COMPACTION_RATE_TOKENS_PER_SECOND;
   for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
   dirs = [];
 });
@@ -71,6 +73,9 @@ interface Session {
  * A pod in the fleet layout: a named directory under a shared parent, with its own session id.
  */
 async function pod(name: string, options: { sessionId?: string; idle?: boolean } = {}): Promise<Session> {
+  // The ceiling scales from the token count, and these tests are about who holds the lease and when it expires.
+  // Pin a rate where the configured `deadlineMs` floor governs; the scaling itself is tested in the other file.
+  if (process.env.IDLE_COMPACTION_RATE_TOKENS_PER_SECOND === undefined) process.env.IDLE_COMPACTION_RATE_TOKENS_PER_SECOND = "100000";
   const parent = mkdtempSync(path.join(tmpdir(), "pi-ed-fleet-"));
   dirs.push(parent);
   const cwd = path.join(parent, name);
