@@ -2,12 +2,17 @@
 /**
  * Would a cache warm have paid for itself, on this fleet, in the last few hours?
  *
- * Pi's warmer is written for a world where input tokens cost dollars. On this fleet they cost GPU seconds,
- * and Pi refuses to warm anything here before it even reaches its own arithmetic: `cache-warmer.js` prices a
- * refresh from `model.cost`, the catalogue entries for rooter, strata and sushi carry no `cost` block at all,
- * and a model with no pricing gets `{action: "stop", reason: "no catalogue pricing"}`. So the question "should
- * we warm?" has never been answered here, in either direction. This answers it in GPU units, from rooter's own
- * per-call rows, using the *same* gate `extensions/cache-warm-policy.ts` applies in a session. It is read-only.
+ * Pi's warmer is written for a world where input tokens cost dollars. On this fleet they cost GPU seconds, and
+ * Pi never gets as far as noticing: `cache-warmer.js` starts a run by asking `getPromptCacheTtlMs(model, options)`
+ * for the lifetime of the entry it would refresh, every catalogue entry in /root/.pi/agent/models.json omits
+ * `promptCache`, so the warmer stops with `{action: "stop", reason: "cache lifetime unavailable"}` and no decision
+ * is ever scheduled or emitted. Declaring `promptCache` without `cost` is the other half of the story: the
+ * config loader defaults a missing `cost` to all zeros (verified against the 1.6.1 registry), so
+ * `evaluateCacheWarming` returns `economicsAvailable: false` with `warmCost` and `missCost` both 0 and action
+ * `stop` — it does not throw, and it does ask extensions, which is exactly the hole this policy steps into. So
+ * the question "should we warm?" has never been answered here, in either direction. This answers it in GPU
+ * units, from rooter's own per-call rows, using the *same* gate `extensions/cache-warm-policy.ts` applies in a
+ * session. It is read-only.
  *
  * Why the counter imports the gate rather than restating it (`lib/cache-warm.ts`, which Node 26 runs directly):
  * a fleet tool that paraphrases the policy drifts from it, and the only number worth trusting is the one the
@@ -64,7 +69,11 @@ const json = argv.includes("--json");
 
 const MODELS_JSON = flag("models", process.env.MODELS_JSON || "/root/.pi/agent/models.json");
 const hours = num("hours", 3);
-const reArmSec = num("re-arm", 2000);
+// 1800s is the value hack/models-json-promptcache-draft.md recommends declaring, because Pi times the refresh at
+// short x 0.9 from the request that opened the run and stops a run whose next refresh falls past +30 minutes.
+// 2000s is the arithmetic edge (its refresh is exactly 1800s) and any elapsed time pushes it past, so pricing a
+// cadence at 2000 flatters the change.
+const reArmSec = num("re-arm", 1800);
 const top = num("top", 14);
 const eventLimit = num("limit", 1000);
 
@@ -107,7 +116,13 @@ function ratesFrom(backends) {
   return out;
 }
 
-/** Which catalogue entries can carry a warm decision at all: Pi needs a `cost` block before it prices one. */
+/**
+ * What the catalogue file actually declares, per entry. Two blocks decide whether a warm is even possible, and
+ * they fail differently: `promptCache` is what Pi's warmer needs to schedule a run at all, and a `cost` block that
+ * is *absent from the file* is silently defaulted to zeros by the 1.6.1 config loader, which yields
+ * `economicsAvailable: false` rather than an error. So this reports both, and the reader must not assume the file
+ * is what the runtime saw.
+ */
 function pricedModels(cataloguePath) {
   const catalogue = JSON.parse(readFileSync(cataloguePath, "utf8"));
   const rows = [];
@@ -153,6 +168,9 @@ const cfg = {
   // The gate's window is widened to the counter's window: a 60-minute evidence window inside a 139-minute
   // event buffer would silently drop most of what rooter can still see.
   evidenceWindowMs: newest - sinceMs,
+  // The idle bar is "longer than the interval a refresh would have to cover", so it is derived from the cadence
+  // being priced rather than left at the library default: pass --re-arm and the bar moves with it.
+  maxIdleMs: Math.round(reArmSec * 0.9 * 1000),
 };
 
 const byKey = new Map();
@@ -241,13 +259,13 @@ const warmRestore = sessions.reduce((sum, session) => sum + (session.warmRestore
 const warmCold = sessions.reduce((sum, session) => sum + (session.warmColdSec ?? 0), 0);
 const savedTokens = warmable.reduce((sum, session) => sum + session.medianComputed, 0);
 const catalogueRows = pricedModels(MODELS_JSON);
-const unpriced = catalogueRows.filter((row) => !row.cost);
+const undeclaredLifetime = catalogueRows.filter((row) => !row.promptCache);
 
 if (json) {
-  console.log(JSON.stringify({ windowMs: newest - sinceMs, sessions, totals: { sessions: sessions.length, piSessions: piSessions.length, warmable: warmable.length, warmablePiSessions: warmable.filter((session) => session.piSession).length, fleetColdCalls, fleetColdTokens, fleetColdSeconds, totalFires, warmRestoreSec: warmRestore, warmColdSec: warmCold, savedTokens }, rates, unpriced }, null, 2));
+  console.log(JSON.stringify({ windowMs: newest - sinceMs, sessions, totals: { sessions: sessions.length, piSessions: piSessions.length, warmable: warmable.length, warmablePiSessions: warmable.filter((session) => session.piSession).length, fleetColdCalls, fleetColdTokens, fleetColdSeconds, totalFires, warmRestoreSec: warmRestore, warmColdSec: warmCold, savedTokens }, rates, undeclaredLifetime }, null, 2));
 } else {
   console.log(`rooter ${door.root} boot ${eventsBody.boot_id} (rooter uptime ${stats.uptime}, dropped_total ${eventsBody.dropped_total})`);
-  console.log(`window ${(newest - sinceMs) / 60000}m to ${new Date(newest).toISOString().slice(0, 19)}  gate: floor ${cfg.minRecomputeTokens} tokens, arrivals ${cfg.minArrivalsPerHour}/h, veto >= ${cfg.vetoCacheHitRate} cache read, ${cfg.evidenceCalls} calls`);
+  console.log(`window ${(newest - sinceMs) / 60000}m to ${new Date(newest).toISOString().slice(0, 19)}  gate: floor ${cfg.minRecomputeTokens} tokens, arrivals ${cfg.minArrivalsPerHour}/h, saved >= ${cfg.minSavedSeconds}s, veto >= ${cfg.vetoCacheHitRate} cache read, idle bar ${Math.round(cfg.maxIdleMs / 60000)}m, ${cfg.evidenceCalls} calls`);
   console.log(`re-arm cadence priced: every ${reArmSec}s`);
   for (const [name, rate] of Object.entries(rates)) {
     console.log(`  ${name}: cold prefill ${rate.coldTokS} tok/s over ${rate.coldSamples} samples, restore ${Math.round(rate.restoreTokS)} tok/s over ${rate.restoreSamples} samples, ${rate.requests} proxied calls`);
@@ -278,7 +296,8 @@ if (json) {
   console.log("Pi's own gate, for reference (cache-warmer.js):");
   console.log(`  a warm is priced as price(model, {cacheRead: promptTokens, output: 1}) and the miss as the difference between a full re-prefill and a cached read,`);
   console.log(`  so an idle refresh arms only when 0.15 x (miss - hit) - warm >= $0.05, i.e. roughly input price >= $${(0.4 / Math.max(0.001, med(sessions.map((session) => session.medianPrompt)) / 1e6)).toFixed(2)}/M input tokens at this fleet's median prompt of ${med(sessions.map((session) => session.medianPrompt))} tokens with cache reads at 10% of input price.`);
-  console.log(`  catalogue entries with no \`cost\` block (Pi stops with "no catalogue pricing" before any of that arithmetic): ${unpriced.length} of ${catalogueRows.length}`);
+  console.log(`  catalogue entries declaring no \`promptCache\` (Pi's warmer stops at start() with "cache lifetime unavailable", so no decision is ever scheduled): ${undeclaredLifetime.length} of ${catalogueRows.length}`);
+  console.log(`  a missing \`cost\` in this file is not what Pi sees at runtime: the config loader defaults it to zeros, giving economicsAvailable=false and action "stop" with warmCost and missCost both 0.`);
   for (const row of catalogueRows.filter((entry) => /rooter|strata|sushi/.test(entry.provider)).slice(0, 8)) {
     console.log(`    ${row.provider}/${row.model}: cost ${row.cost ?? "none"}, promptCache ${row.promptCache ?? "none"}`);
   }

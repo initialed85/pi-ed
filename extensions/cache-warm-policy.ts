@@ -20,11 +20,14 @@
  *
  * Two ceilings Pi imposes, recorded here because they decide what the catalogue may say:
  *
- *   - A refresh is scheduled at `min(ttl × 0.9, ttl − 10s)`, and Pi stops a run whose next refresh falls
- *     past its horizons: 30 minutes after the agent settles, 60 while it streams. Rooter measured sushi's
- *     real prefix lifetime at ~5,957 s, which schedules a refresh at ~5,362 s and is stopped immediately.
- *     A declared `promptCache.short` therefore has to be ≤ 2,000 seconds to arm at all, and it must be
- *     read as a re-arm interval, not as a claim about how long a prefix lives.
+ *   - A refresh is scheduled at `min(short × 0.9, short − 10s)`, timed from the request that opened the run, and
+ *     Pi stops a run whose next refresh falls past that request + 30 minutes (60 while it streams). Rooter
+ *     measured sushi's real prefix lifetime at ~5,957 s, which schedules a refresh at ~5,362 s and is stopped
+ *     immediately. 2,000s is the largest `short` whose refresh (1,800s) merely *touches* that horizon, and any
+ *     elapsed time since the request puts it past, so the value that arms at all is below it: **1,800**,
+ *     refreshing every 27 minutes. A declared `promptCache.short` is a re-arm interval, never a claim about how
+ *     long a prefix lives, and `maxIdleMs` in `lib/cache-warm.ts` is set to that same 27-minute interval so the
+ *     two move together.
  *   - Pi's idle `continuationProbability` is the constant 0.15, whose source comment reports that
  *     per-session estimates were not better than it. The rhythm here is logged next to that constant so
  *     the claim "busy sessions are the ones worth warming" is measured rather than assumed.
@@ -71,7 +74,7 @@ function readConfig(ctx: ExtensionContext): RuntimeConfig {
     if (raw) {
       const file = JSON.parse(raw) as Partial<WarmConfig>;
       if (file.mode === "observe" || file.mode === "arm") cfg.mode = file.mode;
-      for (const key of ["minRecomputeTokens", "minArrivalsPerHour", "vetoCacheHitRate", "maxIdleMs", "evidenceCalls", "evidenceWindowMs", "evidenceTimeoutMs"] as const) {
+      for (const key of ["minRecomputeTokens", "minArrivalsPerHour", "minSavedSeconds", "vetoCacheHitRate", "maxIdleMs", "evidenceCalls", "evidenceWindowMs", "evidenceTimeoutMs"] as const) {
         const value = file[key];
         if (typeof value === "number" && Number.isFinite(value) && value > 0) cfg[key] = value;
         else if (value !== undefined) cfg.problems.push(`${key} ignored (not a positive number)`);
@@ -98,6 +101,9 @@ function readConfig(ctx: ExtensionContext): RuntimeConfig {
   });
   envNumber("CACHE_WARM_MIN_ARRIVALS_PER_HOUR", (value) => {
     cfg.minArrivalsPerHour = value;
+  });
+  envNumber("CACHE_WARM_MIN_SAVED_SECONDS", (value) => {
+    cfg.minSavedSeconds = value;
   });
   envNumber("CACHE_WARM_VETO_CACHE_HIT_RATE", (value) => {
     cfg.vetoCacheHitRate = value;
@@ -262,7 +268,7 @@ export default function extension(pi: ExtensionAPI): void {
       const cfg = readConfig(ctx);
       const lines = [`cache warm policy: ${cfg.mode}`];
       lines.push(
-        `arms when nothing has been idle past ${Math.round(cfg.maxIdleMs / 60000)}m, median recompute >= ${cfg.minRecomputeTokens} tokens and arrivals >= ${cfg.minArrivalsPerHour}/h; vetoes a session already reading ${Math.round(cfg.vetoCacheHitRate * 100)}% from cache`,
+        `arms when nothing has been idle past ${Math.round(cfg.maxIdleMs / 60000)}m, median recompute >= ${cfg.minRecomputeTokens} tokens, arrivals >= ${cfg.minArrivalsPerHour}/h and the prefill avoided >= ${cfg.minSavedSeconds}s; vetoes a session already reading ${Math.round(cfg.vetoCacheHitRate * 100)}% from cache`,
       );
       for (const problem of cfg.problems) lines.push(`config: ${problem}`);
       const last = lastDecision;

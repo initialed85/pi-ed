@@ -9,6 +9,13 @@
  *
  * Why the decision has to be ours rather than Pi's, in three measured facts:
  *
+ *   0. On this fleet Pi is not asked at all. It starts a warming run by reading the lifetime of the entry it
+ *      would refresh (`getPromptCacheTtlMs`, from the model's `promptCache` tier), no entry in
+ *      `/root/.pi/agent/models.json` declares `promptCache`, and the warmer stops with
+ *      `{action: "stop", reason: "cache lifetime unavailable"}`. There is no decision event to policy on until a
+ *      lifetime is declared. A missing `cost` block does not error: the 1.6.1 config loader defaults it to zeros,
+ *      so `evaluateCacheWarming` answers `economicsAvailable: false`, `warmCost: 0`, `missCost: 0`, `action: stop`
+ *      — which is a stop Pi reaches *while still asking extensions*, and is the hole this policy stands in.
  *   1. Pi warms only when `continuationProbability × missCost − warmCost ≥ $0.05`, and for an idle
  *      session `continuationProbability` is the constant 0.15. On a 42,000-token prompt that needs a
  *      miss worth about $8.8 per million input tokens. Our tokens are not priced in dollars, they are
@@ -17,8 +24,11 @@
  *      enforces a hard 30-minute horizon once the agent settles (60 while it streams). Rooter measured
  *      sushi's real prefix lifetime at 5,957,400 ms (~99 minutes), which schedules a refresh 89 minutes
  *      out — past both horizons, so warming stops the moment the session goes idle, which is exactly
- *      when a warm would be wanted. The catalogue value therefore has to be a *re-arm interval* under
- *      2,000 seconds, not a statement about how long a prefix lives.
+ *      when a warm would be wanted. The catalogue value therefore has to be a *re-arm interval* Pi can
+ *      actually schedule, not a statement about how long a prefix lives: 2,000s is the largest number whose
+ *      refresh (1,800s) merely touches the idle horizon, and it is measured from the request that started the
+ *      run, so any elapsed time puts it past. `1,800` is the value that schedules a refresh 27 minutes out
+ *      with headroom, and `maxIdleMs` below is set to that interval.
  *   3. Upstream tested the busyness idea already, and their own comment on that constant says
  *      "per-session estimates were not better than this constant". A score only earns its complexity
  *      if it beats a flat 0.15, so the score is measured and logged, and the arm itself rests on
@@ -33,7 +43,9 @@
  *   - nothing has arrived for longer than `maxIdleMs`, because a refresh only protects the entry until the next
  *     call, and a session already silent for longer than the interval a warm runs on has nothing to protect;
  *   - median `prompt_tokens_computed` over the session's recent calls ≥ `minRecomputeTokens`, because that is
- *     the work a refresh would actually have avoided;
+ *     the work a refresh would actually have avoided — and that avoided work must itself clear
+ *     `minSavedSeconds`, because a warm that saves 7 seconds of prefill is not a saving, it is noise. This is the
+ *     gate's own version of Pi's `$0.05` minimum expected savings, in the currency we actually trade in;
  *   - the session keeps arriving (`arrivalsPerHour`), because a warm spent on a session that woke once and then
  *     sleeps for a day is a warm spent on nobody;
  *   - and never when the most recent call already read the prompt from cache (`vetoCacheHitRate`).
@@ -89,6 +101,14 @@ export interface WarmConfig {
   minRecomputeTokens: number;
   /** Turn arrivals per hour a session must show to be worth warming. */
   minArrivalsPerHour: number;
+  /**
+   * The least prefill a refresh must avoid to be worth sending, in seconds. The gate already trades in seconds
+   * rather than dollars, so it needs the equivalent of Pi's `$0.05`: a refresh costs a replay of the session's
+   * whole prompt, and avoiding a 7-second prefill is not a saving, it is noise. This bar is what caught two
+   * single-call sessions arming on 2026-11-27 because rooter had just restarted and the observation window was
+   * 40 minutes short, which made one call read as 2.55 arrivals/hour.
+   */
+  minSavedSeconds: number;
   /** A last call at or above this cache read share veto the warm: there is nothing to save. */
   vetoCacheHitRate: number;
   /**
@@ -98,7 +118,11 @@ export interface WarmConfig {
    *
    * It is read against the interval a warm would run on: a refresh only protects the entry until the next call
    * arrives, so a session already silent for longer than that interval is a session the refresh would have
-   * protected nobody. Pi's own idle horizon is 30 minutes, which is why the default sits just over it.
+   * protected nobody. The default is 27 minutes because that is what a refresh interval actually is on this
+   * fleet: Pi schedules the idle refresh at `min(short x 0.9, short - 10s)` and refuses a run whose next refresh
+   * falls past 30 minutes after the request started, so a catalogue declaring `promptCache.short: 1800` re-arms
+   * every 1,620s and nothing larger can be scheduled at all. A bar wider than the interval would be a bar that
+   * never fires, which is how this knob must not be written.
    */
   maxIdleMs: number;
   /** How many of the session's most recent calls the median is taken over. */
@@ -113,8 +137,9 @@ export const DEFAULT_WARM_CONFIG: WarmConfig = {
   mode: "observe",
   minRecomputeTokens: 10000,
   minArrivalsPerHour: 2,
+  minSavedSeconds: 30,
   vetoCacheHitRate: 0.99,
-  maxIdleMs: 2_000_000,
+  maxIdleMs: 1_620_000,
   evidenceCalls: 8,
   evidenceWindowMs: 60 * 60_000,
   evidenceTimeoutMs: 1500,
@@ -352,6 +377,12 @@ function gateDecision(
     return stop(
       `${base}; ${rhythm.arrivalsPerHour.toFixed(2)} arrivals/h is under the ${cfg.minArrivalsPerHour}/h bar (this session woke and is unlikely to return again inside the re-arm interval)`,
     );
+  }
+  // Last, because it is the summary of everything above: a refresh replays the session's whole prompt, and a
+  // saving this small does not pay for it. An unknown price does not trip the bar, since absence of a rate is not
+  // evidence of a cheap warm - it is evidence of an unpriced box.
+  if (coldSec !== undefined && coldSec < cfg.minSavedSeconds) {
+    return stop(`${base}; a refresh avoids only${costNote}, under the ${cfg.minSavedSeconds}s a replay of ${last.promptTokens} prompt tokens is worth`);
   }
 
   const cold = coldSec === undefined ? "" : ` a refresh avoids${costNote}`;

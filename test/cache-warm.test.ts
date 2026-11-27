@@ -152,8 +152,28 @@ describe("armDecision", () => {
     // 50 minutes without one against a 33-minute interval.
     const decision = armDecision([row({ computedTokens: 40000 })], WAKE_ONCE, cfg({ mode: "arm" }), "stop");
     expect(decision.action).toBe("stop");
-    expect(decision.reason).toContain("nothing has arrived for 50m, longer than the 33m a refresh would have to cover");
+    expect(decision.reason).toContain("nothing has arrived for 50m, longer than the 27m a refresh would have to cover");
     expect(decision.detail.sinceLastMs).toBe(3_000_000);
+  });
+
+  it("refuses a warm whose saving is noise, because a refresh replays the whole prompt", () => {
+    // ~29,000 recomputed tokens on strata is 14 seconds at its measured 2,147 tok/s: real recompute, over the
+    // token floor, on a session that keeps arriving - and not worth a replay of a 42,000-token prompt.
+    const rows = [row({ computedTokens: 30000, backend: "strata" }), row({ computedTokens: 28000, backend: "strata", cacheHitRate: 0.3 })];
+    const decision = armDecision(rows, BUSY, cfg({ mode: "arm" }), "stop");
+    expect(decision.action).toBe("stop");
+    expect(decision.reason).toContain("a refresh avoids only (14s at strata's measured 2147 tok/s), under the 30s a replay of 42000 prompt tokens is worth");
+    expect(decision.detail.coldSecondsAvoided).toBe(14);
+  });
+
+  it("does not let an unpriced box pass as a cheap one", () => {
+    // An unknown backend has no rate, so there is no seconds figure to trip the bar on: the gate cannot claim a
+    // saving it never priced, and it must not veto for a reason it does not have.
+    const rows = [row({ computedTokens: 24000, backend: "unheardof", cacheHitRate: 0.4 })];
+    const decision = armDecision(rows, BUSY, cfg({ mode: "arm" }), "stop");
+    expect(decision.action).toBe("warm");
+    expect(decision.reason).not.toContain("avoids");
+    expect(decision.detail.coldSecondsAvoided).toBeUndefined();
   });
 
   it("refuses a session that is still arriving, but too rarely to be worth a cadence", () => {
@@ -434,7 +454,7 @@ describe("cache-warm-policy extension", () => {
       ok: true,
       body: {
         events: [
-          { ts: ago(6), kind: "gen", key: "h:01a1a9b1-7", backend: "strata", prompt_tokens: 60000, prompt_tokens_computed: 40000, cache_hit_rate: 0.3, status: 200 },
+          { ts: ago(6), kind: "gen", key: "h:01a1a9b1-7", backend: "sushi", prompt_tokens: 60000, prompt_tokens_computed: 40000, cache_hit_rate: 0.3, status: 200 },
         ],
       },
     }));
