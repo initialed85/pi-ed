@@ -252,6 +252,49 @@ console.log(
     (repeatPods.length ? `  pods that re-armed and aborted again: ${repeatPods.map(([p, n]) => `${p} x${n}`).join(", ")}` : ""),
 );
 
+header("how long a completion takes to pay back, per pod");
+// A completion writes a new prompt prefix once (1.25x) and every later call re-reads it (0.1x), so what it frees
+// comes back as 0.1 x freed on each subsequent call. The number of calls that takes is price / (0.1 x freed);
+// whether that is a good trade depends entirely on how often the session is used, which the arm lines report - an
+// arm is written when a turn ends with the session eligible, so arm timestamps are turn endings.
+const armTimes = new Map();
+for (const r of records.filter((x) => x.kind === "compact")) {
+  const t = Date.parse(r.at);
+  if (Number.isFinite(t)) (armTimes.get(r.pod) ?? armTimes.set(r.pod, []).get(r.pod)).push(t);
+}
+const podNames = new Set([...armTimes.keys(), ...completions.map((c) => c.pod)]);
+const rows = [];
+for (const pod of podNames) {
+  const arms = (armTimes.get(pod) ?? []).sort((a, b) => a - b);
+  if (arms.length < 2) continue;
+  const gaps = arms.slice(1).map((t, i) => t - arms[i]).sort((a, b) => a - b);
+  const medianGap = gaps[Math.floor(gaps.length / 2)];
+  const done = completions.filter((c) => c.pod === pod && (c.freed ?? 0) > 0 && !String(c.trigger ?? "").startsWith("pi:"));
+  if (!done.length) {
+    rows.push({ pod, arms: arms.length, medianGap, calls: null, hours: null, freed: 0 });
+    continue;
+  }
+  const freed = done.reduce((n, c) => n + c.freed, 0) / done.length;
+  const price = done.reduce((n, c) => n + 0.84 * Math.max(c.tokensBefore ?? 0, c.tokensAfter ?? 0), 0) / done.length;
+  const calls = price / (0.1 * Math.max(freed, 1));
+  rows.push({ pod, arms: arms.length, medianGap, calls, hours: (calls * medianGap) / 3600_000, freed });
+}
+rows.sort((a, b) => (a.hours ?? -1) - (b.hours ?? -1));
+for (const r of rows) {
+  console.log(
+    `${r.pod.padEnd(26)} ${String(r.arms).padStart(3)} arms in window, median ${(r.medianGap / 60000).toFixed(0).padStart(4)} min between turn endings` +
+      (r.calls === null
+        ? "  no completion in window to price"
+        : `  freed ${Math.round(r.freed)} needs ${Math.ceil(r.calls)} calls to pay back = ${r.hours.toFixed(1)} h of this session's own use`),
+  );
+}
+const slow = rows.filter((r) => r.hours !== null && r.hours > 8);
+console.log(
+  `${slow.length} pods would not see the saving inside a working day at their own rate` +
+    (slow.length ? ` (${slow.map((r) => `${r.pod} ${r.hours.toFixed(1)}h`).join(", ")})` : "") +
+    " - for those, an idle compaction is a payment, not an investment",
+);
+
 header("queue cost per pod (gate deferrals)");
 const waits = new Map();
 for (const r of records.filter((x) => x.kind === "gate")) {
