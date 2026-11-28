@@ -18,3 +18,6 @@ coverage/
 # to the repository, and `git add -A` will otherwise commit a screenshot of someone’s screen into a public repo -
 # which is exactly what happened in cdfbaa5.
 .slopyphus/
+
+# Probe artifacts (rooter event ring samples etc.)
+.tmp/
