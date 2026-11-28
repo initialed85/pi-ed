@@ -46,8 +46,10 @@
  *     the work a refresh would actually have avoided - and that avoided work must itself clear
  *     `minSavedSeconds`, because a warm that saves 7 seconds of prefill is not a saving, it is noise. This is the
  *     gate's own version of Pi's `$0.05` minimum expected savings, in the currency we actually trade in;
- *   - the session keeps arriving (`arrivalsPerHour`), because a warm spent on a session that woke once and then
- *     sleeps for a day is a warm spent on nobody;
+ *   - the session keeps arriving (`humanArrivalsPerHour`), because a warm spent on a session that woke once and
+ *     then sleeps for a day is a warm spent on nobody; and it counts *human* turns, which is what makes it the
+ *     right bar (see the catalyst note below): machine injections never entered this series, so a 1/h floor means
+ *     "a person sent something in the last hour" rather than "this session is busy";
  *   - and never when the most recent call already read the prompt from cache (`vetoCacheHitRate`).
  *
  * The catalyst precondition, which is the last of those four and answers a question none of them can. Ed stated
@@ -133,7 +135,17 @@ export interface WarmConfig {
   mode: "observe" | "arm";
   /** Median recomputed tokens a session must show before a warm is worth spending. */
   minRecomputeTokens: number;
-  /** Turn arrivals per hour a session must show to be worth warming. */
+  /**
+   * Human turn arrivals per hour a session must show to be worth warming.
+   *
+   * It counts only user-role arrivals, so scheduled runs, resumes and team-room turns do not raise it - see
+   * `SessionRhythm`. The default was 2 until 2026-11-28, when measuring what the bar actually selects made 2 the
+   * wrong number: Ed's pattern is that he sits down, sends **one** message, idle compaction makes headroom, and
+   * warming should follow it. At 2/h that case was refused by the bar whose job was to permit it, and the floor
+   * that keeps a cadence warm is the catalyst rule plus `maxIdleMs`, not a human-arrival rate. One message per
+   * hour is now the ask; the knob keeps its name because it is the env/`config` surface
+   * (`CACHE_WARM_MIN_ARRIVALS_PER_HOUR`, `.pi/cache-warm.json`) and pi-bot asked that path stay exactly as it is.
+   */
   minArrivalsPerHour: number;
   /**
    * How long a decision may wait for its own log line, in ms. The log is a diagnostic: it must never be able to
@@ -180,7 +192,7 @@ export interface WarmConfig {
 export const DEFAULT_WARM_CONFIG: WarmConfig = {
   mode: "observe",
   minRecomputeTokens: 10000,
-  minArrivalsPerHour: 2,
+  minArrivalsPerHour: 1,
   logTimeoutMs: 2000,
   logRetryMs: 120000,
   minSavedSeconds: 30,
@@ -205,11 +217,19 @@ export interface CallEvidence {
   aborted: boolean;
 }
 
-/** The session's arrival rhythm, from the entries it already wrote. */
+/**
+ * The session's arrival rhythm, from the entries it already wrote.
+ *
+ * `arrivals` and `humanArrivalsPerHour` count **user-role messages only**. That is not an oversight and it is the
+ * first thing a reader of a decision row needs to know: scheduled runs, resumes, dreams and team-room turns
+ * persist as `custom_message` entries, so a session that has been woken forty times by peers and once by a person
+ * reads as nearly quiet here. Both fields are named for what they measure because `arrivalsPerHour` reads like all
+ * traffic to anyone who has not been through this.
+ */
 export interface SessionRhythm {
   windowMs: number;
   arrivals: number;
-  arrivalsPerHour: number;
+  humanArrivalsPerHour: number;
   medianGapMs?: number;
   lastArrivalMs?: number;
   /** Idle time since the last arrival, at `nowMs`. */
@@ -353,7 +373,7 @@ export interface ArmDecision {
     /** Whether that figure was measured on this session's calls or priced from the fallback table. */
     coldSource?: "observed" | "rate table";
     evidenceCalls: number;
-    arrivalsPerHour?: number;
+    humanArrivalsPerHour?: number;
     medianGapMs?: number;
     sinceLastMs?: number;
     /** In observe mode, what the gate would have said. `action` is what actually happened. */
@@ -447,7 +467,7 @@ export function sessionRhythm(entries: RhythmEntry[], nowMs: number, windowMs: n
   return {
     windowMs,
     arrivals: stamps.length,
-    arrivalsPerHour: stamps.length / hours,
+    humanArrivalsPerHour: stamps.length / hours,
     medianGapMs: median(gaps),
     lastArrivalMs: last,
     sinceLastMs: last === undefined ? undefined : Math.max(0, nowMs - last),
@@ -474,7 +494,7 @@ function gateDecision(
     catalyst: session.catalyst?.catalyst ?? "unknown",
     catalystBasis: session.catalyst?.basis ?? "not supplied to the gate",
     evidenceCalls: recent.length,
-    arrivalsPerHour: Math.round(rhythm.arrivalsPerHour * 100) / 100,
+    humanArrivalsPerHour: Math.round(rhythm.humanArrivalsPerHour * 100) / 100,
     medianGapMs: rhythm.medianGapMs === undefined ? undefined : Math.round(rhythm.medianGapMs / 100) * 100,
     sinceLastMs: rhythm.sinceLastMs === undefined ? undefined : Math.round(rhythm.sinceLastMs / 100) * 100,
   };
@@ -540,9 +560,9 @@ function gateDecision(
   if (medians < cfg.minRecomputeTokens) {
     return stop(`${base}; median recompute ${Math.round(medians)} tokens over ${recent.length} calls is under the ${cfg.minRecomputeTokens} floor${costNote}`);
   }
-  if (rhythm.arrivalsPerHour < cfg.minArrivalsPerHour) {
+  if (rhythm.humanArrivalsPerHour < cfg.minArrivalsPerHour) {
     return stop(
-      `${base}; ${rhythm.arrivalsPerHour.toFixed(2)} arrivals/h is under the ${cfg.minArrivalsPerHour}/h bar (this session woke and is unlikely to return again inside the re-arm interval)`,
+      `${base}; ${rhythm.humanArrivalsPerHour.toFixed(2)} human arrivals/h is under the ${cfg.minArrivalsPerHour}/h bar (a machine woken this session does not raise this number; nobody has sent a turn in the window)`,
     );
   }
   // Last, because it is the summary of everything above: a refresh replays the session's whole prompt, and a
@@ -566,7 +586,7 @@ function gateDecision(
   }
   return {
     action: "warm",
-    reason: `${base}; median recompute ${Math.round(medians)} tokens over ${recent.length} calls, ${rhythm.arrivalsPerHour.toFixed(2)} arrivals/h, catalyst ${detail.catalyst}${cold}`,
+    reason: `${base}; median recompute ${Math.round(medians)} tokens over ${recent.length} calls, ${rhythm.humanArrivalsPerHour.toFixed(2)} human arrivals/h, catalyst ${detail.catalyst}${cold}`,
     detail,
   };
 }

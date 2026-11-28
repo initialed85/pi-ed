@@ -196,15 +196,25 @@ for (const [key, list] of byKey) {
   // that made one call: an active span of zero seconds turns a single call into 60 arrivals/hour, which is the
   // kind of number that would have this counter arming warming for callers that called once. Whether a session is
   // *still* awake is the idle bar's job, and it reads `sinceLastMs`.
+  //
+  // Note the mismatch, since it bounds what this tool may be used for: rooter rows are generations, and a `p:`
+  // caller's generation is not a human turn. On a pod the gate's `humanArrivalsPerHour` counts user-role messages
+  // only, so every figure below is an **upper bound** on what the gate would arm, not a prediction of it.
   const rhythm = {
     windowMs: cfg.evidenceWindowMs,
     arrivals: list.length,
-    arrivalsPerHour: list.length / (cfg.evidenceWindowMs / 3_600_000),
+    humanArrivalsPerHour: list.length / (cfg.evidenceWindowMs / 3_600_000),
     medianGapMs: gaps.length ? gaps.sort((a, b) => a - b)[Math.floor(gaps.length / 2)] : undefined,
     lastArrivalMs: stamps[stamps.length - 1],
     sinceLastMs: newest - stamps[stamps.length - 1],
   };
-  const decision = armDecision(evidence, rhythm, cfg, "warm");
+  // The catalyst precondition cannot be evaluated from rooter rows, so it is assumed clear and the caveat is
+  // printed. The alternative - letting it default to `unknown` - would report 0 warmable for a reason that has
+  // nothing to do with the evidence, which is the kind of number that gets quoted as a finding.
+  const decision = armDecision(evidence, rhythm, cfg, "warm", {
+    compacting: false,
+    catalyst: { catalyst: "terminal", basis: "assumed by warm-counter: rooter rows carry no transcript, so no catalyst can be named" },
+  });
 
   for (const event of evidence) {
     if (event.computedTokens >= 5000) {
@@ -265,7 +275,8 @@ if (json) {
   console.log(JSON.stringify({ windowMs: newest - sinceMs, sessions, totals: { sessions: sessions.length, piSessions: piSessions.length, warmable: warmable.length, warmablePiSessions: warmable.filter((session) => session.piSession).length, fleetColdCalls, fleetColdTokens, fleetColdSeconds, totalFires, warmRestoreSec: warmRestore, warmColdSec: warmCold, savedTokens }, rates, undeclaredLifetime }, null, 2));
 } else {
   console.log(`rooter ${door.root} boot ${eventsBody.boot_id} (rooter uptime ${stats.uptime}, dropped_total ${eventsBody.dropped_total})`);
-  console.log(`window ${(newest - sinceMs) / 60000}m to ${new Date(newest).toISOString().slice(0, 19)}  gate: floor ${cfg.minRecomputeTokens} tokens, arrivals ${cfg.minArrivalsPerHour}/h, saved >= ${cfg.minSavedSeconds}s, veto >= ${cfg.vetoCacheHitRate} cache read, idle bar ${Math.round(cfg.maxIdleMs / 60000)}m, ${cfg.evidenceCalls} calls`);
+  console.log(`window ${(newest - sinceMs) / 60000}m to ${new Date(newest).toISOString().slice(0, 19)}  gate: floor ${cfg.minRecomputeTokens} tokens, human arrivals ${cfg.minArrivalsPerHour}/h, saved >= ${cfg.minSavedSeconds}s, veto >= ${cfg.vetoCacheHitRate} cache read, idle bar ${Math.round(cfg.maxIdleMs / 60000)}m, ${cfg.evidenceCalls} calls`);
+  console.log("catalyst rule assumed clear (a rooter row names no catalyst), and the arrival rate here counts generations, not human turns: these warmable counts are an upper bound on what the gate would arm");
   console.log(`re-arm cadence priced: every ${reArmSec}s`);
   for (const [name, rate] of Object.entries(rates)) {
     console.log(`  ${name}: cold prefill ${rate.coldTokS} tok/s over ${rate.coldSamples} samples, restore ${Math.round(rate.restoreTokS)} tok/s over ${rate.restoreSamples} samples, ${rate.requests} proxied calls`);

@@ -443,23 +443,30 @@ boxes first, and `build` on every line |
 ### `cache-warm-policy.ts` — should a prompt cache be kept alive on purpose? It says no, and shows the work
 
 Pi ships a prompt-cache warmer: it re-sends the last real request with a one-token output cap at 90% of the
-declared cache lifetime, refuses to replay a request it cannot
-replay identically, prices the decision, and asks extensions before acting. Until 2026-11-28 it had never warmed anything here, for a reason that was in the catalogue
+declared cache lifetime, refuses to replay a request it cannot replay identically, prices the decision, and asks
+extensions before acting. Until 2026-11-28 it had never warmed anything here, for a reason that was in the catalogue
 rather than in the arithmetic: it opens a warming run by reading the lifetime of the entry it would refresh
 (`getPromptCacheTtlMs`, from the model's `promptCache` tier), no entry in `/root/.pi/agent/models.json` declared one,
 so the warmer stopped at `start()` with `{action: "stop", reason: "cache lifetime unavailable"}` and there was never a
-decision to policy on. **That door is now open**: `rooter/auto` declares `promptCache: {"short": 1800}` (Ed said turn
-it on - home-ops `0cbefe7`, rolled across all 16 agent pods at 03:58Z on 2026-11-28), so from here the only thing
-between a quiet session and a spent re-prefill is this gate. A missing `cost` block fails differently and is *not* a
-door: the config loader defaults it to zeros, so `evaluateCacheWarming` answers `economicsAvailable: false` with
-`warmCost` and `missCost` both 0 and action `stop` - a stop Pi reaches *while still asking extensions*, which is the
-hole this policy stands in. So the question "should we warm?" is now being asked, and this extension is the only
-thing answering it, in GPU units.
+decision to policy on. A missing `cost` block fails differently and is *not* a door: the config loader defaults it to
+zeros, so `evaluateCacheWarming` answers `economicsAvailable: false` with `warmCost` and `missCost` both 0 and action
+`stop` - a stop Pi reaches *while still asking extensions*, which is the hole this policy stands in.
 
-It has still sent nothing, and that is a measurement rather than a configuration: a decision needs an open run that
-then goes quiet for `delayMs` (1,620 s at `short: 1800`), and across 210 rooter rows since the roll the longest
-inter-arrival on any Pi session was 21.6 minutes. The first armed decisions land on each pod's first 27-minute quiet
-window.
+**The catalogue door has since been opened, and then deliberately left ajar.** `rooter/auto` declares
+`promptCache: {"short": 1800}` (Ed said turn it on - home-ops `0cbefe7`, rolled across all 16 agent pods at 03:58Z on
+2026-11-28), and three hours later the fleet went back to `mode: observe` (home-ops `9eac941`) on Ed's ruling in Chat:
+"i dont think i need anything that keeps the pi agent sessions fresher than others, just rely on idle compaction and
+warming based on session busyness in general". The mechanism agrees with him in a way none of us had said out loud:
+the refresh is scheduled `delayMs` after the request that **opened** the run, so the only sessions warmer-eligible at
+all are ones that have gone quiet for 27 minutes. Warming cannot keep the session you are typing in fresher than any
+other - the cache your real request just wrote already does that - so what it can buy here is a cheaper return for
+sessions that have already stopped, and nothing else. This extension is what decides whether that is worth a GPU
+second, and it decides in GPU units.
+
+It has sent nothing, and there are now two independent reasons: the fleet is in observe, and a decision needs an open
+run that then goes quiet for `delayMs` (1,620 s at `short: 1800`) - across 210 rooter rows since the roll the longest
+inter-arrival on any Pi session was 21.6 minutes. In observe the ask still arrives on each pod's first long quiet
+window and still writes its row; only the spend is withheld, which is exactly what re-arming is a decision about.
 
 The policy is in `pi-coding-agent/dist/core/cache-warmer.js` on 1.5.0 and, from 1.6.0, split between that file
 (which owns scheduling) and `pi-ai/dist/cache-warming.js` (which owns the numbers); the constants are the same in
@@ -470,8 +477,8 @@ rows for this session (`GET /rooter/events?key=h:<first 10 chars of the Pi sessi
 `prompt_tokens_computed` is the work a refresh would have avoided, and whose `prefill_ms` prices it), the session's
 own arrival rhythm off the branch, and the **catalyst** of the newest entry that opened a request. It arms only when
 the catalyst is human-shaped, nothing has been idle past `maxIdleMs`, median recompute clears
-`minRecomputeTokens`, arrivals clear `minArrivalsPerHour`, and the last call was not already a cache read. Three
-corrections are carried in the code, from review and from measurement:
+`minRecomputeTokens`, `humanArrivalsPerHour` clears `minArrivalsPerHour` (1/h), and the last call was not already a
+cache read. Three corrections are carried in the code, from review and from measurement:
 
 - a *high* cache hit rate is not a precondition, it is a **veto**. A session reading 99% of its prompt from cache is
   a session a refresh cannot help, and it is the fleet's normal state: this session's 148 calls in 139 minutes
@@ -493,7 +500,18 @@ corrections are carried in the code, from review and from measurement:
   a peer; `[background job complete]` and `(auto-resume)` are the harness). Only `chat` and `terminal` may turn a stop
   into a warm. It is a precondition on the **override** and runs after every evidence rule, so a vetoed decision still
   records what the evidence said, and `catalystVetoed: true` on a row is exactly the count of how often this rule
-  alone would have stopped a spend.
+  alone would have stopped a spend. Finding this out also renamed a field and moved a default: the rhythm row is
+  `humanArrivalsPerHour`, because `arrivalsPerHour` reads like all traffic to anyone who has not been through this,
+  and the floor went 2 → **1**, because at 2/h the bar whose job was to permit Ed's pattern (sit down, send one
+  message, compaction makes headroom, warming follows) was the bar refusing it. It is a code default and not a
+  ConfigMap value, so one roll carries the rule and the threshold together. What the floor is once it sits at 1 is
+  worth saying plainly: a **presence test** ("a human spoke inside the window"), not a rate - one call in a
+  60-minute window reads as exactly 1.0/h - so the discriminating is left to `minRecomputeTokens`, `minSavedSeconds`
+  and the cache-read veto, and on the first read after this change those three were what stopped both Pi sessions
+  (99% cache read, 983-token median recompute). pi-bot is not rolling for it today:
+  the fleet is in observe, so `f1896ab` buys nothing until the arm decision, and the next roll is Sunday 08:30 AWST
+  bundled with whatever a day of observe evidence says (`arm` + this build if sessions genuinely clear the bars,
+  `off` + no new build if none do).
 
 What the fleet measured against that gate (`hack/warm-counter.mjs`, rooter boot `d7f15035b14e`, 347 generations,
 144 minutes, 24 session keys): **0 of the 5 Pi sessions warmable**, and 0 warmable among the 19 `p:`-keyed callers
@@ -522,7 +540,7 @@ against a $0.05 floor. On boxes we own, warming is a latency transfer and never 
 | --- | --- |
 | Commands | `/cache-warm` (mode, last decision, its catalyst, and the rhythm it was judged from) |
 | Config | `.pi/cache-warm.json`, with `CACHE_WARM_MODE` / `CACHE_WARM_MIN_RECOMPUTE_TOKENS` / `CACHE_WARM_MIN_ARRIVALS_PER_HOUR` / `CACHE_WARM_VETO_CACHE_HIT_RATE` / `CACHE_WARM_MAX_IDLE_MS` / `CACHE_WARM_EVIDENCE_CALLS` overrides |
-| Knobs | `mode` (**observe** in code — the gate runs, its verdict is logged as `gateVerdict`, and the action is `stop`, which sends no request at all: measuring what the gate would have armed is free, so arming is a decision made after reading the log, not before. **This is not what the fleet runs.** Ed turned it on the night of 2026-11-27 in home-ops `0cbefe7` ("turn on cache-warm for the fleet"), which puts `CACHE_WARM_MODE: "arm"` in the shared `slopyphus/config` ConfigMap and wires it into all 16 agent pods; verified live on my own pod's environment. Precedence is env > project file > default, so a single agent can be held back with a `.pi/cache-warm.json` and no redeploy. What makes the fleet quiet in practice is not the mode, it is that a decision needs 27 minutes of silence in one session. **`promptCache` in the catalogue is the switch that opens the door, and it was opened on 2026-11-28**: `rooter/auto` declares `short: 1800`, so the first armed decisions land on each pod's first long quiet window with no further step) · `minRecomputeTokens` (10000) · `minArrivalsPerHour` (2) · `minSavedSeconds` (**30** — the gate's own version of Pi's `$0.05` minimum expected savings, in the currency we trade in: a refresh replays the session's whole prompt, and it earns nothing to avoid 14 seconds on strata. This bar was written by a mistake: at 12:07Z rooter restarted with a short event buffer, one call read as 2.55 arrivals/h over the compressed window, and two sessions armed to save 7s and 17s) · `vetoCacheHitRate` (0.99) · `maxIdleMs` (**1620000** = 27 minutes, the interval a `promptCache.short: 1800` catalogue would actually schedule, so this bar and that value move together) · `evidenceCalls` (8) · `evidenceWindowMs` (3600000) · `evidenceTimeoutMs` (1500, and a 60-second backoff after a rooter read fails) · `logTimeoutMs` (**2000** — how long a decision may wait for its own log line) / `logRetryMs` (120000, how long a stalled log stays shut) |
+| Knobs | `mode` (**observe** in code — the gate runs, its verdict is logged as `gateVerdict`, and the action is `stop`, which sends no request at all: measuring what the gate would have armed is free, so arming is a decision made after reading the log, not before. **This is not what the fleet runs.** Ed turned it on the night of 2026-11-27 in home-ops `0cbefe7` ("turn on cache-warm for the fleet"), which put `CACHE_WARM_MODE: "arm"` in the shared `slopyphus/config` ConfigMap across all 16 agent pods; **the fleet is back in observe as of home-ops `9eac941` (13:41 AWST / 05:41Z 2026-11-28)**, on Ed's Chat ruling that he does not want pi sessions kept fresher than others - and the mechanism supports that, since a refresh is scheduled from the request that *opened* the run, so only a session already quiet for 27 minutes is ever eligible. Observe keeps the evidence without the spend, and re-arming is one line in that ConfigMap. Precedence is env > project file > default, so a single agent can be held back with a `.pi/cache-warm.json` and no redeploy. What makes the fleet quiet in practice is not the mode, it is that a decision needs 27 minutes of silence in one session, and **`promptCache` in the catalogue is the switch that opens the door**: `rooter/auto` declares `short: 1800`, so the ask lands on each pod's first long quiet window whether or not it is answered with a spend) · `minRecomputeTokens` (10000) · `minArrivalsPerHour` (**1** — human turns only, and the knob counts *user-role* arrivals: a peer wake or a scheduled run does not raise it, because those persist as `custom_message`. It was 2 until 2026-11-28, when naming what the bar actually selects showed 2/h refused the exact case it was written for (Ed sits down, sends **one** message, compaction makes headroom, warming should follow). Held at the override path's name so `CACHE_WARM_MIN_ARRIVALS_PER_HOUR` and `.pi/cache-warm.json` keep working unchanged; the row field it gates is now `humanArrivalsPerHour`) · `minSavedSeconds` (**30** — the gate's own version of Pi's `$0.05` minimum expected savings, in the currency we trade in: a refresh replays the session's whole prompt, and it earns nothing to avoid 14 seconds on strata. This bar was written by a mistake: at 12:07Z rooter restarted with a short event buffer, one call read as 2.55 arrivals/h over the compressed window, and two sessions armed to save 7s and 17s) · `vetoCacheHitRate` (0.99) · `maxIdleMs` (**1620000** = 27 minutes, the interval a `promptCache.short: 1800` catalogue would actually schedule, so this bar and that value move together) · `evidenceCalls` (8) · `evidenceWindowMs` (3600000) · `evidenceTimeoutMs` (1500, and a 60-second backoff after a rooter read fails) · `logTimeoutMs` (**2000** — how long a decision may wait for its own log line) / `logRetryMs` (120000, how long a stalled log stays shut) |
 | Ceilings | Pi's own, which decide what a catalogue may ever say: a refresh is scheduled at `min(short × 0.9, short − 10s)` measured from the request that opened the run, and Pi stops a run whose next refresh falls past 30 minutes after that (60 while it streams). 2,000s is therefore the largest `short` whose refresh (1,800s) merely *touches* the horizon, and any elapsed time pushes it past, so a declared value is a **re-arm interval** — `1800` schedules 27 minutes out with headroom — and never a claim about how long a prefix lives. What the prefix actually does is measured: rooter's probe held a 33,761-token prefix on sushi to **56.7 min** (read off SSD) and missed at **77.0 min**, counting age from the **last write**, so both 1800 and 1500 sit well inside real survival and the choice between them is which tier the refresh reads back from (hot demotes to SSD within ~24 min under load, which is rooter's argument for 1500) |
 | Ownership | Also answers `cache_warming_decision` from the summarisation side (`idle-compaction.ts`), and Pi merges that event by taking the last handler that answered in load order. This extension watches `session_before_compact` / `session_compact` / `session_compact_failed` and holds the veto itself, so a warm never depends on which of the two Pi loaded first |
 | Evidence | `.pi/cache-warm/log.jsonl`, one JSON line per decision: Pi's own `warmCost` / `missCost` / `continuationProbability`, what this extension answered, `gateVerdict` when observing, `catalyst` and `catalystBasis` (never the turn's text), `catalystVetoed` when that rule alone stopped a spend, the median recompute it priced from, whether that price was observed or table-derived, the rhythm, and `evidenceSource` when rooter could not be read |

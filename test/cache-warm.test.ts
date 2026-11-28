@@ -55,9 +55,9 @@ function row(over: Partial<CallEvidence> = {}): CallEvidence {
 }
 
 /** A session that comes back every six minutes. */
-const BUSY = { windowMs: 60 * 60_000, arrivals: 10, arrivalsPerHour: 10, medianGapMs: 360_000, lastArrivalMs: NOW - 120_000, sinceLastMs: 120_000 };
+const BUSY = { windowMs: 60 * 60_000, arrivals: 10, humanArrivalsPerHour: 10, medianGapMs: 360_000, lastArrivalMs: NOW - 120_000, sinceLastMs: 120_000 };
 /** A session that wakes once and has been quiet since. */
-const WAKE_ONCE = { windowMs: 60 * 60_000, arrivals: 1, arrivalsPerHour: 1, medianGapMs: undefined, lastArrivalMs: NOW - 50 * 60_000, sinceLastMs: 50 * 60_000 };
+const WAKE_ONCE = { windowMs: 60 * 60_000, arrivals: 1, humanArrivalsPerHour: 1, medianGapMs: undefined, lastArrivalMs: NOW - 50 * 60_000, sinceLastMs: 50 * 60_000 };
 
 /**
  * Catalysts, in the shape `armDecision` takes.
@@ -219,14 +219,17 @@ describe("sessionRhythm", () => {
     { type: "message", message: { role: "toolResult" }, timestamp: "2026-11-27T09:02:00Z" },
     { type: "message", message: { role: "user" }, timestamp: "2026-11-27T09:30:00Z" },
     { type: "custom", customType: "turn-stats", timestamp: "2026-11-27T09:31:00Z" },
+    // A peer wake inside the window, which is exactly the entry that must not move the rate: machine catalysts
+    // persist as custom_message, and a bar that counted them would warm prefixes nobody is coming back to read.
+    { type: "custom_message", customType: "pi-team-room-wake", timestamp: "2026-11-27T09:35:00Z" },
     { type: "message", message: { role: "user" }, timestamp: "2026-11-26T09:30:00Z" },
     { type: "compaction", timestamp: "2026-11-27T09:40:00Z", tokensBefore: 100000 },
   ];
 
-  it("counts wakeups, not typing: only user messages are arrivals", () => {
+  it("counts human turns, not traffic: only user messages are arrivals", () => {
     const rhythm = sessionRhythm(branch, NOW, 60 * 60_000);
     expect(rhythm.arrivals).toBe(2);
-    expect(rhythm.arrivalsPerHour).toBe(2);
+    expect(rhythm.humanArrivalsPerHour).toBe(2);
     expect(rhythm.medianGapMs).toBe(1_800_000);
     expect(rhythm.sinceLastMs).toBe(30 * 60_000);
   });
@@ -234,7 +237,7 @@ describe("sessionRhythm", () => {
   it("reports an empty rhythm honestly rather than as a busy session", () => {
     const rhythm = sessionRhythm([], NOW, 60 * 60_000);
     expect(rhythm.arrivals).toBe(0);
-    expect(rhythm.arrivalsPerHour).toBe(0);
+    expect(rhythm.humanArrivalsPerHour).toBe(0);
     expect(rhythm.medianGapMs).toBeUndefined();
     expect(rhythm.lastArrivalMs).toBeUndefined();
     expect(rhythm.sinceLastMs).toBeUndefined();
@@ -296,11 +299,29 @@ describe("armDecision", () => {
     expect(decision.detail.coldSecondsAvoided).toBeUndefined();
   });
 
-  it("refuses a session that is still arriving, but too rarely to be worth a cadence", () => {
-    const slow = { ...WAKE_ONCE, arrivals: 1, arrivalsPerHour: 1, sinceLastMs: 60_000, lastArrivalMs: NOW - 60_000 };
+  it("refuses a session nobody has written to in the last hour, even one still arriving", () => {
+    // 1 human turn spread over a two-hour window, and fresh enough that the idle bar is not what stops it.
+    const slow = { ...WAKE_ONCE, windowMs: 2 * 60 * 60_000, arrivals: 1, humanArrivalsPerHour: 0.5, sinceLastMs: 60_000, lastArrivalMs: NOW - 60_000 };
     const decision = armDecision([row({ computedTokens: 40000 })], slow, cfg({ mode: "arm" }), "stop", HUMAN);
     expect(decision.action).toBe("stop");
-    expect(decision.reason).toContain("1.00 arrivals/h is under the 2/h bar");
+    expect(decision.reason).toContain("0.50 human arrivals/h is under the 1/h bar");
+  });
+
+  it("arms on the case the bar exists for: one human message in the last hour, then idle", () => {
+    // Ed's pattern, stated in Chat: he sits down, sends something, idle compaction makes headroom, and warming
+    // should follow it. One arrival in an hour is 1/h, and at the old floor of 2 that exact case was refused by
+    // the bar whose job was to permit it.
+    const justBack = {
+      ...WAKE_ONCE,
+      arrivals: 1,
+      humanArrivalsPerHour: 1,
+      lastArrivalMs: NOW - 10 * 60_000,
+      sinceLastMs: 10 * 60_000,
+    };
+    const decision = armDecision([row({ computedTokens: 40000, backend: "sushi" })], justBack, cfg({ mode: "arm" }), "stop", HUMAN);
+    expect(decision.action).toBe("warm");
+    expect(decision.reason).toContain("1.00 human arrivals/h");
+    expect(decision.detail.humanArrivalsPerHour).toBe(1);
   });
 
   it("arms when a busy session is doing the cold work a warm would have avoided", () => {
@@ -311,7 +332,7 @@ describe("armDecision", () => {
     expect(decision.reason).toContain("a refresh avoids (93s at sushi's measured 236 tok/s)");
     expect(decision.detail.coldSecondsAvoided).toBe(93);
     expect(decision.detail.coldSource).toBe("rate table");
-    expect(decision.detail.arrivalsPerHour).toBe(10);
+    expect(decision.detail.humanArrivalsPerHour).toBe(10);
   });
 
   it("prices a warm from what the session's own calls actually cost, when rooter timed them", () => {
@@ -512,7 +533,9 @@ describe("cache-warm-policy extension", () => {
     const [record] = await readLog();
     expect(record.evidence.medianComputedTokens).toBe(22000);
     expect(record.evidence.coldSecondsAvoided).toBe(93);
-    expect(record.rhythm.arrivalsPerHour).toBe(3);
+    expect(record.rhythm.humanArrivalsPerHour).toBe(3);
+    // The name is the point: the old key read like all traffic, and it never was.
+    expect(record.rhythm).not.toHaveProperty("arrivalsPerHour");
     expect(record.evidenceSource.ok).toBe(true);
     delete process.env.CACHE_WARM_MODE;
   });
@@ -558,7 +581,7 @@ describe("cache-warm-policy extension", () => {
     expect(record.evidence.catalystVetoed).toBe(true);
     expect(record.evidence.medianComputedTokens).toBe(22000);
     expect(record.evidence.coldSecondsAvoided).toBe(93);
-    expect(record.rhythm.arrivalsPerHour).toBe(3);
+    expect(record.rhythm.humanArrivalsPerHour).toBe(3);
     // And no text from the turn reached the log.
     expect(JSON.stringify(record)).not.toContain("implement the catalyst rule");
     delete process.env.CACHE_WARM_MODE;

@@ -221,7 +221,8 @@ interface LoggedDecision {
   reason: string;
   evidence: ArmDecision["detail"];
   evidenceSource: { ok: boolean; key: string; error?: string };
-  rhythm: { arrivals: number; arrivalsPerHour: number; medianGapMs?: number; sinceLastMs?: number };
+  /** Human turns only. A scheduled run or a team-room wake does not raise this number; see `SessionRhythm`. */
+  rhythm: { arrivals: number; humanArrivalsPerHour: number; medianGapMs?: number; sinceLastMs?: number };
   configProblems: string[];
   /** Set when this decision could not be written, or was not attempted because an earlier write is wedged. */
   logStalled?: true;
@@ -335,7 +336,7 @@ export default function extension(pi: ExtensionAPI): void {
       evidenceSource: { ok: evidence.ok, key: evidence.key, ...(evidence.error ? { error: evidence.error } : {}) },
       rhythm: {
         arrivals: rhythm.arrivals,
-        arrivalsPerHour: Math.round(rhythm.arrivalsPerHour * 100) / 100,
+        humanArrivalsPerHour: Math.round(rhythm.humanArrivalsPerHour * 100) / 100,
         ...(rhythm.medianGapMs === undefined ? {} : { medianGapMs: Math.round(rhythm.medianGapMs / 100) * 100 }),
         ...(rhythm.sinceLastMs === undefined ? {} : { sinceLastMs: Math.round(rhythm.sinceLastMs / 100) * 100 }),
       },
@@ -355,7 +356,7 @@ export default function extension(pi: ExtensionAPI): void {
       const cfg = readConfig(ctx);
       const lines = [`cache warm policy: ${cfg.mode}`];
       lines.push(
-        `arms when the newest request was human-shaped (chat or terminal), nothing has been idle past ${Math.round(cfg.maxIdleMs / 60000)}m, median recompute >= ${cfg.minRecomputeTokens} tokens, arrivals >= ${cfg.minArrivalsPerHour}/h and the prefill avoided >= ${cfg.minSavedSeconds}s; vetoes a session already reading ${Math.round(cfg.vetoCacheHitRate * 100)}% from cache`,
+        `arms when the newest request was human-shaped (chat or terminal), nothing has been idle past ${Math.round(cfg.maxIdleMs / 60000)}m, median recompute >= ${cfg.minRecomputeTokens} tokens, human arrivals >= ${cfg.minArrivalsPerHour}/h and the prefill avoided >= ${cfg.minSavedSeconds}s; vetoes a session already reading ${Math.round(cfg.vetoCacheHitRate * 100)}% from cache`,
       );
       for (const problem of cfg.problems) lines.push(`config: ${problem}`);
       const last = lastDecision;
@@ -371,7 +372,7 @@ export default function extension(pi: ExtensionAPI): void {
         lines.push(
           `  evidence: ${last.evidence.evidenceCalls} calls, median recompute ${last.evidence.medianComputedTokens ?? "n/a"} tokens${saved === undefined ? "" : `, ~${saved}s of prefill a warm would have avoided`}`,
         );
-        lines.push(`  rhythm: ${last.rhythm.arrivals} arrivals in the window, ${last.rhythm.arrivalsPerHour}/h${last.rhythm.medianGapMs === undefined ? "" : `, median gap ${Math.round(last.rhythm.medianGapMs / 1000)}s`}`);
+        lines.push(`  rhythm: ${last.rhythm.arrivals} human arrivals in the window, ${last.rhythm.humanArrivalsPerHour}/h (a peer or scheduled turn is not counted here)${last.rhythm.medianGapMs === undefined ? "" : `, median gap ${Math.round(last.rhythm.medianGapMs / 1000)}s`}`);
         if (last.evidenceSource.error) lines.push(`  evidence problem: ${last.evidenceSource.error}`);
       }
       lines.push(`decisions: ${join(ctx.cwd, LOG_FILE)}`);
