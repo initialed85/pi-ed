@@ -1,8 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+// The stall fixture below needs a FIFO. Where mkfifo does not exist the test is skipped rather than failed:
+// a missing coreutil is not a defect in the ceiling it is trying to prove.
+const HAVE_MKFIFO = (() => {
+  try {
+    execFileSync("mkfifo", ["--version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+})();
 
 import { createContext, createFakePi } from "./harness.ts";
 
@@ -232,6 +244,17 @@ describe("cache-warm-policy extension", () => {
     // A fresh cwd per test: the decision log is append-only, so a second test reading it would otherwise
     // read the first test's decision and pass on someone else's evidence.
     cwd = await mkdtemp(path.join(os.tmpdir(), "cache-warm-"));
+    // The suite promises "everything here runs without infrastructure" (.woodpecker/ci.yaml), and this file
+    // broke that promise twice over. (a) A test that took no position on fetch reached the real rooter, which
+    // resolved in a dev pod and hung in a CI step pod for ~30s (the OS resolver's own timeout, which a fetch
+    // abort does not interrupt), failing pipelines 167-170 as a timeout rather than an assertion. (b) The mode
+    // came from the ambient environment, and the fleet now sets CACHE_WARM_MODE=arm in the shared `config`
+    // ConfigMap (home-ops 0cbefe7), so a suite run inside a pod inherited "arm" and a test named "in observe
+    // mode" asserted against a mode it never chose. Every test starts from observe and no network.
+    for (const key of Object.keys(process.env)) {
+      if (key.startsWith("CACHE_WARM_")) delete process.env[key];
+    }
+    stubFetch(() => ({ ok: true, status: 200, body: { events: [] } }));
   });
 
   afterEach(() => {
@@ -497,10 +520,17 @@ describe("cache-warm-policy extension", () => {
   });
 
   it("keeps a log it cannot write from changing the decision", async () => {
+    // Not "/proc/something", which asserted nothing on a privileged runner: a CI container running as root
+    // reaches paths a dev pod does not, so the write never failed there and the test waited 30s for an error
+    // that never arrived. A directory sitting where the log file should be fails for any uid, always EISDIR.
+    const logDir = path.join(cwd, ".pi", "cache-warm");
+    await mkdir(logDir, { recursive: true });
+    await mkdir(path.join(logDir, "log.jsonl"));
+
     const mod = await load();
     const pi = createFakePi();
     mod.default(pi as any);
-    const ctx = createContext({ cwd: "/proc/definitely-not-writable", sessionId: "01a1a9b1-795c", model: rooterModel });
+    const ctx = createContext({ cwd, sessionId: "01a1a9b1-795c", model: rooterModel });
     const [result] = await pi.emit("cache_warming_decision", {
       type: "cache_warming_decision",
       warmCost: 0.0041,
@@ -509,5 +539,54 @@ describe("cache-warm-policy extension", () => {
       action: "warm",
     }, ctx.context);
     expect(result).toEqual({ action: "stop" });
+
+    // The failure has to be visible somewhere, because an unwritable log is exactly the state in which a tool
+    // that says nothing looks healthy.
+    await pi.commands.get("cache-warm")?.handler?.("", ctx.context);
+    const notice = ctx.ui.notifications.at(-1)?.message ?? "";
+    expect(notice).toContain("log problem: 1 write(s) failed");
+    // EISDIR, not a permission error: the point of the fixture is that it fails for any uid.
+    expect(notice).toContain("EISDIR");
+  });
+
+  it.skipIf(!HAVE_MKFIFO)("returns the decision inside the ceiling when the log write never comes back", async () => {
+    // A FIFO with no reader blocks on open, which is the shape that would actually hurt: a wedged volume
+    // turning a dark build into a turn-end stall. appendFile cannot be cancelled, so what is being asserted is
+    // the race - the decision lands on time and the wedged write is not re-bought on the next decision.
+    const logDir = path.join(cwd, ".pi", "cache-warm");
+    await mkdir(logDir, { recursive: true });
+    execFileSync("mkfifo", [path.join(logDir, "log.jsonl")]);
+
+    const mod = await load();
+    const pi = createFakePi();
+    mod.default(pi as any);
+    const ctx = createContext({ cwd, sessionId: "01a1a9b1-795c", model: rooterModel });
+    const decide = () =>
+      pi.emit("cache_warming_decision", {
+        type: "cache_warming_decision",
+        warmCost: 0.0041,
+        missCost: 0.0219,
+        continuationProbability: 0.15,
+        action: "warm",
+      }, ctx.context);
+
+    const firstStart = Date.now();
+    const [first] = await decide();
+    const firstMs = Date.now() - firstStart;
+    expect(first).toEqual({ action: "stop" });
+    // At or above the ceiling (that is the race firing) and far below a 30s stall.
+    expect(firstMs).toBeGreaterThanOrEqual(1900);
+    expect(firstMs).toBeLessThan(6000);
+
+    const secondStart = Date.now();
+    const [second] = await decide();
+    const secondMs = Date.now() - secondStart;
+    expect(second).toEqual({ action: "stop" });
+    // The stall latch: the second decision does not queue a second wedged write and pay the ceiling again.
+    expect(secondMs).toBeLessThan(500);
+
+    await pi.commands.get("cache-warm")?.handler?.("", ctx.context);
+    const notice = ctx.ui.notifications.at(-1)?.message ?? "";
+    expect(notice).toContain("log problem: 1 write(s) failed (no write inside 2000ms) and 1 decision(s) were not written while a wedged write was outstanding");
   });
 });

@@ -112,6 +112,16 @@ export interface WarmConfig {
   /** Turn arrivals per hour a session must show to be worth warming. */
   minArrivalsPerHour: number;
   /**
+   * How long a decision may wait for its own log line, in ms. The log is a diagnostic: it must never be able to
+   * hold a turn open. `appendFile` is not cancellable, so the ceiling is a race rather than a timeout passed to
+   * the call, and a write that blows the ceiling is recorded as a stall instead of being retried on every
+   * decision. This is the guard against the shape that actually hurts: a full or wedged volume turning a dark
+   * build into a turn-end stall.
+   */
+  logTimeoutMs: number;
+  /** After a log write stalls, stop trying to write for this long (one blocked worker, not a queue of them). */
+  logRetryMs: number;
+  /**
    * The least prefill a refresh must avoid to be worth sending, in seconds. The gate already trades in seconds
    * rather than dollars, so it needs the equivalent of Pi's `$0.05`: a refresh costs a replay of the session's
    * whole prompt, and avoiding a 7-second prefill is not a saving, it is noise. This bar is what caught two
@@ -147,6 +157,8 @@ export const DEFAULT_WARM_CONFIG: WarmConfig = {
   mode: "observe",
   minRecomputeTokens: 10000,
   minArrivalsPerHour: 2,
+  logTimeoutMs: 2000,
+  logRetryMs: 120000,
   minSavedSeconds: 30,
   vetoCacheHitRate: 0.99,
   maxIdleMs: 1_620_000,

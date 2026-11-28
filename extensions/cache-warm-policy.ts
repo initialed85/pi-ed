@@ -74,7 +74,7 @@ function readConfig(ctx: ExtensionContext): RuntimeConfig {
     if (raw) {
       const file = JSON.parse(raw) as Partial<WarmConfig>;
       if (file.mode === "observe" || file.mode === "arm") cfg.mode = file.mode;
-      for (const key of ["minRecomputeTokens", "minArrivalsPerHour", "minSavedSeconds", "vetoCacheHitRate", "maxIdleMs", "evidenceCalls", "evidenceWindowMs", "evidenceTimeoutMs"] as const) {
+      for (const key of ["minRecomputeTokens", "minArrivalsPerHour", "minSavedSeconds", "vetoCacheHitRate", "maxIdleMs", "evidenceCalls", "evidenceWindowMs", "evidenceTimeoutMs", "logTimeoutMs", "logRetryMs"] as const) {
         const value = file[key];
         if (typeof value === "number" && Number.isFinite(value) && value > 0) cfg[key] = value;
         else if (value !== undefined) cfg.problems.push(`${key} ignored (not a positive number)`);
@@ -104,6 +104,12 @@ function readConfig(ctx: ExtensionContext): RuntimeConfig {
   });
   envNumber("CACHE_WARM_MIN_SAVED_SECONDS", (value) => {
     cfg.minSavedSeconds = value;
+  });
+  envNumber("CACHE_WARM_LOG_TIMEOUT_MS", (value) => {
+    cfg.logTimeoutMs = value;
+  });
+  envNumber("CACHE_WARM_LOG_RETRY_MS", (value) => {
+    cfg.logRetryMs = value;
   });
   envNumber("CACHE_WARM_VETO_CACHE_HIT_RATE", (value) => {
     cfg.vetoCacheHitRate = value;
@@ -192,15 +198,60 @@ interface LoggedDecision {
   evidenceSource: { ok: boolean; key: string; error?: string };
   rhythm: { arrivals: number; arrivalsPerHour: number; medianGapMs?: number; sinceLastMs?: number };
   configProblems: string[];
+  /** Set when this decision could not be written, or was not attempted because an earlier write is wedged. */
+  logStalled?: true;
+  logSkipped?: true;
 }
 
-async function logDecision(ctx: ExtensionContext, record: LoggedDecision): Promise<void> {
+/**
+ * The state of the log, kept apart from the decisions it records.
+ *
+ * A log that cannot be written must not change a decision, and it must not be able to hold a turn open either.
+ * `appendFile` offers nothing to cancel - there is no signal to pass - so the ceiling is a `Promise.race` against
+ * a timer rather than a timeout handed to the call. Racing returns the decision on time but leaves a blocked
+ * worker in the thread pool, which is why a stall also shuts the door for `logRetryMs`: one wedged write is an
+ * incident, while a fresh wedged write per decision is a leak that ends with the pool exhausted and every
+ * decision paying the full ceiling.
+ */
+const logState = { broken: false, failures: 0, stalls: 0, skipped: 0, blockedUntilMs: 0, lastError: "" };
+
+async function logDecision(ctx: ExtensionContext, record: LoggedDecision, cfg: RuntimeConfig, nowMs: number): Promise<void> {
+  if (nowMs < logState.blockedUntilMs) {
+    logState.skipped += 1;
+    record.logSkipped = true;
+    return;
+  }
   const path = join(ctx.cwd, LOG_FILE);
-  try {
+  const writing = (async () => {
     await mkdir(dirname(path), { recursive: true });
     await appendFile(path, `${JSON.stringify(record)}\n`);
-  } catch {
-    // A decision log that cannot be written must not change the decision, and must not look like one.
+  })();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const ceiling = new Promise<"stall">((resolve) => {
+    timer = setTimeout(() => resolve("stall"), cfg.logTimeoutMs);
+    // A timer that outlives a fast write must not keep the process, or a test run, waiting for it.
+    timer.unref?.();
+  });
+  try {
+    if ((await Promise.race([writing, ceiling])) === "stall") {
+      logState.broken = true;
+      logState.stalls += 1;
+      logState.blockedUntilMs = nowMs + cfg.logRetryMs;
+      logState.lastError = `no write inside ${cfg.logTimeoutMs}ms`;
+      record.logStalled = true;
+    } else {
+      logState.broken = false;
+    }
+  } catch (error) {
+    // A decision log that cannot be written must not change the decision, and must not look like one. It does
+    // have to be *said*: an unwritable log is exactly the state in which a tool that reports nothing looks
+    // healthy, so a fast failure counts too rather than only a wedged one.
+    logState.broken = true;
+    logState.failures += 1;
+    const code = error instanceof Error ? (error as NodeJS.ErrnoException).code ?? error.message : String(error);
+    logState.lastError = code;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -255,7 +306,7 @@ export default function extension(pi: ExtensionAPI): void {
       configProblems: cfg.problems,
     };
     lastDecision = record;
-    await logDecision(ctx, record);
+    await logDecision(ctx, record, cfg, nowMs);
     // Pi falls back to its own decision if a handler throws, which is the wrong fallback here: Pi's own
     // decision is always "stop" on this fleet, so a throw would silently disable the gate instead of
     // leaving it armed. Always answer explicitly.
@@ -287,6 +338,11 @@ export default function extension(pi: ExtensionAPI): void {
         if (last.evidenceSource.error) lines.push(`  evidence problem: ${last.evidenceSource.error}`);
       }
       lines.push(`decisions: ${join(ctx.cwd, LOG_FILE)}`);
+      if (logState.broken || logState.skipped > 0) {
+        lines.push(
+          `log problem: ${logState.failures + logState.stalls} write(s) failed (${logState.lastError || "no detail"}) and ${logState.skipped} decision(s) were not written while a wedged write was outstanding; the decisions still ran and still answered Pi — the log is what is missing`,
+        );
+      }
       ctx.ui.notify(lines.join("\n"), "info");
     },
   });
