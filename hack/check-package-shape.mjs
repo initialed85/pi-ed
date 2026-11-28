@@ -27,6 +27,9 @@ const EXPECTED_EXTENSIONS = [
   "auto-resume.ts",
   "autopilot.ts",
   "background.ts",
+  // Answers Pi's cache_warming_decision with a rule of its own, from rooter's per-call evidence. It is in the load
+  // path alongside the warming gate because a warm that no one decided about is the failure mode this exists to stop.
+  "cache-warm-policy.ts",
   "graphiti.ts",
   "compaction-summary-guard.ts",
   // The guard retries a summarisation; this is what makes the compaction happen while nobody is waiting for it.
