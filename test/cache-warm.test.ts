@@ -20,12 +20,16 @@ import { createContext, createFakePi } from "./harness.ts";
 
 import {
   armDecision,
+  classifyCatalystText,
   coldSeconds,
   DEFAULT_WARM_CONFIG,
+  isHumanCatalyst,
+  latestRequestCatalyst,
   parseCallEvents,
   rooterKey,
   sessionRhythm,
   type CallEvidence,
+  type CatalystRead,
   type WarmConfig,
 } from "../lib/cache-warm.ts";
 
@@ -52,8 +56,112 @@ function row(over: Partial<CallEvidence> = {}): CallEvidence {
 
 /** A session that comes back every six minutes. */
 const BUSY = { windowMs: 60 * 60_000, arrivals: 10, arrivalsPerHour: 10, medianGapMs: 360_000, lastArrivalMs: NOW - 120_000, sinceLastMs: 120_000 };
-/** A session that woke once and has been quiet since. */
+/** A session that wakes once and has been quiet since. */
 const WAKE_ONCE = { windowMs: 60 * 60_000, arrivals: 1, arrivalsPerHour: 1, medianGapMs: undefined, lastArrivalMs: NOW - 50 * 60_000, sinceLastMs: 50 * 60_000 };
+
+/**
+ * Catalysts, in the shape `armDecision` takes.
+ *
+ * Every other rule in the gate can pass and still not justify a warm, so the fixtures say who opened the run. The
+ * default when a caller passes none is `unknown`, which vetoes: a gate that armed on an unattributed turn would be
+ * spending a re-prefill because nobody could say who it was for.
+ */
+const cat = (catalyst: CatalystRead["catalyst"], basis: string) => ({ compacting: false, catalyst: { catalyst, basis } });
+const HUMAN = cat("terminal", "no peer or chat marker on a user-role turn");
+const CHAT = cat("chat", "marker [pi-chat:");
+const PEER = cat("peer", "customType pi-team-room-wake");
+
+describe("catalyst of the newest request", () => {
+  it("names a peer wake, a scheduled job and an auto-resume as machine turns, from the entry type alone", () => {
+    // These are the customTypes this session's own transcript actually carries, so the mapping is against live
+    // shapes rather than against names this file would have invented.
+    const entry = (customType: string, minutes: number): unknown => ({
+      type: "custom_message",
+      customType,
+      content: "whatever the peer asked for",
+      timestamp: new Date(NOW - minutes * 60_000).toISOString(),
+    });
+    expect(latestRequestCatalyst([entry("pi-team-room-wake", 40), entry("pi-team-room-wake", 5)] as never)).toMatchObject({
+      catalyst: "peer",
+      basis: "customType pi-team-room-wake",
+    });
+    expect(latestRequestCatalyst([entry("pi-team-room-wake", 40), entry("schedule-run", 5)] as never).catalyst).toBe("unknown");
+    expect(latestRequestCatalyst([entry("pi-team-room-wake", 40), entry("auto-resume-prompt", 5)] as never).catalyst).toBe("unknown");
+    expect(latestRequestCatalyst([entry("pi-team-room-wake", 40), entry("memory:dream", 5)] as never).catalyst).toBe("unknown");
+    // A pulse is peer chatter arriving alongside a wake, and it is the newest entry more often than the wake is.
+    expect(latestRequestCatalyst([entry("pi-team-room-wake", 40), entry("pi-team-room-pulse", 5)] as never).catalyst).toBe("peer");
+  });
+
+  it("reads markers off a user-role turn, because on other pods the bridge delivers text rather than typed entries", () => {
+    const user = (text: string, minutes: number): unknown => ({
+      type: "message",
+      message: { role: "user", content: [{ type: "text", text }] },
+      timestamp: new Date(NOW - minutes * 60_000).toISOString(),
+    });
+    expect(latestRequestCatalyst([user("carry on with the roll", 60), user("[pi-chat:c3a58f38a1f27b91] Ed: turn the warming on", 20)] as never)).toMatchObject({
+      catalyst: "chat",
+    });
+    expect(latestRequestCatalyst([user("[pi-chat:abc] a question", 60), user("[Team inbox — steer]\n[owns: pi-bot]\ndelegation", 10)] as never)).toMatchObject({
+      catalyst: "peer",
+      basis: "marker [Team inbox",
+    });
+    expect(latestRequestCatalyst([user("[Team inbox — steer] old", 60), user("please just finish the task", 5)] as never).catalyst).toBe("terminal");
+    // A harness note that lands on a user-role turn is still not a human coming back.
+    expect(latestRequestCatalyst([user("[background job complete] Background job mwzxhszq-sw3wgn succeeded", 5)] as never).catalyst).toBe("unknown");
+    expect(latestRequestCatalyst([user("(auto-resume) This session stopped and was resumed.", 5)] as never).catalyst).toBe("unknown");
+  });
+
+  it("prefers the newest of the two shapes, since that is the turn the prefix now ends at", () => {
+    const humanAt = new Date(NOW - 60_000).toISOString();
+    const peerAt = new Date(NOW - 30_000).toISOString();
+    const branch = [
+      { type: "message", message: { role: "user", content: [{ type: "text", text: "do the thing" }] }, timestamp: humanAt },
+      { type: "custom_message", customType: "pi-team-room-wake", content: "peer asked", timestamp: peerAt },
+    ];
+    expect(latestRequestCatalyst(branch as never).catalyst).toBe("peer");
+    // And the other way round: a person typing after the peer wake is a human turn again.
+    const later = new Date(NOW - 10_000).toISOString();
+    expect(latestRequestCatalyst([...branch, { type: "message", message: { role: "user", content: "thanks, now ship it" }, timestamp: later }] as never).catalyst).toBe(
+      "terminal",
+    );
+  });
+
+  it("answers unknown instead of throwing when the tail is unreadable, and never carries the text", () => {
+    expect(latestRequestCatalyst([] as never)).toEqual({ catalyst: "unknown", basis: "no user or custom_message entry on the branch" });
+    expect(latestRequestCatalyst([null, {}, { type: "message" }] as never).catalyst).toBe("unknown");
+    expect(latestRequestCatalyst([{ type: "message", message: { role: "user", content: 42 }, timestamp: NOW }] as never).catalyst).toBe("unknown");
+    expect(latestRequestCatalyst(undefined as never).catalyst).toBe("unknown");
+    // The basis is what lands in the log, so it must not repeat the turn: a peer question can carry anything.
+    const read = latestRequestCatalyst([{ type: "custom_message", customType: "pi-team-room-wake", content: "secret-ish text", timestamp: NOW }] as never);
+    expect(JSON.stringify(read)).not.toContain("secret-ish");
+    expect(classifyCatalystText("   \n  ").catalyst).toBe("unknown");
+    expect(isHumanCatalyst("chat")).toBe(true);
+    expect(isHumanCatalyst("terminal")).toBe(true);
+    expect(isHumanCatalyst("peer")).toBe(false);
+    expect(isHumanCatalyst("unknown")).toBe(false);
+    expect(isHumanCatalyst(undefined)).toBe(false);
+  });
+
+  it("vetoes a warm the other rules would have armed, and says so on the row", () => {
+    // The rest of the fixture is a textbook arm: 22,000 median recompute on sushi, 10 arrivals/h, 93s avoided.
+    const rows = [row({ computedTokens: 20000, backend: "sushi" }), row({ computedTokens: 24000, backend: "sushi", cacheHitRate: 0.43 })];
+    for (const catalyst of [PEER, { compacting: false, catalyst: { catalyst: "unknown" as const, basis: "customType schedule-run" } }]) {
+      const decision = armDecision(rows, BUSY, cfg({ mode: "arm" }), "stop", catalyst);
+      expect(decision.action).toBe("stop");
+      expect(decision.reason).toContain("not a human coming back");
+      expect(decision.reason).toContain("the other rules cleared, and a refresh would have avoided (93s at sushi's measured 236 tok/s)");
+      // The point of putting this last: observe can count how often the rule alone mattered.
+      expect(decision.detail.catalystVetoed).toBe(true);
+      expect(decision.detail.medianComputedTokens).toBe(22000);
+      expect(decision.detail.coldSecondsAvoided).toBe(93);
+    }
+    // A human catalyst on the same evidence still arms, so the precondition is a filter and not a kill switch.
+    expect(armDecision(rows, BUSY, cfg({ mode: "arm" }), "stop", HUMAN).action).toBe("warm");
+    expect(armDecision(rows, BUSY, cfg({ mode: "arm" }), "stop", CHAT).action).toBe("warm");
+    // Omitting the catalyst is not the same as claiming one.
+    expect(armDecision(rows, BUSY, cfg({ mode: "arm" }), "stop").action).toBe("stop");
+  });
+});
 
 describe("rooter key", () => {
   it("is rooter's truncation of the Pi session id, which is what live rows are keyed by", () => {
@@ -135,7 +243,7 @@ describe("sessionRhythm", () => {
 
 describe("armDecision", () => {
   it("observe mode stops everything and says that is why", () => {
-    const decision = armDecision([row(), row()], BUSY, cfg(), "warm");
+    const decision = armDecision([row(), row()], BUSY, cfg(), "warm", HUMAN);
     expect(decision.action).toBe("stop");
     expect(decision.reason).toContain("pi said warm");
     expect(decision.reason).toContain("observe mode");
@@ -143,7 +251,7 @@ describe("armDecision", () => {
   });
 
   it("vetoes a session already reading its prompt from cache, because a warm there saves nothing", () => {
-    const decision = armDecision([row({ computedTokens: 12000 }), row({ cacheHitRate: 0.998, computedTokens: 219 })], BUSY, cfg({ mode: "arm" }), "stop");
+    const decision = armDecision([row({ computedTokens: 12000 }), row({ cacheHitRate: 0.998, computedTokens: 219 })], BUSY, cfg({ mode: "arm" }), "stop", HUMAN);
     expect(decision.action).toBe("stop");
     expect(decision.reason).toContain("99% cache read");
     expect(decision.reason).toContain("saves nothing");
@@ -152,7 +260,7 @@ describe("armDecision", () => {
   it("stops when the median recompute is under the floor, and prices what it would have saved", () => {
     // This session's real numbers: 219-924 tokens recomputed on a 91k prompt. Nothing to warm.
     const rows = [row({ computedTokens: 329 }), row({ computedTokens: 646 }), row({ computedTokens: 504 })];
-    const decision = armDecision(rows, BUSY, cfg({ mode: "arm" }), "stop");
+    const decision = armDecision(rows, BUSY, cfg({ mode: "arm" }), "stop", HUMAN);
     expect(decision.action).toBe("stop");
     expect(decision.detail.medianComputedTokens).toBe(504);
     expect(decision.reason).toContain("under the 10000 floor");
@@ -162,7 +270,7 @@ describe("armDecision", () => {
   it("refuses a session that has already been silent longer than a refresh would have to cover", () => {
     // The sharpest bar, checked first: a warm protects the entry until the next call, and this session has gone
     // 50 minutes without one against a 33-minute interval.
-    const decision = armDecision([row({ computedTokens: 40000 })], WAKE_ONCE, cfg({ mode: "arm" }), "stop");
+    const decision = armDecision([row({ computedTokens: 40000 })], WAKE_ONCE, cfg({ mode: "arm" }), "stop", HUMAN);
     expect(decision.action).toBe("stop");
     expect(decision.reason).toContain("nothing has arrived for 50m, longer than the 27m a refresh would have to cover");
     expect(decision.detail.sinceLastMs).toBe(3_000_000);
@@ -172,7 +280,7 @@ describe("armDecision", () => {
     // ~29,000 recomputed tokens on strata is 14 seconds at its measured 2,147 tok/s: real recompute, over the
     // token floor, on a session that keeps arriving - and not worth a replay of a 42,000-token prompt.
     const rows = [row({ computedTokens: 30000, backend: "strata" }), row({ computedTokens: 28000, backend: "strata", cacheHitRate: 0.3 })];
-    const decision = armDecision(rows, BUSY, cfg({ mode: "arm" }), "stop");
+    const decision = armDecision(rows, BUSY, cfg({ mode: "arm" }), "stop", HUMAN);
     expect(decision.action).toBe("stop");
     expect(decision.reason).toContain("a refresh avoids only (14s at strata's measured 2147 tok/s), under the 30s a replay of 42000 prompt tokens is worth");
     expect(decision.detail.coldSecondsAvoided).toBe(14);
@@ -182,7 +290,7 @@ describe("armDecision", () => {
     // An unknown backend has no rate, so there is no seconds figure to trip the bar on: the gate cannot claim a
     // saving it never priced, and it must not veto for a reason it does not have.
     const rows = [row({ computedTokens: 24000, backend: "unheardof", cacheHitRate: 0.4 })];
-    const decision = armDecision(rows, BUSY, cfg({ mode: "arm" }), "stop");
+    const decision = armDecision(rows, BUSY, cfg({ mode: "arm" }), "stop", HUMAN);
     expect(decision.action).toBe("warm");
     expect(decision.reason).not.toContain("avoids");
     expect(decision.detail.coldSecondsAvoided).toBeUndefined();
@@ -190,14 +298,14 @@ describe("armDecision", () => {
 
   it("refuses a session that is still arriving, but too rarely to be worth a cadence", () => {
     const slow = { ...WAKE_ONCE, arrivals: 1, arrivalsPerHour: 1, sinceLastMs: 60_000, lastArrivalMs: NOW - 60_000 };
-    const decision = armDecision([row({ computedTokens: 40000 })], slow, cfg({ mode: "arm" }), "stop");
+    const decision = armDecision([row({ computedTokens: 40000 })], slow, cfg({ mode: "arm" }), "stop", HUMAN);
     expect(decision.action).toBe("stop");
     expect(decision.reason).toContain("1.00 arrivals/h is under the 2/h bar");
   });
 
   it("arms when a busy session is doing the cold work a warm would have avoided", () => {
     const rows = [row({ computedTokens: 20000, backend: "sushi" }), row({ computedTokens: 24000, backend: "sushi", cacheHitRate: 0.43 })];
-    const decision = armDecision(rows, BUSY, cfg({ mode: "arm" }), "stop");
+    const decision = armDecision(rows, BUSY, cfg({ mode: "arm" }), "stop", HUMAN);
     expect(decision.action).toBe("warm");
     expect(decision.reason).toContain("median recompute 22000 tokens over 2 calls");
     expect(decision.reason).toContain("a refresh avoids (93s at sushi's measured 236 tok/s)");
@@ -210,7 +318,7 @@ describe("armDecision", () => {
     // prefill_ms is measured per call, so a session that already paid for a cold recompute in this window
     // states its own price: 61s observed beats any table.
     const rows = [row({ computedTokens: 20000, backend: "sushi", prefillMs: 61_000 }), row({ computedTokens: 24000, backend: "sushi", prefillMs: 84_000 })];
-    const decision = armDecision(rows, BUSY, cfg({ mode: "arm" }), "stop");
+    const decision = armDecision(rows, BUSY, cfg({ mode: "arm" }), "stop", HUMAN);
     expect(decision.action).toBe("warm");
     expect(decision.detail.coldSecondsAvoided).toBe(73);
     expect(decision.detail.coldSource).toBe("observed");
@@ -221,7 +329,7 @@ describe("armDecision", () => {
     // A 300-token recompute at 2,000ms of prefill is a prefix reload, not a re-prefill. Pricing a 22,000-token
     // warm from it would claim a warm is free.
     const rows = [row({ computedTokens: 300, backend: "sushi", prefillMs: 2000, cacheHitRate: 0.999 }), row({ computedTokens: 24000, backend: "sushi", cacheHitRate: 0.45 })];
-    const decision = armDecision(rows, BUSY, cfg({ mode: "arm" }), "stop");
+    const decision = armDecision(rows, BUSY, cfg({ mode: "arm" }), "stop", HUMAN);
     // 12,150 is the median recompute of the two calls, priced from the table because the only measured prefill
     // in the window was a reload, not a re-prefill.
     expect(decision.detail.medianComputedTokens).toBe(12150);
@@ -230,7 +338,7 @@ describe("armDecision", () => {
   });
 
   it("stops with no evidence rather than arming on an empty median", () => {
-    const decision = armDecision([], BUSY, cfg({ mode: "arm" }), "warm");
+    const decision = armDecision([], BUSY, cfg({ mode: "arm" }), "warm", HUMAN);
     expect(decision.action).toBe("stop");
     expect(decision.reason).toContain("no rooter call rows for this session");
     expect(decision.detail.evidenceCalls).toBe(0);
@@ -292,6 +400,21 @@ describe("cache-warm-policy extension", () => {
   // in the day than the fixtures assume.
   const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
 
+  /**
+   * A branch whose arrivals are a person typing, at `minutes` ago.
+   *
+   * The gate will not arm on a turn it cannot attribute to a human, so a fixture that wants a warm has to say who
+   * asked for it. Entries carry text the way Pi persists them - a user-role message with a content block - which is
+   * also what `latestRequestCatalyst` reads on a pod.
+   */
+  function humanBranch(...minutesAgo: number[]): unknown[] {
+    return minutesAgo.map((minutes) => ({
+      type: "message",
+      message: { role: "user", content: [{ type: "text", text: `what I wanted next (${minutes}m ago)` }] },
+      timestamp: ago(minutes),
+    }));
+  }
+
   it("answers every decision explicitly, in observe mode, and logs both sides of it", async () => {
     const mod = await load();
     const pi = createFakePi();
@@ -337,11 +460,7 @@ describe("cache-warm-policy extension", () => {
     const mod = await load();
     const pi = createFakePi();
     mod.default(pi as any);
-    const branch = [
-      { type: "message", message: { role: "user" }, timestamp: ago(30) },
-      { type: "message", message: { role: "user" }, timestamp: ago(12) },
-      { type: "message", message: { role: "user" }, timestamp: ago(9) },
-    ];
+    const branch = humanBranch(30, 12, 9);
     const ctx = createContext({ cwd, sessionId: "01a1a9b1-795c", model: rooterModel, branch });
     const [result] = await pi.emit("cache_warming_decision", {
       type: "cache_warming_decision",
@@ -379,11 +498,7 @@ describe("cache-warm-policy extension", () => {
     const pi = createFakePi();
     mod.default(pi as any);
 
-    const branch = [
-      { type: "message", message: { role: "user" }, timestamp: ago(50) },
-      { type: "message", message: { role: "user" }, timestamp: ago(30) },
-      { type: "message", message: { role: "user" }, timestamp: ago(10) },
-    ];
+    const branch = humanBranch(50, 30, 10);
     const ctx = createContext({ cwd, sessionId: "01a1a9b1-795c-7190-862e-cde05ddd7bc0", model: rooterModel, branch });
     const [result] = await pi.emit("cache_warming_decision", {
       type: "cache_warming_decision",
@@ -400,6 +515,127 @@ describe("cache-warm-policy extension", () => {
     expect(record.rhythm.arrivalsPerHour).toBe(3);
     expect(record.evidenceSource.ok).toBe(true);
     delete process.env.CACHE_WARM_MODE;
+  });
+
+  it("refuses to arm a warm when the turn that opened the run came from a peer, and still writes the row", async () => {
+    // Ed's case, in arm mode, on evidence that clears every other bar: the prefix at the end of this run is the
+    // one a peer's one-off question was built on, and the session goes back to dormant after it answers.
+    process.env.CACHE_WARM_MODE = "arm";
+    stubFetch(() => ({
+      ok: true,
+      body: {
+        events: [
+          { ts: ago(10), kind: "gen", key: "h:01a1a9b1-7", backend: "sushi", prompt_tokens: 42000, prompt_tokens_computed: 20000, cache_hit_rate: 0.52, status: 200 },
+          { ts: ago(5), kind: "gen", key: "h:01a1a9b1-7", backend: "sushi", prompt_tokens: 44000, prompt_tokens_computed: 24000, cache_hit_rate: 0.45, status: 200 },
+        ],
+      },
+    }));
+    const mod = await load();
+    const pi = createFakePi();
+    mod.default(pi as any);
+
+    const branch = [
+      ...humanBranch(50, 30, 10),
+      // The newest thing on the session is a team-room delegation, which is what the run replays.
+      { type: "custom_message", customType: "pi-team-room-wake", content: "[Team inbox - steer] implement the catalyst rule", timestamp: ago(2) },
+    ];
+    const ctx = createContext({ cwd, sessionId: "01a1a9b1-795c-7190-862e-cde05ddd7bc0", model: rooterModel, branch });
+    const [result] = await pi.emit("cache_warming_decision", {
+      type: "cache_warming_decision",
+      warmCost: 0.0041,
+      missCost: 0.0219,
+      continuationProbability: 0.15,
+      action: "stop",
+    }, ctx.context);
+
+    expect(result).toEqual({ action: "stop" });
+    const [record] = await readLog();
+    expect(record.catalyst).toBe("peer");
+    expect(record.catalystBasis).toBe("customType pi-team-room-wake");
+    expect(record.reason).toContain("not a human coming back");
+    expect(record.reason).toContain("left to expire");
+    // The row says the rule was the only thing that stopped a spend, which is the number observe mode collects.
+    expect(record.evidence.catalystVetoed).toBe(true);
+    expect(record.evidence.medianComputedTokens).toBe(22000);
+    expect(record.evidence.coldSecondsAvoided).toBe(93);
+    expect(record.rhythm.arrivalsPerHour).toBe(3);
+    // And no text from the turn reached the log.
+    expect(JSON.stringify(record)).not.toContain("implement the catalyst rule");
+    delete process.env.CACHE_WARM_MODE;
+  });
+
+  it("leaves a chat-catalysed run to the existing rules, and names the catalyst on the row either way", async () => {
+    // The other half of the acceptance check: a `[pi-chat:...]` turn behaves exactly as it did before this rule
+    // existed, so the recompute / savedSeconds / arrivals bars are what decide it.
+    process.env.CACHE_WARM_MODE = "arm";
+    stubFetch(() => ({
+      ok: true,
+      body: {
+        events: [
+          { ts: ago(10), kind: "gen", key: "h:01a1a9b1-7", backend: "sushi", prompt_tokens: 42000, prompt_tokens_computed: 20000, cache_hit_rate: 0.52, status: 200 },
+          { ts: ago(5), kind: "gen", key: "h:01a1a9b1-7", backend: "sushi", prompt_tokens: 44000, prompt_tokens_computed: 24000, cache_hit_rate: 0.45, status: 200 },
+        ],
+      },
+    }));
+    const mod = await load();
+    const pi = createFakePi();
+    mod.default(pi as any);
+
+    const branch = [
+      { type: "message", message: { role: "user", content: [{ type: "text", text: "old turn" }] }, timestamp: ago(50) },
+      { type: "message", message: { role: "user", content: [{ type: "text", text: "previous turn" }] }, timestamp: ago(30) },
+      { type: "message", message: { role: "user", content: [{ type: "text", text: "[pi-chat:c3a58f38a1f27b91] Ed: is the warming thing on?" }] }, timestamp: ago(10) },
+    ];
+    const ctx = createContext({ cwd, sessionId: "01a1a9b1-795c-7190-862e-cde05ddd7bc0", model: rooterModel, branch });
+    const [result] = await pi.emit("cache_warming_decision", {
+      type: "cache_warming_decision",
+      warmCost: 0.0041,
+      missCost: 0.0219,
+      continuationProbability: 0.15,
+      action: "stop",
+    }, ctx.context);
+
+    expect(result).toEqual({ action: "warm" });
+    const [record] = await readLog();
+    expect(record.catalyst).toBe("chat");
+    expect(record.catalystBasis).toBe("marker [pi-chat:");
+    expect(record.action).toBe("warm");
+    expect(record.reason).toContain("catalyst chat");
+    expect(record.evidence.catalystVetoed).toBeUndefined();
+    delete process.env.CACHE_WARM_MODE;
+  });
+
+  it("keeps the row and Pi's stop in observe mode when the catalyst vetoes", async () => {
+    stubFetch(() => ({
+      ok: true,
+      body: {
+        events: [{ ts: ago(6), kind: "gen", key: "h:01a1a9b1-7", backend: "sushi", prompt_tokens: 44000, prompt_tokens_computed: 24000, prefill_ms: 101000, cache_hit_rate: 0.45, status: 200 }],
+      },
+    }));
+    const mod = await load();
+    const pi = createFakePi();
+    mod.default(pi as any);
+    const branch = [
+      ...humanBranch(40, 25),
+      { type: "custom_message", customType: "pi-team-room-wake", content: "a peer asked", timestamp: ago(4) },
+    ];
+    const ctx = createContext({ cwd, sessionId: "01a1a9b1-795c-7190", model: rooterModel, branch });
+    const [result] = await pi.emit("cache_warming_decision", {
+      type: "cache_warming_decision",
+      warmCost: 0.0041,
+      missCost: 0.09,
+      continuationProbability: 0.15,
+      action: "stop",
+    }, ctx.context);
+
+    expect(result).toEqual({ action: "stop" });
+    const [record] = await readLog();
+    expect(record.mode).toBe("observe");
+    expect(record.action).toBe("stop");
+    expect(record.catalyst).toBe("peer");
+    expect(record.reason).toContain("observe mode sends nothing; the gate would have said stop:");
+    expect(record.reason).toContain("not a human coming back");
+    expect(record.evidence.catalystVetoed).toBe(true);
   });
 
   it("fails closed when rooter is unreadable, and records why rather than guessing", async () => {
@@ -485,11 +721,7 @@ describe("cache-warm-policy extension", () => {
     const pi = createFakePi();
     mod.default(pi as any);
 
-    const branch = [
-      { type: "message", message: { role: "user" }, timestamp: ago(20) },
-      { type: "message", message: { role: "user" }, timestamp: ago(10) },
-      { type: "message", message: { role: "user" }, timestamp: ago(3) },
-    ];
+    const branch = humanBranch(20, 10, 3);
     const ctx = createContext({ cwd, sessionId: "01a1a9b1-795c", model: rooterModel, branch });
 
     await pi.emit("session_before_compact", { type: "session_before_compact" }, ctx.context);

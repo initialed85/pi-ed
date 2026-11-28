@@ -42,13 +42,37 @@
  *
  *   - nothing has arrived for longer than `maxIdleMs`, because a refresh only protects the entry until the next
  *     call, and a session already silent for longer than the interval a warm runs on has nothing to protect;
- *   - median `prompt_tokens_computed` over the session's recent calls ≥ `minRecomputeTokens`, because that is
- *     the work a refresh would actually have avoided — and that avoided work must itself clear
+ *   - median `prompt_tokens_computed` over the session's recent calls >= `minRecomputeTokens`, because that is
+ *     the work a refresh would actually have avoided - and that avoided work must itself clear
  *     `minSavedSeconds`, because a warm that saves 7 seconds of prefill is not a saving, it is noise. This is the
  *     gate's own version of Pi's `$0.05` minimum expected savings, in the currency we actually trade in;
  *   - the session keeps arriving (`arrivalsPerHour`), because a warm spent on a session that woke once and then
  *     sleeps for a day is a warm spent on nobody;
  *   - and never when the most recent call already read the prompt from cache (`vetoCacheHitRate`).
+ *
+ * The catalyst precondition, which is the last of those four and answers a question none of them can. Ed stated
+ * the goal in Chat on 2026-11-28: idle compaction makes headroom when he sits down to a session, warming makes
+ * sure that headroom is backed by a cached prefix "as long as sessions are hot enough", and a session woken for a
+ * one-off team-room question "is probably not worth doing a warming for it (because that session will go back to
+ * being dormant for some time)". Arrival rhythm alone cannot express that, and *why* it cannot is measured rather
+ * than argued - the newest entries of this session's own transcript, over its last 24 hours of activity:
+ *
+ *     22  custom_message  pi-team-room-pulse
+ *     17  custom_message  pi-team-room-wake        (peer asks and delegations)
+ *      5  custom_message  auto-resume-prompt
+ *      3  custom_message  schedule-run
+ *      1  message         role=user                (the only human-shaped arrival)
+ *
+ * Forty-five machine turns to one human turn, on the most peer-driven session in the fleet. So the confound runs
+ * the other way from the one it was described as: in Pi 1.7.0 a team-room wake, a scheduled job and an auto-resume
+ * are injected as `custom_message` entries, not as user-role messages, and `sessionRhythm` only counts user-role
+ * messages - which means the rhythm already ignores machine catalysts, and what it cannot see is that the prefix
+ * being kept alive *ends* at a machine turn. A warm replays the last request, whatever opened it; the last request
+ * here is usually a peer's question, and the expensive prefix a refresh would hold open is the one that question
+ * was built on. Hence a separate precondition on the override: name the catalyst of the newest request-opening
+ * entry, and only let a `chat` or `terminal` one turn the gate's stop into a warm. `peer`, and `unknown` when the
+ * entry cannot be attributed, veto - which is also the safe direction for the shapes that arrive as user-role text
+ * on other pods (`[background job complete]` notes, and an unreadable tail).
  *
  * What the fleet measured against that gate on 2026-11-27 (`hack/warm-counter.mjs`, rooter boot d7f15035b14e,
  * 347 generations over 144 minutes, 24 session keys): **0 sessions warmable**. The three dense Pi sessions had
@@ -197,7 +221,113 @@ export interface RhythmEntry {
   type: string;
   customType?: string;
   timestamp?: string | number;
-  message?: { role?: string };
+  message?: { role?: string; content?: unknown };
+  /** `custom_message` entries carry their text here rather than under `message`. */
+  content?: unknown;
+}
+
+/**
+ * What opened a session's newest request.
+ *
+ * `chat` and `terminal` are the human-shaped ones and the only two that may turn the gate's stop into a warm.
+ * `peer` is a team-room ask or delegation, and `unknown` is anything the gate cannot attribute - an unreadable
+ * entry, a harness note, a scheduled job, an auto-resume. `unknown` vetoes for the same reason the others do:
+ * nobody has been shown to want this prefix kept.
+ */
+export type Catalyst = "chat" | "terminal" | "peer" | "unknown";
+
+/** What the gate read the catalyst from, in words. Never the message itself: the log must not carry prompt text. */
+export interface CatalystRead {
+  catalyst: Catalyst;
+  basis: string;
+  /** Timestamp of the entry it was read from, when one was found. */
+  atMs?: number;
+}
+
+const HUMAN_CATALYSTS: ReadonlySet<Catalyst> = new Set<Catalyst>(["chat", "terminal"]);
+
+export function isHumanCatalyst(catalyst: Catalyst | undefined): boolean {
+  return catalyst !== undefined && HUMAN_CATALYSTS.has(catalyst);
+}
+
+/**
+ * Classify the text of a turn by its leading markers, from what the agent actually receives.
+ *
+ * Pure, synchronous, no fs and no network, and it never returns the text it read. pi-bot's bridge tags
+ * Chat-originated user messages with a leading `[pi-chat:<digest>]`; the team-room extension delivers peer
+ * follow-ups as `[Team inbox ...]` and replies/delegations with an `[owns: <agent>;` line; a person typing at a
+ * terminal carries neither. Machine notes that do reach a user-role message (`[background job complete]`, the
+ * `(auto-resume)` prompt) are named rather than allowed, because a note arriving on a human's turn is still not a
+ * human coming back.
+ */
+export function classifyCatalystText(text: string | undefined): { catalyst: Catalyst; basis: string } {
+  const body = typeof text === "string" ? text : "";
+  if (!body.trim()) return { catalyst: "unknown", basis: "no readable text on the entry" };
+  const stripped = body.replace(/^\s+/, "");
+  const firstLine = stripped.split("\n", 1)[0] ?? stripped;
+  if (firstLine.includes("[pi-chat:")) return { catalyst: "chat", basis: "marker [pi-chat:" };
+  if (/^\[Team (inbox|message)/.test(stripped)) return { catalyst: "peer", basis: "marker [Team inbox" };
+  if (firstLine.includes("[owns:")) return { catalyst: "peer", basis: "peer message header [owns:" };
+  if (/^\((auto-resume|scheduled|dream)\b/i.test(stripped)) return { catalyst: "unknown", basis: "harness nudge" };
+  if (/^\[background job (complete|failed|cancelled)\]/i.test(stripped)) return { catalyst: "unknown", basis: "background job note" };
+  return { catalyst: "terminal", basis: "no peer or chat marker on a user-role turn" };
+}
+
+/** `custom_message` types that open a request from a peer rather than from a person. */
+const PEER_CUSTOM_TYPES: readonly string[] = ["pi-team-room-wake", "pi-team-room-pulse"];
+
+function entryText(entry: RhythmEntry): string | undefined {
+  const raw = (entry.content ?? entry.message?.content) as unknown;
+  if (typeof raw === "string") return raw;
+  if (Array.isArray(raw)) {
+    const parts = raw
+      .map((block) => (block && typeof block === "object" && (block as { type?: unknown }).type === "text" ? (block as { text?: unknown }).text : undefined))
+      .filter((part): part is string => typeof part === "string");
+    if (parts.length) return parts.join("\n");
+  }
+  return undefined;
+}
+
+function stampMs(entry: RhythmEntry): number | undefined {
+  if (typeof entry.timestamp === "number" && Number.isFinite(entry.timestamp)) return entry.timestamp;
+  const parsed = Date.parse(String(entry.timestamp ?? ""));
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/**
+ * The catalyst of the newest entry that opened a request on this session.
+ *
+ * Both shapes have to be consulted, and that is the whole point of the function: a person's turn persists as a
+ * user-role message, while a peer wake, a scheduled job, a dream and an auto-resume persist as `custom_message`
+ * (measured 45 of those against 1 user-role message in this session's last 24 h of activity). Whichever of the two
+ * is newest is the turn the prefix now ends at, and is therefore the thing a refresh would be keeping alive.
+ *
+ * Never throws and never reads the filesystem: Pi hands the branch to extensions in memory, and a decision must not
+ * be lost because an entry was shaped unexpectedly. An empty or unreadable branch answers `unknown`.
+ */
+export function latestRequestCatalyst(entries: RhythmEntry[]): CatalystRead {
+  let best: { atMs: number; read: CatalystRead } | undefined;
+  const consider = (atMs: number | undefined, read: CatalystRead) => {
+    if (atMs === undefined) return;
+    if (!best || atMs >= best.atMs) best = { atMs, read: { ...read, atMs } };
+  };
+  for (const entry of entries ?? []) {
+    if (entry?.type === "custom_message") {
+      const customType = typeof entry.customType === "string" ? entry.customType : "";
+      const basis = `customType ${customType || "<unnamed>"}`;
+      const catalyst: Catalyst = PEER_CUSTOM_TYPES.includes(customType)
+        ? "peer"
+        : customType === "pi-chat"
+          ? "chat"
+          : "unknown";
+      consider(stampMs(entry), { catalyst, basis });
+      continue;
+    }
+    if (entry?.type === "message" && entry.message?.role === "user") {
+      consider(stampMs(entry), classifyCatalystText(entryText(entry)));
+    }
+  }
+  return best ? best.read : { catalyst: "unknown", basis: "no user or custom_message entry on the branch" };
 }
 
 export interface ArmDecision {
@@ -207,6 +337,15 @@ export interface ArmDecision {
   detail: {
     mode: WarmConfig["mode"];
     compacting?: boolean;
+    /** What opened the newest request. Only a human-shaped one may arm. See `latestRequestCatalyst`. */
+    catalyst?: Catalyst;
+    /** What the catalyst was read from, in words - never the message text. */
+    catalystBasis?: string;
+    /**
+     * The other rules all cleared and the catalyst vetoed the warm. This is the number observe mode exists to
+     * produce: how often Ed's rule would have mattered, without spending a GPU second to find out.
+     */
+    catalystVetoed?: boolean;
     medianComputedTokens?: number;
     lastComputedTokens?: number;
     lastCacheHitRate?: number;
@@ -281,11 +420,15 @@ function median(values: number[]): number | undefined {
 /**
  * Turn arrivals, taken from the user-role messages on the branch.
  *
- * A scheduled job, a team-room steering message and a Chat message from a person all persist as a user
- * message, so this rhythm counts *wakeups*, not human typing. That is the honest reading for warming:
- * what matters is whether a real request arrives before a cache entry expires, whatever woke it. The
- * limit is worth stating rather than discovering — a session woken every two minutes by its own scheduler
- * looks busy here and would be warmed on evidence nobody typed.
+ * Machine catalysts are already excluded here, which is not what an earlier version of this comment claimed: a
+ * team-room wake, a scheduled job, a dream and an auto-resume persist as `custom_message` entries and are not
+ * counted as arrivals, while a Chat message and a person typing persist as user-role messages. Measured on this
+ * session's own transcript over its last 24 h of activity: 45 `custom_message` injections (22 pulse, 17 wake, 5
+ * auto-resume, 3 schedule-run) against 1 user-role arrival. So this rhythm is close to a count of human turns,
+ * and it is *not* a count of how often the session is woken - which is why the catalyst of the newest request is
+ * a separate question, answered by `latestRequestCatalyst`, and why a session that is busy with peer traffic reads
+ * as quiet here. That is the right direction for a warm: the prefix a refresh protects is the one the last request
+ * was built on, and if the last request was a peer's one-off question there is nobody coming back to read it.
  */
 export function sessionRhythm(entries: RhythmEntry[], nowMs: number, windowMs: number): SessionRhythm {
   const stamps: number[] = [];
@@ -322,12 +465,14 @@ function gateDecision(
   rhythm: SessionRhythm,
   cfg: WarmConfig,
   piAction: "warm" | "stop",
-  session: { compacting: boolean },
+  session: { compacting: boolean; catalyst?: CatalystRead },
 ): ArmDecision {
   const recent = evidence.slice(-cfg.evidenceCalls);
   const detail: ArmDecision["detail"] = {
     mode: cfg.mode,
     compacting: session.compacting,
+    catalyst: session.catalyst?.catalyst ?? "unknown",
+    catalystBasis: session.catalyst?.basis ?? "not supplied to the gate",
     evidenceCalls: recent.length,
     arrivalsPerHour: Math.round(rhythm.arrivalsPerHour * 100) / 100,
     medianGapMs: rhythm.medianGapMs === undefined ? undefined : Math.round(rhythm.medianGapMs / 100) * 100,
@@ -408,9 +553,20 @@ function gateDecision(
   }
 
   const cold = coldSec === undefined ? "" : ` a refresh avoids${costNote}`;
+  // The last gate, and a precondition on the *override* only: everything above can arm a warm on evidence, and
+  // this is the one question evidence cannot answer - whether a person is the reason the prefix exists. It runs
+  // after the evidence rules so that a vetoed decision still records what the evidence said, and so observe mode
+  // can count how often this rule alone would have stopped a spend.
+  if (!isHumanCatalyst(detail.catalyst)) {
+    detail.catalystVetoed = true;
+    const avoid = coldSec === undefined ? "" : ` (the other rules cleared, and a refresh would have avoided${costNote})`;
+    return stop(
+      `${base}; the turn that opened this run was a ${detail.catalyst} catalyst (${detail.catalystBasis ?? "unnamed"}), not a human coming back, so the prefix it was built on is left to expire${avoid}`,
+    );
+  }
   return {
     action: "warm",
-    reason: `${base}; median recompute ${Math.round(medians)} tokens over ${recent.length} calls, ${rhythm.arrivalsPerHour.toFixed(2)} arrivals/h${cold}`,
+    reason: `${base}; median recompute ${Math.round(medians)} tokens over ${recent.length} calls, ${rhythm.arrivalsPerHour.toFixed(2)} arrivals/h, catalyst ${detail.catalyst}${cold}`,
     detail,
   };
 }
@@ -425,7 +581,7 @@ export function armDecision(
   rhythm: SessionRhythm,
   cfg: WarmConfig,
   piAction: "warm" | "stop",
-  session: { compacting: boolean } = { compacting: false },
+  session: { compacting: boolean; catalyst?: CatalystRead } = { compacting: false },
 ): ArmDecision {
   const gate = gateDecision(evidence, rhythm, cfg, piAction, session);
   if (cfg.mode === "arm") return gate;

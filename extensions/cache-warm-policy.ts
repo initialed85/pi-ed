@@ -18,16 +18,31 @@
  * warm. `cacheWarmMode: "arm"` is the switch, and it is deliberately something a person sets after
  * reading `hack/warm-counter.mjs`.
  *
+ * The catalyst precondition, which is the last thing to clear before an override to `warm` is allowed. Ed stated
+ * the goal in Chat on 2026-11-28: idle compaction makes headroom when he sits down to a session, warming makes sure
+ * that headroom is backed by a cached prefix "as long as sessions are hot enough" — and a session woken for a
+ * one-off team-room question is still worth compacting, but not worth warming, "because that session will go back
+ * to being dormant for some time". Arrival rhythm alone cannot express that, and the measured reason is in
+ * `lib/cache-warm.ts`: on this fleet a peer wake, a scheduled job, a dream and an auto-resume persist as
+ * `custom_message` entries rather than user-role messages (45 of them against 1 human arrival in the most
+ * peer-driven session's last 24 hours), so the rhythm already ignores machine catalysts while the prefix a refresh
+ * would protect still *ends* at one. The gate therefore names the catalyst of the newest request-opening entry —
+ * `chat`, `terminal`, `peer` or `unknown` — and only lets the two human-shaped ones arm. It is a precondition on
+ * the override, so a vetoed decision still runs every other rule and still writes its row; `catalystVetoed: true`
+ * on a row is the count of how often this rule alone would have stopped a spend, which is what observe mode exists
+ * to produce.
+ *
  * Two ceilings Pi imposes, recorded here because they decide what the catalogue may say:
  *
  *   - A refresh is scheduled at `min(short × 0.9, short − 10s)`, timed from the request that opened the run, and
- *     Pi stops a run whose next refresh falls past that request + 30 minutes (60 while it streams). Rooter
- *     measured sushi's real prefix lifetime at ~5,957 s, which schedules a refresh at ~5,362 s and is stopped
- *     immediately. 2,000s is the largest `short` whose refresh (1,800s) merely *touches* that horizon, and any
- *     elapsed time since the request puts it past, so the value that arms at all is below it: **1,800**,
- *     refreshing every 27 minutes. A declared `promptCache.short` is a re-arm interval, never a claim about how
- *     long a prefix lives, and `maxIdleMs` in `lib/cache-warm.ts` is set to that same 27-minute interval so the
- *     two move together.
+ *     Pi stops a run whose next refresh falls past that request + 30 minutes (60 while it streams). A declared
+ *     `promptCache.short` is therefore a re-arm interval, never a claim about how long a prefix lives, and
+ *     `maxIdleMs` in `lib/cache-warm.ts` is set to that same 27-minute interval so the two move together. Rooter's
+ *     probe on 2026-11-27 measured a 33,761-token prefix on sushi surviving to 56.7 min (read off SSD) and missing
+ *     at 77.0 min, with age counted *from the last write* — so both 1,800 and 1,500 sit well inside real survival,
+ *     and the choice between them is which tier the refresh reads back from, not whether it misses. The earlier
+ *     ~99-minute figure in this file's history is retired: it was age-from-first-write, and the point that
+ *     produced it was an entry 24.2 minutes old at its last write.
  *   - Pi's idle `continuationProbability` is the constant 0.15, whose source comment reports that
  *     per-session estimates were not better than it. The rhythm here is logged next to that constant so
  *     the claim "busy sessions are the ones worth warming" is measured rather than assumed.
@@ -45,11 +60,14 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
   armDecision,
   DEFAULT_WARM_CONFIG,
+  latestRequestCatalyst,
   parseCallEvents,
   rooterKey,
   sessionRhythm,
   type ArmDecision,
   type CallEvidence,
+  type Catalyst,
+  type CatalystRead,
   type WarmConfig,
 } from "../lib/cache-warm.ts";
 
@@ -193,6 +211,13 @@ interface LoggedDecision {
   gateVerdict?: "warm" | "stop";
   /** Whether a summarisation was in flight, which vetoes a warm on its own. */
   compacting: boolean;
+  /**
+   * What opened the newest request: `chat` and `terminal` are human-shaped, `peer` is a team-room ask or
+   * delegation, `unknown` is anything the gate cannot attribute. Only the first two may arm a warm.
+   */
+  catalyst: Catalyst;
+  /** What the catalyst was read from, in words. The message text itself never reaches this file. */
+  catalystBasis: string;
   reason: string;
   evidence: ArmDecision["detail"];
   evidenceSource: { ok: boolean; key: string; error?: string };
@@ -274,11 +299,20 @@ export default function extension(pi: ExtensionAPI): void {
   pi.on("cache_warming_decision", async (event, ctx) => {
     const nowMs = Date.now();
     const cfg = readConfig(ctx);
+    const branch = ctx.sessionManager.getBranch() as unknown as Parameters<typeof sessionRhythm>[0];
     const [evidence, rhythm] = [
       await readEvidence(ctx, cfg, nowMs),
-      sessionRhythm(ctx.sessionManager.getBranch() as unknown as Parameters<typeof sessionRhythm>[0], nowMs, cfg.evidenceWindowMs),
+      sessionRhythm(branch, nowMs, cfg.evidenceWindowMs),
     ];
-    const decision = armDecision(evidence.rows, rhythm, cfg, event.action, { compacting });
+    // A catalyst read that throws must not cost the session its decision, and must not be allowed to look like a
+    // human turn: an unreadable tail answers `unknown`, which vetoes.
+    let catalyst: CatalystRead;
+    try {
+      catalyst = latestRequestCatalyst(branch);
+    } catch (error) {
+      catalyst = { catalyst: "unknown", basis: `catalyst read failed: ${error instanceof Error ? error.name : String(error)}` };
+    }
+    const decision = armDecision(evidence.rows, rhythm, cfg, event.action, { compacting, catalyst });
     const record: LoggedDecision = {
       at: new Date(nowMs).toISOString(),
       session: ctx.sessionManager.getSessionName?.() || ctx.sessionManager.getSessionId(),
@@ -296,6 +330,8 @@ export default function extension(pi: ExtensionAPI): void {
       gateVerdict: decision.detail.gateVerdict,
       evidence: decision.detail,
       compacting,
+      catalyst: catalyst.catalyst,
+      catalystBasis: catalyst.basis,
       evidenceSource: { ok: evidence.ok, key: evidence.key, ...(evidence.error ? { error: evidence.error } : {}) },
       rhythm: {
         arrivals: rhythm.arrivals,
@@ -319,7 +355,7 @@ export default function extension(pi: ExtensionAPI): void {
       const cfg = readConfig(ctx);
       const lines = [`cache warm policy: ${cfg.mode}`];
       lines.push(
-        `arms when nothing has been idle past ${Math.round(cfg.maxIdleMs / 60000)}m, median recompute >= ${cfg.minRecomputeTokens} tokens, arrivals >= ${cfg.minArrivalsPerHour}/h and the prefill avoided >= ${cfg.minSavedSeconds}s; vetoes a session already reading ${Math.round(cfg.vetoCacheHitRate * 100)}% from cache`,
+        `arms when the newest request was human-shaped (chat or terminal), nothing has been idle past ${Math.round(cfg.maxIdleMs / 60000)}m, median recompute >= ${cfg.minRecomputeTokens} tokens, arrivals >= ${cfg.minArrivalsPerHour}/h and the prefill avoided >= ${cfg.minSavedSeconds}s; vetoes a session already reading ${Math.round(cfg.vetoCacheHitRate * 100)}% from cache`,
       );
       for (const problem of cfg.problems) lines.push(`config: ${problem}`);
       const last = lastDecision;
@@ -329,6 +365,7 @@ export default function extension(pi: ExtensionAPI): void {
         lines.push(
           `last decision ${last.at}: pi ${last.actionFromPi} -> us ${last.action} (warm cost $${last.warmCost.toFixed(6)}, miss cost $${last.missCost.toFixed(6)}, pi continuation ${last.continuationProbability})`,
         );
+        lines.push(`  catalyst: ${last.catalyst} (${last.catalystBasis})${last.evidence.catalystVetoed ? " - the only rule that stood in the way" : ""}`);
         lines.push(`  ${last.reason}`);
         const saved = last.evidence.coldSecondsAvoided;
         lines.push(
