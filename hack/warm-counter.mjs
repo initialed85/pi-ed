@@ -224,7 +224,10 @@ for (const [key, list] of byKey) {
     }
   }
   if (!evidence.length) {
-    sessions.push({ key, piSession: key.startsWith("h:"), calls: list.length, warmable: false, verdict: "stop", reason: "no rows with token accounting", medianComputed: 0, maxComputed: 0, medianPrompt: 0, aborts: 0, spanMs, rhythm, fires: 0, warmRestoreSec: 0, warmColdSec: 0 });
+    // The same shape as a priced session, `callsPerHour` included: the table print reads it unguarded, and a
+    // session that reaches this path (every row aborted before token accounting) is exactly the one a review
+    // run is most likely to contain.
+    sessions.push({ key, piSession: key.startsWith("h:"), calls: list.length, warmable: false, verdict: "stop", reason: "no rows with token accounting", medianComputed: 0, maxComputed: 0, medianPrompt: 0, aborts: 0, spanMs, idleMs: rhythm.sinceLastMs, callsPerHour: list.length / Math.max(1, spanMs / 3_600_000), rhythm, fires: 0, warmRestoreSec: 0, warmColdSec: 0 });
     continue;
   }
 
@@ -292,7 +295,7 @@ if (json) {
     console.log(
       `${session.key.padEnd(16)} ${(session.piSession ? "pi" : "other").padEnd(5)} ${String(session.calls).padStart(5)} ${String(session.aborts).padStart(6)} ` +
         `${String(session.medianComputed).padStart(11)} ${String(session.maxComputed).padStart(11)} ${String(session.medianPrompt).padStart(10)} ${hit.padStart(7)} ` +
-        `${String(Math.round(session.spanMs / 60000)).padStart(5)} ${String(Math.round((session.idleMs ?? 0) / 60000)).padStart(5)} ${session.callsPerHour.toFixed(1).padStart(8)}  ${session.verdict.padEnd(8)} ${String(session.fires).padStart(10)}  ${cost}`,
+        `${String(Math.round(session.spanMs / 60000)).padStart(5)} ${String(Math.round((session.idleMs ?? 0) / 60000)).padStart(5)} ${(session.callsPerHour ?? 0).toFixed(1).padStart(8)}  ${session.verdict.padEnd(8)} ${String(session.fires).padStart(10)}  ${cost}`,
     );
   }
   console.log("");
